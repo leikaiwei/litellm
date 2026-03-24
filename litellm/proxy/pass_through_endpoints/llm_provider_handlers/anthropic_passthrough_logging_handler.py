@@ -294,6 +294,9 @@ class AnthropicPassthroughLoggingHandler:
             # Process each individual event
             for event_str in individual_events:
                 try:
+                    # 跳过 Anthropic 兼容接口里可能出现的控制帧（如 OpenAI 风格 [DONE]）
+                    if "[DONE]" in event_str:
+                        continue
                     transformed_openai_chunk = anthropic_model_response_iterator.convert_str_chunk_to_generic_chunk(
                         chunk=event_str
                     )
@@ -302,6 +305,9 @@ class AnthropicPassthroughLoggingHandler:
 
                 except (StopIteration, StopAsyncIteration):
                     break
+                except json.JSONDecodeError:
+                    # 某些上游会返回非 JSON SSE 行，记录时忽略避免中断日志链路
+                    continue
 
         complete_streaming_response = litellm.stream_chunk_builder(
             chunks=all_openai_chunks,
