@@ -1,6 +1,7 @@
 import base64
 import mimetypes
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Literal, Optional, Union
 
@@ -715,6 +716,37 @@ async def resolve_output_file_ids_to_unified(response, prisma_client) -> None:
             )
             if managed_file:
                 setattr(response, attr, managed_file.unified_file_id)
+                continue
+
+            # 中文注释: DB 未及时写入 output/error file 映射时，基于 input_file_id 兜底生成统一 ID。
+            input_file_id = getattr(response, "input_file_id", None)
+            decoded_unified_input = (
+                _is_base64_encoded_unified_file_id(input_file_id)
+                if isinstance(input_file_id, str)
+                else False
+            )
+            if not decoded_unified_input:
+                continue
+
+            target_model_names = get_models_from_unified_file_id(decoded_unified_input)
+            if not target_model_names:
+                continue
+
+            fallback_unified_file_id_str = (
+                SpecialEnums.LITELLM_MANAGED_FILE_COMPLETE_STR.value.format(
+                    "application/octet-stream",
+                    str(uuid.uuid4()),
+                    ",".join(target_model_names),
+                    raw_id,
+                    target_model_names[0],
+                )
+            )
+            fallback_unified_file_id = (
+                base64.urlsafe_b64encode(fallback_unified_file_id_str.encode())
+                .decode()
+                .rstrip("=")
+            )
+            setattr(response, attr, fallback_unified_file_id)
         except Exception:
             pass
 
