@@ -1,5 +1,9 @@
 name: CodSpeed Benchmarks
 
+env:
+  # 中文注释：提前切换到 Node.js 24，避免 Node 20 弃用告警
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 on:
   push:
     branches:
@@ -21,6 +25,8 @@ concurrency:
 
 jobs:
   benchmarks:
+    # 中文注释：仅官方主仓库执行，fork 仓库会跳过，避免 401 鉴权失败
+    if: github.repository == 'BerriAI/litellm'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
