@@ -1,0 +1,50 @@
+name: CodSpeed Benchmarks
+
+env:
+  # 中文注释：提前切换到 Node.js 24，避免 Node 20 弃用告警
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  # Allow CodSpeed to trigger backtest performance analysis
+  # in order to generate initial data
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmarks:
+    # 中文注释：仅官方主仓库执行，fork 仓库会跳过，避免 401 鉴权失败
+    if: github.repository == 'BerriAI/litellm'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -e "."
+          pip install pytest pytest-codspeed==4.3.0
+
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          mode: simulation
+          run: pytest tests/benchmarks/ --codspeed
