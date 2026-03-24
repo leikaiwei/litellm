@@ -30,7 +30,6 @@ jobs:
         run: |
           # 中文注释：main 分支固定打 main 标签，同时叠加 latest
           echo "value=main" >> "$GITHUB_OUTPUT"
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
