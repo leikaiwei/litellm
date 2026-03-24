@@ -18,11 +18,18 @@ from litellm.proxy.openai_files_endpoints.common_utils import (
 
 
 DECODED_UNIFIED_INPUT_FILE_ID = "litellm_proxy:application/octet-stream;unified_id,test-uuid;target_model_names,azure-gpt-4"
-B64_UNIFIED_INPUT_FILE_ID = base64.urlsafe_b64encode(DECODED_UNIFIED_INPUT_FILE_ID.encode()).decode().rstrip("=")
+B64_UNIFIED_INPUT_FILE_ID = (
+    base64.urlsafe_b64encode(DECODED_UNIFIED_INPUT_FILE_ID.encode())
+    .decode()
+    .rstrip("=")
+)
 RAW_INPUT_FILE_ID = "file-raw-provider-abc123"
+RAW_OUTPUT_FILE_ID = "file-batch-output-aacbd77601a5"
 
 DECODED_UNIFIED_BATCH_ID = "litellm_proxy;model_id:model-xyz;llm_batch_id:batch-123"
-B64_UNIFIED_BATCH_ID = base64.urlsafe_b64encode(DECODED_UNIFIED_BATCH_ID.encode()).decode().rstrip("=")
+B64_UNIFIED_BATCH_ID = (
+    base64.urlsafe_b64encode(DECODED_UNIFIED_BATCH_ID.encode()).decode().rstrip("=")
+)
 
 
 @pytest.mark.asyncio
@@ -55,10 +62,16 @@ async def test_should_resolve_raw_input_file_id_to_unified():
     mock_managed_file.unified_file_id = B64_UNIFIED_INPUT_FILE_ID
 
     mock_prisma = MagicMock()
-    mock_prisma.db.litellm_managedobjecttable.find_first = AsyncMock(return_value=mock_db_object)
-    mock_prisma.db.litellm_managedfiletable.find_first = AsyncMock(return_value=mock_managed_file)
+    mock_prisma.db.litellm_managedobjecttable.find_first = AsyncMock(
+        return_value=mock_db_object
+    )
+    mock_prisma.db.litellm_managedfiletable.find_first = AsyncMock(
+        return_value=mock_managed_file
+    )
 
-    from litellm.proxy.openai_files_endpoints.common_utils import get_batch_from_database
+    from litellm.proxy.openai_files_endpoints.common_utils import (
+        get_batch_from_database,
+    )
 
     _, response = await get_batch_from_database(
         batch_id=B64_UNIFIED_BATCH_ID,
@@ -73,3 +86,40 @@ async def test_should_resolve_raw_input_file_id_to_unified():
         f"input_file_id should be unified '{B64_UNIFIED_INPUT_FILE_ID}', "
         f"got raw '{response.input_file_id}'"
     )
+
+
+@pytest.mark.asyncio
+async def test_should_fallback_generate_unified_output_file_id_when_db_mapping_missing():
+    """
+    When output_file_id is still raw and the managed file mapping is missing,
+    response should still return a unified file ID derived from input_file_id models.
+    """
+    from litellm.types.utils import LiteLLMBatch
+    from litellm.proxy.openai_files_endpoints.common_utils import (
+        convert_b64_uid_to_unified_uid,
+        resolve_output_file_ids_to_unified,
+    )
+
+    response = LiteLLMBatch(
+        id="batch_123",
+        completion_window="24h",
+        created_at=1700000000,
+        endpoint="/v1/chat/completions",
+        input_file_id=B64_UNIFIED_INPUT_FILE_ID,
+        object="batch",
+        status="completed",
+        output_file_id=RAW_OUTPUT_FILE_ID,
+    )
+
+    mock_prisma = MagicMock()
+    # 中文注释: 模拟查不到 raw output_file_id 对应的 managed file 记录
+    mock_prisma.db.litellm_managedfiletable.find_first = AsyncMock(return_value=None)
+
+    await resolve_output_file_ids_to_unified(
+        response=response, prisma_client=mock_prisma
+    )
+
+    assert response.output_file_id != RAW_OUTPUT_FILE_ID
+    decoded_output_id = convert_b64_uid_to_unified_uid(response.output_file_id)
+    assert decoded_output_id.startswith("litellm_proxy:")
+    assert f"llm_output_file_id,{RAW_OUTPUT_FILE_ID}" in decoded_output_id
