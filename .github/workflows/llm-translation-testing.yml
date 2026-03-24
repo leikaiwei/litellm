@@ -1,15 +1,10 @@
 name: LLM Translation Tests
 
 on:
-  workflow_dispatch:
-    inputs:
-      release_candidate_tag:
-        description: 'Release candidate tag/version'
-        required: true
-        type: string
   push:
-    tags:
-      - 'v*-rc*'  # Triggers on release candidate tags like v1.0.0-rc1
+    # 中文注释：仅 main 分支自动化，子分支不触发
+    branches:
+      - "main"
   
 jobs:
   run-llm-translation-tests:
@@ -19,8 +14,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.release_candidate_tag || github.ref }}
       
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -53,18 +46,10 @@ jobs:
         run: mkdir -p test-results
       
       - name: Run LLM Translation Tests
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          AZURE_API_KEY: ${{ secrets.AZURE_API_KEY }}
-          AZURE_API_BASE: ${{ secrets.AZURE_API_BASE }}
-          AZURE_API_VERSION: ${{ secrets.AZURE_API_VERSION }}
-          # Add other API keys as needed
         run: |
+          # 中文注释：不再依赖第三方厂商密钥，避免无密钥仓库执行失败
           python .github/workflows/run_llm_translation_tests.py \
-            --tag "${{ github.event.inputs.release_candidate_tag || github.ref_name }}" \
+            --tag "${{ github.ref_name }}" \
             --commit "${{ github.sha }}" \
             || true  # Continue even if tests fail
       
@@ -84,6 +69,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: LLM-Translation-Artifact-${{ github.event.inputs.release_candidate_tag || github.ref_name }}
+          name: LLM-Translation-Artifact-${{ github.ref_name }}
           path: test-results/
           retention-days: 30

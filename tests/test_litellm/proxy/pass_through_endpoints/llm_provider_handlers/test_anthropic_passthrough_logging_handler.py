@@ -244,6 +244,27 @@ class TestAzureAnthropicCostCalculation:
         assert call_kwargs["model"] == "azure_ai/claude-sonnet-4-5_gb_20250929"
         assert call_kwargs["custom_llm_provider"] == "azure_ai"
 
+
+    def test_build_complete_streaming_response_should_ignore_done_control_frame(self):
+        """should ignore OpenAI-style [DONE] control frame in Anthropic-compatible SSE."""
+        logging_obj = MagicMock()
+        logging_obj.litellm_call_id = "test-call-id"
+        all_chunks = [
+            'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet"}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}\n\n',
+            "data: [DONE]\n\n",
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        response = AnthropicPassthroughLoggingHandler._build_complete_streaming_response(
+            all_chunks=all_chunks,
+            litellm_logging_obj=logging_obj,
+            model="claude-3-5-sonnet",
+        )
+
+        assert response is not None
+
     @patch("litellm.completion_cost")
     def test_cost_calculation_without_custom_llm_provider(self, mock_completion_cost):
         """Test that cost calculation works without custom_llm_provider (standard Anthropic)"""
