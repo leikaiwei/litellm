@@ -1,7 +1,8 @@
 name: LiteLLM MCP Tests (folder - tests/mcp_tests)
 
 on:
-  pull_request:
+  # 中文注释：只在 main 分支推送时触发，避免其他分支触发 CI
+  push:
     branches: [ main ]
 
 jobs:
