@@ -1,11 +1,10 @@
 name: Auto Publish Docker & GHCR
 
 on:
-  # 中文注释：仅 main 分支自动化，子分支不触发
-  push:
-    branches:
-      - "main"
-  workflow_dispatch:
+  # 中文注释：仅在手动发布 Release（打 tag 并发布）后触发
+  release:
+    types:
+      - published
 
 env:
   # 中文注释：GHCR 目标
@@ -28,8 +27,8 @@ jobs:
         id: tag
         shell: bash
         run: |
-          # 中文注释：main 分支固定打 main 标签，同时叠加 latest
-          echo "value=main" >> "$GITHUB_OUTPUT"
+          # 中文注释：镜像 tag 直接使用本次 Release 的 tag 名
+          echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
