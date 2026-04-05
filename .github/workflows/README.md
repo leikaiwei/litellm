@@ -1,35 +1,47 @@
-# Simple PyPI Publishing
+# 当前仓库的最小发布流程
 
-A GitHub workflow to manually publish LiteLLM packages to PyPI with a specified version.
+本仓库 CI/CD 调整为“最小可用发布链路”：
 
-## How to Use
+1. 手动创建 GitHub Release（会自动打 tag）
+2. Release 发布后自动构建并推送 Docker 镜像（Docker Hub + GHCR）
 
-1. Go to the **Actions** tab in the GitHub repository
-2. Select **Simple PyPI Publish** from the workflow list
-3. Click **Run workflow**
-4. Enter the version to publish (e.g., `1.74.10`)
+不再保留 PyPI 发布工作流。
 
-## What the Workflow Does
+---
 
-1. **Updates** the version in `pyproject.toml`
-2. **Copies** the model prices backup file
-3. **Builds** the Python package
-4. **Publishes** to PyPI
+## 1) 创建 Release
 
-## Prerequisites
+工作流：`Create Release`  
+触发方式：`workflow_dispatch`
 
-Make sure the following secret is configured in the repository:
-- `PYPI_PUBLISH_PASSWORD`: PyPI API token for authentication
+输入参数：
+- `tag`：发布标签（例如 `v1.0.1`）
+- `target`：目标分支或提交（默认 `main`）
 
-## Example Usage
+说明：
+- 自动生成 Release Notes
+- `tag` 需要符合 `vX.Y.Z`（可带后缀如 `-rc.1`）
 
-- Version: `1.74.11` → Publishes as v1.74.11
-- Version: `1.74.10-hotfix1` → Publishes as v1.74.10-hotfix1
+## 2) 自动发布 Docker 镜像
 
-## Features
+工作流：`Auto Publish Docker & GHCR`  
+触发方式：Release `published`
 
-- ✅ Manual trigger with version input
-- ✅ Automatic version updates in `pyproject.toml`
-- ✅ Repository safety check (only runs on official repo)
-- ✅ Clean package building and publishing
-- ✅ Success confirmation with PyPI package link 
+镜像推送目标：
+- Docker Hub：`${{ vars.DOCKERHUB_REPOSITORY || github.repository }}`
+- GHCR：`ghcr.io/${{ github.repository }}`
+
+镜像标签：
+- `${release_tag}`
+- `latest`
+
+---
+
+## 需要提前配置的 Secrets / Variables
+
+### Secrets
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
+
+### Variables（可选）
+- `DOCKERHUB_REPOSITORY`（不配置则默认使用 `owner/repo`）
