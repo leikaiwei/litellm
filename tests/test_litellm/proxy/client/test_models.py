@@ -10,7 +10,7 @@ sys.path.insert(
 
 
 
-import responses
+from tests.test_litellm.proxy.client._responses_loader import responses
 
 from litellm.proxy.client import Client, ModelsManagementClient
 from litellm.proxy.client.exceptions import NotFoundError, UnauthorizedError

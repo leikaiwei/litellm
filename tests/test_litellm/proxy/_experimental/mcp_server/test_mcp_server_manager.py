@@ -220,8 +220,14 @@ class TestMCPServerManager:
             }
         }
 
-        with caplog.at_level(logging.WARNING, logger="LiteLLM"):
-            await manager.load_servers_from_config(config)
+        logger = logging.getLogger("LiteLLM")
+        prev_disabled = logger.disabled
+        logger.disabled = False
+        try:
+            with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+                await manager.load_servers_from_config(config)
+        finally:
+            logger.disabled = prev_disabled
 
         assert any(
             "invalid alias 'bad/name'" in message for message in caplog.messages
@@ -240,8 +246,14 @@ class TestMCPServerManager:
             }
         }
 
-        with caplog.at_level(logging.WARNING, logger="LiteLLM"):
-            await manager.load_servers_from_config(config)
+        logger = logging.getLogger("LiteLLM")
+        prev_disabled = logger.disabled
+        logger.disabled = False
+        try:
+            with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+                await manager.load_servers_from_config(config)
+        finally:
+            logger.disabled = prev_disabled
 
         # No warnings logged for the valid alias
         assert all("invalid alias" not in message for message in caplog.messages)

@@ -60,6 +60,19 @@ def isolate_litellm_state():
         if hasattr(litellm, _attr):
             original_state[_attr] = getattr(litellm, _attr)
 
+
+    # 避免环境里的 OPENAI_BASE_URL 污染测试（CI 里常被注入代理端口）
+    original_env_vars = {}
+    for _env_key in (
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+    ):
+        if _env_key in os.environ:
+            original_env_vars[_env_key] = os.environ[_env_key]
+            os.environ.pop(_env_key, None)
+
     # Flush cache before test (critical for respx mocks)
     if hasattr(litellm, "in_memory_llm_clients_cache"):
         litellm.in_memory_llm_clients_cache.flush_cache()
@@ -80,7 +93,22 @@ def isolate_litellm_state():
     if hasattr(litellm, 'model_fallbacks'):
         litellm.model_fallbacks = None
 
+    # 清理常见全局开关，避免测试间互相污染
+    if hasattr(litellm, 'drop_params'):
+        litellm.drop_params = False
+    if hasattr(litellm, 'modify_params'):
+        litellm.modify_params = False
+    if hasattr(litellm, 'api_base'):
+        litellm.api_base = None
+    if hasattr(litellm, 'openai_api_base'):
+        litellm.openai_api_base = None
+
     yield
+
+
+    # 还原环境变量，避免影响其它模块
+    for _env_key, _env_val in original_env_vars.items():
+        os.environ[_env_key] = _env_val
 
     # Cleanup after test
     if hasattr(litellm, "in_memory_llm_clients_cache"):

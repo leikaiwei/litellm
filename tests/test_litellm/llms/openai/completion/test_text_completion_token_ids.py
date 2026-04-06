@@ -12,7 +12,6 @@ from httpx import Response
 
 sys.path.insert(0, os.path.abspath("../../../../.."))
 
-import litellm
 from litellm import text_completion
 
 
@@ -20,6 +19,9 @@ from litellm import text_completion
 def setup_env(monkeypatch):
     """Set up test environment variables."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-fake-key")
+    # 清理代理注入的 OpenAI Base URL，确保命中本地 mock 路由
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
 
 
 @pytest.fixture
