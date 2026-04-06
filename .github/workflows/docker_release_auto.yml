@@ -41,8 +41,9 @@ jobs:
         id: tag
         shell: bash
         run: |
-          # 中文注释：优先读取 release tag，兜底读取手动触发输入
-          TAG="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          # 中文注释：从事件 payload 解析 tag，避免表达式上下文兼容性问题
+          TAG="$(jq -r '.release.tag_name // .inputs.tag // empty' "${GITHUB_EVENT_PATH}")"
+
           if [ -z "${TAG}" ]; then
             echo "::error::未获取到镜像 tag"
             exit 1
