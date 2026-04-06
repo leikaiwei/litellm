@@ -21,6 +21,8 @@ concurrency:
 
 jobs:
   benchmarks:
+    # 中文注释：CodSpeed 仅在官方仓库运行，避免 fork 仓库因基线/权限差异产生无效红灯
+    if: github.repository == 'BerriAI/litellm'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
