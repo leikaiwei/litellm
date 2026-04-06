@@ -63,19 +63,6 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "未配置 Docker Hub 凭据，仅推送 GHCR。"
           fi
-- name: 检查 Docker Hub 凭据
-        id: dockerhub
-        shell: bash
-        run: |
-          # 中文注释：Fork 或未配置密钥时，自动跳过 Docker Hub 推送，避免任务失败
-          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "已检测到 Docker Hub 凭据，启用推送。"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "未配置 Docker Hub 凭据，仅推送 GHCR。"
-          fi
-
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
