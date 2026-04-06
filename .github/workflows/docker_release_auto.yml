@@ -26,6 +26,10 @@ jobs:
   build-and-publish:
     name: 构建并发布 Docker 镜像
     runs-on: ubuntu-latest
+    # 中文注释：同一个 tag 仅允许一次发布任务，避免重复推送冲突
+    concurrency:
+      group: docker-release-${{ github.event.release.tag_name || github.event.inputs.tag }}
+      cancel-in-progress: true
     permissions:
       contents: read
       packages: write
@@ -39,6 +43,7 @@ jobs:
         run: |
           # 中文注释：从事件 payload 解析 tag，避免表达式上下文兼容性问题
           TAG="$(jq -r '.release.tag_name // .inputs.tag // empty' "${GITHUB_EVENT_PATH}")"
+
           if [ -z "${TAG}" ]; then
             echo "::error::未获取到镜像 tag"
             exit 1
@@ -58,6 +63,19 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "未配置 Docker Hub 凭据，仅推送 GHCR。"
           fi
+- name: 检查 Docker Hub 凭据
+        id: dockerhub
+        shell: bash
+        run: |
+          # 中文注释：Fork 或未配置密钥时，自动跳过 Docker Hub 推送，避免任务失败
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "已检测到 Docker Hub 凭据，启用推送。"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 Docker Hub 凭据，仅推送 GHCR。"
+          fi
+
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
