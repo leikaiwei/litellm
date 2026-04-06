@@ -53,3 +53,23 @@ jobs:
               draft: false,
               prerelease: false,
             });
+
+      - name: 兜底触发 Docker 发布
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ inputs.tag }}
+          TARGET: ${{ inputs.target }}
+        with:
+          script: |
+            // 中文注释：部分场景 release 事件不会触发后续 workflow，这里做兜底触发
+            const tag = process.env.TAG;
+            const target = process.env.TARGET || 'main';
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'docker_release_auto.yml',
+              ref: target,
+              inputs: {
+                tag,
+              },
+            });

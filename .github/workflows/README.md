@@ -25,7 +25,9 @@
 ## 2) 自动发布 Docker 镜像
 
 工作流：`Auto Publish Docker & GHCR`  
-触发方式：Release `published`
+触发方式：
+- Release `published`（主触发）
+- `workflow_dispatch`（兜底触发，可手动指定 tag）
 
 镜像推送目标：
 - GHCR：`ghcr.io/${{ github.repository }}`
@@ -36,6 +38,8 @@
 镜像标签：
 - `${release_tag}`
 - `latest`
+
+> 说明：`Create Release` 工作流在创建 Release 后会额外触发一次 `Auto Publish Docker & GHCR` 的 `workflow_dispatch` 作为兜底，避免某些仓库策略下 release 事件未触发构建。
 
 ---
 

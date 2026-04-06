@@ -5,6 +5,13 @@ on:
   release:
     types:
       - published
+  # 中文注释：支持手动/其他工作流兜底触发，解决 release 事件未触发的场景
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布标签（例如 v1.0.1）"
+        required: true
+        type: string
 
 env:
   # 中文注释：GHCR 镜像名，默认使用当前仓库
@@ -21,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     # 中文注释：同一个 tag 仅允许一次发布任务，避免重复推送冲突
     concurrency:
-      group: docker-release-${{ github.event.release.tag_name }}
+      group: docker-release-${{ github.event.release.tag_name || inputs.tag }}
       cancel-in-progress: true
     permissions:
       contents: read
@@ -34,8 +41,27 @@ jobs:
         id: tag
         shell: bash
         run: |
-          # 中文注释：镜像 tag 与 Release tag 保持一致
-          echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          # 中文注释：优先读取 release tag，兜底读取手动触发输入
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          if [ -z "${TAG}" ]; then
+            echo "::error::未获取到镜像 tag"
+            exit 1
+          fi
+          echo "value=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "trigger=${{ github.event_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: 检查 Docker Hub 凭据
+        id: dockerhub
+        shell: bash
+        run: |
+          # 中文注释：Fork 或未配置密钥时，自动跳过 Docker Hub 推送，避免任务失败
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "已检测到 Docker Hub 凭据，启用推送。"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 Docker Hub 凭据，仅推送 GHCR。"
+          fi
 
       - name: 检查 Docker Hub 凭据
         id: dockerhub
