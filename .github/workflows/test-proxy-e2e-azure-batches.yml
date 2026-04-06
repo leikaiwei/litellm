@@ -14,6 +14,8 @@ permissions:
 
 jobs:
   proxy_e2e_azure_batches_tests:
+    # 中文注释：该 E2E 用例依赖官方环境稳定性，fork 仓库默认跳过避免无效红灯
+    if: github.repository == 'BerriAI/litellm'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
