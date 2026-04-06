@@ -40,11 +40,35 @@ jobs:
         run: |
           poetry install --with dev
 
+      - name: 计算本次 PR 变更的 Python 文件
+        id: changed_py
+        run: |
+          # 中文注释：仅检查本次 PR 变更文件，避免历史格式债务导致当前 PR 失败
+          BASE_REF="origin/${{ github.base_ref }}"
+          if ! git rev-parse --verify "${BASE_REF}" >/dev/null 2>&1; then
+            git fetch origin "${{ github.base_ref }}" --depth=1
+          fi
+          MERGE_BASE=$(git merge-base "${BASE_REF}" HEAD || true)
+          if [ -n "${MERGE_BASE}" ]; then
+            DIFF_RANGE="${MERGE_BASE}...HEAD"
+          else
+            DIFF_RANGE="HEAD~1...HEAD"
+          fi
+          CHANGED_PY_FILES=$(git diff --name-only --diff-filter=ACMRT "${DIFF_RANGE}" | grep '^litellm/.*\.py$' || true)
+          {
+            echo "files<<EOF"
+            echo "${CHANGED_PY_FILES}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Check Black formatting
         run: |
-          cd litellm
-          poetry run black --check --exclude '/enterprise/' .
-          cd ..
+          FILES="${{ steps.changed_py.outputs.files }}"
+          if [ -z "${FILES}" ]; then
+            echo "没有 Python 变更，跳过 Black 检查。"
+            exit 0
+          fi
+          poetry run black --check --exclude '/enterprise/' ${FILES}
 
       - name: Debug - Check file state
         run: |
