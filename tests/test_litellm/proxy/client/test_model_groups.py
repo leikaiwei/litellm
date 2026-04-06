@@ -9,7 +9,7 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 
-import responses
+from tests.test_litellm.proxy.client._responses_loader import responses
 
 from litellm.proxy.client import Client, ModelGroupsManagementClient
 from litellm.proxy.client.exceptions import UnauthorizedError

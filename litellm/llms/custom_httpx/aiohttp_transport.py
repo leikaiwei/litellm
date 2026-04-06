@@ -16,6 +16,24 @@ import litellm
 from litellm._logging import verbose_logger
 from litellm.secret_managers.main import str_to_bool
 
+
+
+def _host_matches_no_proxy(host: str, no_proxy: str) -> bool:
+    """判断 host 是否命中 NO_PROXY 列表。"""
+    host = host.lower().strip()
+    for item in no_proxy.split(","):
+        rule = item.strip().lower()
+        if not rule:
+            continue
+        if rule == "*":
+            return True
+        if rule.startswith("."):
+            rule = rule[1:]
+        if host == rule or host.endswith(f".{rule}"):
+            return True
+    return False
+
+
 AIOHTTP_EXC_MAP: Dict = {
     # Order matters here, most specific exception first
     # Timeout related exceptions
@@ -375,7 +393,12 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
             return self.proxy_cache[proxy_cache_key]
 
         proxies = urllib.request.getproxies()
-        if urllib.request.proxy_bypass(url.host):
+        no_proxy = os.getenv("NO_PROXY") or os.getenv("no_proxy") or ""
+
+        # 先按 NO_PROXY/no_proxy 规则判断，避免不同平台大小写行为不一致
+        if no_proxy and _host_matches_no_proxy(url.host or "", no_proxy):
+            proxy_url = None
+        elif urllib.request.proxy_bypass(url.host):
             proxy_url = None
         else:
             proxy = proxies.get(url.scheme) or proxies.get("all")

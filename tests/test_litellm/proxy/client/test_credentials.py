@@ -2,14 +2,13 @@ import os
 import sys
 
 import pytest
-import requests
 
 sys.path.insert(
     0, os.path.abspath("../../..")
 )  # Adds the parent directory to the system path
 
 
-import responses
+from tests.test_litellm.proxy.client._responses_loader import responses
 
 from litellm.proxy.client.credentials import CredentialsManagementClient
 from litellm.proxy.client.exceptions import UnauthorizedError

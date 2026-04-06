@@ -3845,18 +3845,24 @@ class TestPKCEFunctionality:
         # PKCE_STRICT_CACHE_MISS explicitly set to false — should NOT raise.
         # Use patch.dict with the key set to "false" rather than os.environ.pop()
         # to avoid permanently mutating the test process environment.
-        with caplog.at_level(logging.WARNING), patch(
-            "litellm.proxy.proxy_server.redis_usage_cache", None
-        ), patch(
-            "litellm.proxy.proxy_server.user_api_key_cache", mock_cache
-        ), patch.dict(
-            os.environ,
-            {"GENERIC_CLIENT_USE_PKCE": "true", "PKCE_STRICT_CACHE_MISS": "false"},
-            clear=False,
-        ):
-            result = await SSOAuthenticationHandler.prepare_token_exchange_parameters(
-                request=mock_request, generic_include_client_id=False
-            )
+        proxy_logger = logging.getLogger("LiteLLM Proxy")
+        prev_disabled = proxy_logger.disabled
+        proxy_logger.disabled = False
+        try:
+            with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"), patch(
+                "litellm.proxy.proxy_server.redis_usage_cache", None
+            ), patch(
+                "litellm.proxy.proxy_server.user_api_key_cache", mock_cache
+            ), patch.dict(
+                os.environ,
+                {"GENERIC_CLIENT_USE_PKCE": "true", "PKCE_STRICT_CACHE_MISS": "false"},
+                clear=False,
+            ):
+                result = await SSOAuthenticationHandler.prepare_token_exchange_parameters(
+                    request=mock_request, generic_include_client_id=False
+                )
+        finally:
+            proxy_logger.disabled = prev_disabled
 
         # Should return params without code_verifier (no raise)
         assert "code_verifier" not in result
@@ -3930,18 +3936,24 @@ class TestPKCEFunctionality:
         # Non-strict mode: should log a warning and continue, not raise.
         # Use patch.dict with PKCE_STRICT_CACHE_MISS="false" to avoid permanently
         # mutating the test process environment with os.environ.pop().
-        with caplog.at_level(logging.WARNING), patch(
-            "litellm.proxy.proxy_server.redis_usage_cache", None
-        ), patch(
-            "litellm.proxy.proxy_server.user_api_key_cache", mock_cache
-        ), patch.dict(
-            os.environ,
-            {"GENERIC_CLIENT_USE_PKCE": "true", "PKCE_STRICT_CACHE_MISS": "false"},
-            clear=False,
-        ):
-            result = await SSOAuthenticationHandler.prepare_token_exchange_parameters(
-                request=mock_request, generic_include_client_id=False
-            )
+        proxy_logger = logging.getLogger("LiteLLM Proxy")
+        prev_disabled = proxy_logger.disabled
+        proxy_logger.disabled = False
+        try:
+            with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"), patch(
+                "litellm.proxy.proxy_server.redis_usage_cache", None
+            ), patch(
+                "litellm.proxy.proxy_server.user_api_key_cache", mock_cache
+            ), patch.dict(
+                os.environ,
+                {"GENERIC_CLIENT_USE_PKCE": "true", "PKCE_STRICT_CACHE_MISS": "false"},
+                clear=False,
+            ):
+                result = await SSOAuthenticationHandler.prepare_token_exchange_parameters(
+                    request=mock_request, generic_include_client_id=False
+                )
+        finally:
+            proxy_logger.disabled = prev_disabled
 
         # No raise in non-strict mode; verifier simply absent from params
         assert "code_verifier" not in result
