@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     # 中文注释：同一个 tag 仅允许一次发布任务，避免重复推送冲突
     concurrency:
-      group: docker-release-${{ github.event.release.tag_name || inputs.tag }}
+      group: docker-release-${{ github.event.release.tag_name || github.event.inputs.tag }}
       cancel-in-progress: true
     permissions:
       contents: read
@@ -42,7 +42,7 @@ jobs:
         shell: bash
         run: |
           # 中文注释：优先读取 release tag，兜底读取手动触发输入
-          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          TAG="${{ github.event.release.tag_name || github.event.inputs.tag }}"
           if [ -z "${TAG}" ]; then
             echo "::error::未获取到镜像 tag"
             exit 1
@@ -62,8 +62,7 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "未配置 Docker Hub 凭据，仅推送 GHCR。"
           fi
-
-      - name: 检查 Docker Hub 凭据
+- name: 检查 Docker Hub 凭据
         id: dockerhub
         shell: bash
         run: |
@@ -75,6 +74,7 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "未配置 Docker Hub 凭据，仅推送 GHCR。"
           fi
+
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
