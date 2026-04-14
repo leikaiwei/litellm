@@ -2572,6 +2572,9 @@ class PrismaClient:
                 except Exception:
                     # This avoids Prisma retrying this 5 times, and making 5 clients
                     db_data[k] = "failed-to-serialize-json"
+            # PostgreSQL jsonb 不支持 \u0000，写入前清洗空字节
+            if isinstance(db_data[k], str):
+                db_data[k] = db_data[k].replace("\x00", "")
         return db_data
 
     @backoff.on_exception(
