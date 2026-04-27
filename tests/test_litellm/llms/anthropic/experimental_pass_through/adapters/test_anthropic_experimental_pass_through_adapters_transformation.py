@@ -1681,6 +1681,36 @@ def test_translate_anthropic_tools_mixed_names():
     assert len(tool_name_mapping) == 1
 
 
+def test_translate_anthropic_tools_type_custom_not_leaked_to_parameters():
+    """回归测试: Anthropic tool 顶层 "type": "custom" 不应泄漏到 OpenAI parameters。
+
+    参考上游 issue #24913 / PR #24914。
+    """
+    tools = [
+        {
+            "name": "Read",
+            "type": "custom",
+            "description": "Read a file",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        }
+    ]
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result, _ = adapter.translate_anthropic_tools_to_openai(tools=tools, model=None)
+
+    params = result[0]["function"]["parameters"]
+    assert params["type"] == "object", (
+        f"parameters.type 应为 'object'，实际为 '{params['type']}'"
+    )
+    assert "path" in params["properties"]
+
+    # 验证 deepcopy: 原始 input_schema 不应被污染
+    assert "custom" not in str(tools[0]["input_schema"])
+
+
 def test_translate_openai_response_restores_tool_names():
     """Tool names in responses should be restored to original."""
     original_name = "a_very_long_tool_name_that_needs_truncation_for_openai_api_compatibility"
