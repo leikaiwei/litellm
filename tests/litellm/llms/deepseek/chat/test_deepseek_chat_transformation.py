@@ -166,3 +166,133 @@ class TestDeepSeekThinkingParams:
         )
 
         assert "thinking" not in result
+
+
+class TestDeepSeekFillReasoningContent:
+    """测试 reasoning_content 回传逻辑"""
+
+    def setup_method(self):
+        self.config = DeepSeekChatConfig()
+
+    def test_placeholder_injected_when_absent(self):
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+        result = self.config.fill_reasoning_content(messages)
+        assert result[1]["reasoning_content"] == " "
+        # 原始消息不应被修改
+        assert "reasoning_content" not in messages[1]
+
+    def test_existing_reasoning_content_preserved(self):
+        messages = [
+            {"role": "assistant", "content": "hi", "reasoning_content": "I thought about it"},
+        ]
+        result = self.config.fill_reasoning_content(messages)
+        assert result[0] is messages[0]  # 同一对象，未拷贝
+        assert result[0]["reasoning_content"] == "I thought about it"
+
+    def test_provider_specific_fields_promoted(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "hi",
+                "provider_specific_fields": {"reasoning_content": "stored reasoning"},
+            },
+        ]
+        result = self.config.fill_reasoning_content(messages)
+        assert result[0]["reasoning_content"] == "stored reasoning"
+        assert "reasoning_content" not in result[0]["provider_specific_fields"]
+
+    def test_non_assistant_messages_untouched(self):
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "you are helpful"},
+        ]
+        result = self.config.fill_reasoning_content(messages)
+        assert result[0] is messages[0]
+        assert result[1] is messages[1]
+        assert "reasoning_content" not in result[0]
+        assert "reasoning_content" not in result[1]
+
+    def test_assistant_with_tool_calls_also_patched(self):
+        messages = [
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
+        ]
+        result = self.config.fill_reasoning_content(messages)
+        assert result[0]["reasoning_content"] == " "
+
+
+class TestDeepSeekIsThinkingEnabled:
+    """测试 _is_thinking_enabled 判断逻辑"""
+
+    def test_reasoning_model_returns_true(self):
+        assert DeepSeekChatConfig._is_thinking_enabled("deepseek/deepseek-reasoner", {}) is True
+
+    def test_dynamic_thinking_param_returns_true(self):
+        assert DeepSeekChatConfig._is_thinking_enabled(
+            "deepseek-chat", {"thinking": {"type": "enabled"}}
+        ) is True
+
+    def test_no_thinking_returns_false(self):
+        assert DeepSeekChatConfig._is_thinking_enabled("deepseek-chat", {}) is False
+
+    def test_thinking_disabled_returns_false(self):
+        assert DeepSeekChatConfig._is_thinking_enabled(
+            "deepseek-chat", {"thinking": {"type": "disabled"}}
+        ) is False
+
+
+class TestDeepSeekTransformRequestReasoning:
+    """测试 transform_request 中 reasoning_content 填充的端到端流程"""
+
+    def setup_method(self):
+        self.config = DeepSeekChatConfig()
+
+    def test_reasoning_model_fills_content(self):
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "thinking..."},
+            {"role": "user", "content": "continue"},
+        ]
+        result = self.config.transform_request(
+            model="deepseek/deepseek-reasoner",
+            messages=messages,
+            optional_params={},
+            litellm_params={},
+            headers={},
+        )
+        assistant_msg = result["messages"][1]
+        assert assistant_msg["reasoning_content"] == " "
+
+    def test_dynamic_thinking_fills_content(self):
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "thinking..."},
+            {"role": "user", "content": "continue"},
+        ]
+        result = self.config.transform_request(
+            model="deepseek-chat",
+            messages=messages,
+            optional_params={"thinking": {"type": "enabled"}},
+            litellm_params={},
+            headers={},
+        )
+        assistant_msg = result["messages"][1]
+        assert assistant_msg["reasoning_content"] == " "
+
+    def test_non_thinking_model_no_fill(self):
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "bye"},
+        ]
+        result = self.config.transform_request(
+            model="deepseek-chat",
+            messages=messages,
+            optional_params={},
+            litellm_params={},
+            headers={},
+        )
+        assistant_msg = result["messages"][1]
+        assert "reasoning_content" not in assistant_msg

@@ -16,6 +16,11 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 修复 Claude Code → LiteLLM → DeepSeek（OpenAI 兼容接口）链路的请求被拒问题
 - 注意：仍需在 LiteLLM Params 中配置 `"drop_params": true`
 
+**DeepSeek thinking mode reasoning_content 回传修复** — `deepseek/chat/transformation.py`
+- 多轮对话时自动为 assistant 消息填充 `reasoning_content`，避免 DeepSeek API 拒绝请求
+- 优先从 `provider_specific_fields` 提升已存储的值，否则注入占位符
+- 同时支持注册表 reasoning 模型（`deepseek-reasoner`）和动态启用 thinking 的模型（`deepseek-chat`）
+
 **Docker 自动发布** — `docker_release_auto.yml`
 - tag/release 时自动构建多架构镜像推送 DockerHub 和 GHCR
 

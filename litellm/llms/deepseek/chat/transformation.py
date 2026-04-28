@@ -2,13 +2,15 @@
 Translates from OpenAI's `/v1/chat/completions` to DeepSeek's `/v1/chat/completions`
 """
 
-from typing import Any, Coroutine, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Coroutine, List, Literal, Optional, Tuple, Union, cast, overload
 
+import litellm
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     handle_messages_with_content_list_to_str_conversion,
 )
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import AllMessageValues
+from litellm.utils import supports_reasoning
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 
@@ -90,6 +92,66 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
             return super()._transform_messages(
                 messages=messages, model=model, is_async=False
             )
+
+    @staticmethod
+    def _is_thinking_enabled(model: str, optional_params: dict) -> bool:
+        """判断当前请求是否启用了 thinking mode"""
+        if supports_reasoning(model=model, custom_llm_provider="deepseek"):
+            return True
+        thinking = optional_params.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+            return True
+        return False
+
+    def fill_reasoning_content(
+        self, messages: List[AllMessageValues]
+    ) -> List[AllMessageValues]:
+        """
+        DeepSeek thinking mode 要求每条 assistant 消息都携带 reasoning_content。
+        对缺失该字段的 assistant 消息：
+          1. 从 provider_specific_fields 提升
+          2. 否则注入占位符空格
+        """
+        result: List[AllMessageValues] = []
+        for msg in messages:
+            if msg.get("role") == "assistant" and not msg.get("reasoning_content"):
+                patched = dict(cast(dict, msg))
+                provider_fields = patched.get("provider_specific_fields") or {}
+                stored = provider_fields.get("reasoning_content")
+                if stored:
+                    patched["reasoning_content"] = stored
+                    cleaned = dict(provider_fields)
+                    cleaned.pop("reasoning_content", None)
+                    patched["provider_specific_fields"] = cleaned
+                else:
+                    litellm.verbose_logger.warning(
+                        "DeepSeek thinking model: assistant message is missing "
+                        "`reasoning_content`. Injecting placeholder to satisfy API validation."
+                    )
+                    patched["reasoning_content"] = " "
+                result.append(cast(AllMessageValues, patched))
+            else:
+                result.append(msg)
+        return result
+
+    def transform_request(
+        self,
+        model: str,
+        messages: List[AllMessageValues],
+        optional_params: dict,
+        litellm_params: dict,
+        headers: dict,
+    ) -> dict:
+        if self._is_thinking_enabled(model, optional_params):
+            messages = self.fill_reasoning_content(messages)
+
+        return super().transform_request(
+            model=model,
+            messages=messages,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            headers=headers,
+        )
 
     def _get_openai_compatible_provider_info(
         self, api_base: Optional[str], api_key: Optional[str]
