@@ -7,6 +7,9 @@ from typing import Any, Coroutine, List, Literal, Optional, Tuple, Union, overlo
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     handle_messages_with_content_list_to_str_conversion,
 )
+from litellm.llms.bedrock.common_utils import (
+    normalize_json_schema_custom_types_to_object,
+)
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import AllMessageValues
 
@@ -62,6 +65,34 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
 
         return optional_params
 
+    def transform_request(
+        self,
+        model: str,
+        messages: List[AllMessageValues],
+        optional_params: dict,
+        litellm_params: dict,
+        headers: dict,
+    ) -> dict:
+        # DeepSeek 不支持非标准 JSON Schema 类型（如 Anthropic 的 "custom"）
+        tools = optional_params.get("tools")
+        if isinstance(tools, list):
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                func = tool.get("function")
+                if not isinstance(func, dict):
+                    continue
+                params = func.get("parameters")
+                if isinstance(params, dict):
+                    normalize_json_schema_custom_types_to_object(params)
+        return super().transform_request(
+            model=model,
+            messages=messages,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            headers=headers,
+        )
+
     @overload
     def _transform_messages(
         self, messages: List[AllMessageValues], model: str, is_async: Literal[True]
@@ -75,6 +106,42 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         is_async: Literal[False] = False,
     ) -> List[AllMessageValues]: ...
 
+    def _ensure_reasoning_content_on_assistant_messages(
+        self, messages: List[AllMessageValues]
+    ) -> List[AllMessageValues]:
+        """
+        DeepSeek V4 thinking mode 要求每条 assistant 历史消息都携带 reasoning_content，
+        缺失则返回 HTTP 400。
+
+        Anthropic 适配器将 thinking 内容存为 thinking_blocks 而非 reasoning_content，
+        需要同时检测两种格式，并将 thinking_blocks 转换为 reasoning_content。
+        """
+        thinking_active = any(
+            msg.get("role") == "assistant"
+            and ("reasoning_content" in msg or msg.get("thinking_blocks"))
+            for msg in messages
+        )
+        if not thinking_active:
+            return messages
+        for message in messages:
+            if message.get("role") != "assistant":
+                continue
+            # 将 thinking_blocks 转换为 reasoning_content
+            if "reasoning_content" not in message:
+                thinking_blocks = message.get("thinking_blocks") or []
+                if thinking_blocks:
+                    message["reasoning_content"] = " ".join(
+                        block.get("thinking") or ""
+                        for block in thinking_blocks
+                        if isinstance(block, dict)
+                        and block.get("type") == "thinking"
+                    )
+                else:
+                    message["reasoning_content"] = ""
+            # DeepSeek 不识别 thinking_blocks 字段
+            message.pop("thinking_blocks", None)  # type: ignore
+        return messages
+
     def _transform_messages(
         self, messages: List[AllMessageValues], model: str, is_async: bool = False
     ) -> Union[List[AllMessageValues], Coroutine[Any, Any, List[AllMessageValues]]]:
@@ -82,6 +149,7 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         DeepSeek does not support content in list format.
         """
         messages = handle_messages_with_content_list_to_str_conversion(messages)
+        messages = self._ensure_reasoning_content_on_assistant_messages(messages)
         if is_async:
             return super()._transform_messages(
                 messages=messages, model=model, is_async=True
