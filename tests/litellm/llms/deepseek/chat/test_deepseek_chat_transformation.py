@@ -245,3 +245,124 @@ class TestDeepSeekReasoningContentInjection:
         ]
         result = self.config._transform_messages(messages, "deepseek-v4-pro", is_async=False)
         assert "reasoning_content" not in result[1]
+
+    def test_converts_thinking_blocks_to_reasoning_content(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {
+                "role": "assistant",
+                "content": "Hi",
+                "thinking_blocks": [
+                    {"type": "thinking", "thinking": "Step 1"},
+                    {"type": "thinking", "thinking": "Step 2"},
+                ],
+            },
+        ]
+        result = self.config._ensure_reasoning_content_on_assistant_messages(messages)
+        assert result[1]["reasoning_content"] == "Step 1 Step 2"
+        assert "thinking_blocks" not in result[1]
+
+    def test_thinking_blocks_alone_triggers_thinking_active(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {
+                "role": "assistant",
+                "content": "Hi",
+                "thinking_blocks": [{"type": "thinking", "thinking": "thought"}],
+            },
+            {"role": "user", "content": "Follow up"},
+            {"role": "assistant", "content": "Sure"},
+        ]
+        result = self.config._ensure_reasoning_content_on_assistant_messages(messages)
+        assert result[1]["reasoning_content"] == "thought"
+        assert result[3]["reasoning_content"] == ""
+
+    def test_thinking_blocks_empty_list_gives_empty_reasoning(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi", "reasoning_content": "real thought"},
+            {"role": "user", "content": "Follow up"},
+            {"role": "assistant", "content": "Sure", "thinking_blocks": []},
+        ]
+        result = self.config._ensure_reasoning_content_on_assistant_messages(messages)
+        assert result[3]["reasoning_content"] == ""
+        assert "thinking_blocks" not in result[3]
+
+    def test_thinking_blocks_with_none_thinking_value(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {
+                "role": "assistant",
+                "content": "Hi",
+                "thinking_blocks": [{"type": "thinking", "thinking": None}],
+            },
+        ]
+        result = self.config._ensure_reasoning_content_on_assistant_messages(messages)
+        assert result[1]["reasoning_content"] == ""
+
+
+class TestDeepSeekTransformRequest:
+    """Test transform_request tool schema normalization."""
+
+    def setup_method(self):
+        self.config = DeepSeekChatConfig()
+
+    def test_normalizes_custom_type_to_object_in_tool_schema(self):
+        optional_params = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "test_func",
+                        "parameters": {
+                            "type": "custom",
+                            "properties": {"a": {"type": "string"}},
+                        },
+                    },
+                }
+            ]
+        }
+        result = self.config.transform_request(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "Hi"}],
+            optional_params=optional_params,
+            litellm_params={},
+            headers={},
+        )
+        tool_params = result["tools"][0]["function"]["parameters"]
+        assert tool_params["type"] == "object"
+
+    def test_leaves_valid_types_unchanged(self):
+        optional_params = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "test_func",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"a": {"type": "string"}},
+                        },
+                    },
+                }
+            ]
+        }
+        result = self.config.transform_request(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "Hi"}],
+            optional_params=optional_params,
+            litellm_params={},
+            headers={},
+        )
+        tool_params = result["tools"][0]["function"]["parameters"]
+        assert tool_params["type"] == "object"
+
+    def test_handles_no_tools(self):
+        result = self.config.transform_request(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "Hi"}],
+            optional_params={},
+            litellm_params={},
+            headers={},
+        )
+        assert "tools" not in result

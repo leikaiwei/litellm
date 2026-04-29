@@ -75,15 +75,16 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
     ) -> dict:
         # DeepSeek 不支持非标准 JSON Schema 类型（如 Anthropic 的 "custom"）
         tools = optional_params.get("tools")
-        if tools and isinstance(tools, list):
+        if isinstance(tools, list):
             for tool in tools:
                 if not isinstance(tool, dict):
                     continue
                 func = tool.get("function")
-                if isinstance(func, dict):
-                    params = func.get("parameters")
-                    if isinstance(params, dict):
-                        normalize_json_schema_custom_types_to_object(params)
+                if not isinstance(func, dict):
+                    continue
+                params = func.get("parameters")
+                if isinstance(params, dict):
+                    normalize_json_schema_custom_types_to_object(params)
         return super().transform_request(
             model=model,
             messages=messages,
@@ -130,7 +131,7 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
                 thinking_blocks = message.get("thinking_blocks") or []
                 if thinking_blocks:
                     message["reasoning_content"] = " ".join(
-                        block.get("thinking", "")
+                        block.get("thinking") or ""
                         for block in thinking_blocks
                         if isinstance(block, dict)
                         and block.get("type") == "thinking"
