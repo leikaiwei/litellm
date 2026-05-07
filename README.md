@@ -16,6 +16,10 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 修复 tool schema 中 Anthropic `type:"custom"` 未转换为标准 `"object"` 的问题
 - 修复 Anthropic thinking_blocks 到 DeepSeek reasoning_content 的转换
 
+**OpenRouter OpenAI 系列模型兼容性修复** — `llms/openrouter/chat/transformation.py`
+- 修复 Claude Code `Agent` tool schema 中 Anthropic `type:"custom"` 透传导致 OpenRouter 下游 OpenAI/Azure 模型 API 400 的问题
+- 支持 Claude Code -> LiteLLM -> OpenRouter(OpenAI 系列模型) 链路正常调用
+
 **Docker 自动发布** — `docker_release_auto.yml`
 - tag/release 时自动构建多架构镜像推送 DockerHub 和 GHCR
 

@@ -14,6 +14,9 @@ import litellm
 
 from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
+from litellm.llms.bedrock.common_utils import (
+    normalize_json_schema_custom_types_to_object,
+)
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
 from litellm.types.llms.openrouter import OpenRouterErrorMessage
 from litellm.types.utils import ModelResponse, ModelResponseStream
@@ -145,6 +148,28 @@ class OpenrouterConfig(OpenAIGPTConfig):
 
         return transformed_messages
 
+    def _normalize_openai_tool_schemas(self, optional_params: dict) -> None:
+        """
+        Normalize OpenAI function tool schemas before sending to OpenRouter.
+        """
+        tools = optional_params.get("tools")
+        if not isinstance(tools, list):
+            return
+
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            if not isinstance(function, dict):
+                continue
+            parameters = function.get("parameters")
+            if not isinstance(parameters, dict):
+                continue
+
+            # Claude Code 的 custom tool 元数据不是 OpenAI JSON Schema 字段。
+            parameters.pop("custom", None)
+            normalize_json_schema_custom_types_to_object(parameters)
+
     def transform_request(
         self,
         model: str,
@@ -161,6 +186,8 @@ class OpenrouterConfig(OpenAIGPTConfig):
         """
         if self._supports_cache_control_in_content(model):
             messages = self._move_cache_control_to_content(messages)
+
+        self._normalize_openai_tool_schemas(optional_params=optional_params)
 
         extra_body = optional_params.pop("extra_body", {})
         response = super().transform_request(

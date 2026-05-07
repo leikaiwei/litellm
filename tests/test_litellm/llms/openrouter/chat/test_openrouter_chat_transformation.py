@@ -118,6 +118,44 @@ def test_openrouter_cache_control_flag_removal():
     assert transformed_request["messages"][0].get("cache_control") is None
 
 
+def test_openrouter_normalizes_claude_code_custom_tool_schema():
+    transformed_request = OpenrouterConfig().transform_request(
+        model="openrouter/openai/gpt-5.4-mini",
+        messages=[{"role": "user", "content": "Hello"}],
+        optional_params={
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Agent",
+                        "description": "Run a subagent",
+                        "parameters": {
+                            "type": "custom",
+                            "custom": {"defer_loading": True},
+                            "properties": {
+                                "prompt": {"type": "string"},
+                                "options": {
+                                    "type": "custom",
+                                    "properties": {"mode": {"type": "string"}},
+                                },
+                            },
+                            "required": ["prompt"],
+                        },
+                    },
+                }
+            ]
+        },
+        litellm_params={},
+        headers={},
+    )
+
+    parameters = transformed_request["tools"][0]["function"]["parameters"]
+    assert parameters["type"] == "object"
+    assert "custom" not in parameters
+    assert parameters["properties"]["options"]["type"] == "object"
+    assert transformed_request["usage"] == {"include": True}
+
+
 def test_openrouter_transform_request_with_cache_control():
     """
     Test transform_request moves cache_control from message level to content blocks (string content).
@@ -141,8 +179,6 @@ def test_openrouter_transform_request_with_cache_control():
         ]
     }
     """
-    import json
-
     config = OpenrouterConfig()
 
     messages = [
@@ -173,9 +209,6 @@ def test_openrouter_transform_request_with_cache_control():
         litellm_params={},
         headers={},
     )
-
-    print("\n=== Transformed Request ===")
-    print(json.dumps(transformed_request, indent=4, default=str))
 
     assert "messages" in transformed_request
     assert len(transformed_request["messages"]) == 2
@@ -218,8 +251,6 @@ def test_openrouter_transform_request_with_cache_control_list_content():
         ]
     }
     """
-    import json
-
     config = OpenrouterConfig()
 
     messages = [
@@ -244,9 +275,6 @@ def test_openrouter_transform_request_with_cache_control_list_content():
         litellm_params={},
         headers={},
     )
-
-    print("\n=== Transformed Request (List Content) ===")
-    print(json.dumps(transformed_request, indent=4, default=str))
 
     assert "messages" in transformed_request
     assert len(transformed_request["messages"]) == 2
@@ -284,8 +312,6 @@ def test_openrouter_transform_request_with_cache_control_gemini():
         ]
     }
     """
-    import json
-
     config = OpenrouterConfig()
 
     messages = [
@@ -303,9 +329,6 @@ def test_openrouter_transform_request_with_cache_control_gemini():
         litellm_params={},
         headers={},
     )
-
-    print("\n=== Transformed Request (Gemini) ===")
-    print(json.dumps(transformed_request, indent=4, default=str))
 
     assert "messages" in transformed_request
     assert len(transformed_request["messages"]) == 1
@@ -325,8 +348,6 @@ def test_openrouter_transform_request_multiple_cache_controls():
     When a message has 5 content blocks with cache_control at message level,
     only the 5th block should have cache_control, not all 5 blocks.
     """
-    import json
-
     config = OpenrouterConfig()
 
     messages = [
@@ -350,9 +371,6 @@ def test_openrouter_transform_request_multiple_cache_controls():
         litellm_params={},
         headers={},
     )
-
-    print("\n=== Transformed Request (Multiple Blocks) ===")
-    print(json.dumps(transformed_request, indent=4, default=str))
 
     system_message = transformed_request["messages"][0]
     assert len(system_message["content"]) == 5
