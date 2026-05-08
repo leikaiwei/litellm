@@ -8467,6 +8467,12 @@ class ProviderConfigManager:
         model_lower = model.lower()
         if litellm.LlmProviders.ANTHROPIC == provider:
             return litellm.AnthropicMessagesConfig()
+        elif litellm.LlmProviders.DEEPSEEK == provider:
+            from litellm.llms.anthropic.experimental_pass_through.messages.transformation import (
+                DeepSeekAnthropicMessagesConfig,
+            )
+
+            return DeepSeekAnthropicMessagesConfig()
         # The 'BEDROCK' provider corresponds to Amazon's implementation of Anthropic Claude v3.
         # This mapping ensures that the correct configuration is returned for BEDROCK.
         elif litellm.LlmProviders.BEDROCK == provider:

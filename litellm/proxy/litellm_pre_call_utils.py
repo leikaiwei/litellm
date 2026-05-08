@@ -38,6 +38,7 @@ _EXPLICIT_SESSION_HEADERS = frozenset({"x-litellm-trace-id", "x-litellm-session-
 # Session-id values must be non-empty strings of alphanumerics, hyphens, or underscores
 # (covers UUIDs and most common session-id formats).
 _SESSION_ID_VALUE_RE = re.compile(r"^[a-zA-Z0-9_\-]{8,}$")
+_ANTHROPIC_MESSAGES_CLIENT_HEADERS = ("anthropic-beta", "anthropic-version")
 
 
 def _sanitize_for_log(value: Any) -> str:
@@ -832,6 +833,32 @@ class LiteLLMProxyRequestSetup:
         return data
 
     @staticmethod
+    def add_anthropic_messages_headers_to_llm_call(
+        data: dict, headers: dict, request_path: str
+    ) -> dict:
+        if not request_path.rstrip("/").endswith("/v1/messages"):
+            return data
+
+        forwarded_headers = {}
+        for header_name in _ANTHROPIC_MESSAGES_CLIENT_HEADERS:
+            header_value = LiteLLMProxyRequestSetup._get_case_insensitive_header(
+                headers, header_name
+            )
+            if header_value is not None:
+                forwarded_headers[header_name] = header_value
+
+        if not forwarded_headers:
+            return data
+
+        existing_headers = data.get("headers")
+        if not isinstance(existing_headers, dict):
+            existing_headers = {}
+
+        # Claude Code 的工具/Agent 能力由 Anthropic beta 头声明，只定向透传非敏感能力头。
+        data["headers"] = {**existing_headers, **forwarded_headers}
+        return data
+
+    @staticmethod
     def get_internal_user_header_from_mapping(user_header_mapping) -> Optional[str]:
         if not user_header_mapping:
             return None
@@ -1323,6 +1350,12 @@ async def add_litellm_data_to_request(  # noqa: PLR0915
     # check for forwardable headers
     data = LiteLLMProxyRequestSetup.add_headers_to_llm_call_by_model_group(
         data=data, headers=_headers, user_api_key_dict=user_api_key_dict
+    )
+
+    data = LiteLLMProxyRequestSetup.add_anthropic_messages_headers_to_llm_call(
+        data=data,
+        headers=_headers,
+        request_path=request.url.path,
     )
 
     user_api_key_dict = LiteLLMProxyRequestSetup.add_internal_user_from_user_mapping(

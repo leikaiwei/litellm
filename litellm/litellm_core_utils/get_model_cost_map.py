@@ -241,6 +241,13 @@ def _expand_model_aliases(model_cost: dict) -> dict:
     return model_cost
 
 
+def _merge_local_missing_model_cost_entries(remote_map: dict) -> dict:
+    local_map = GetModelCostMap.load_local_model_cost_map()
+
+    # Fork 本地价格表可能包含上游远端尚未发布的模型；远端优先，本地补缺。
+    return {**local_map, **remote_map}
+
+
 def get_model_cost_map(url: str) -> dict:
     """
     Public entry point — returns the model cost map dict.
@@ -296,4 +303,4 @@ def get_model_cost_map(url: str) -> dict:
 
     _cost_map_source_info.source = "remote"
     _cost_map_source_info.fallback_reason = None
-    return _expand_model_aliases(content)
+    return _expand_model_aliases(_merge_local_missing_model_cost_entries(content))

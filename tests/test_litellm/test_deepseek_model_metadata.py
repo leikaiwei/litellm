@@ -95,6 +95,33 @@ class TestDeepSeekModelCostEntries:
         entry = data.get("deepseek/deepseek-reasoner", {})
         assert entry.get("supports_response_schema") is True
 
+    def test_anthropic_deepseek_v4_pro_pricing_matches_native_entry_in_backup(self):
+        data = _load_backup_json()
+        native = data["deepseek/deepseek-v4-pro"]
+        anthropic = data["anthropic/deepseek-v4-pro"]
+
+        assert anthropic["litellm_provider"] == "anthropic"
+        assert anthropic["input_cost_per_token"] == native["input_cost_per_token"]
+        assert anthropic["output_cost_per_token"] == native["output_cost_per_token"]
+        assert (
+            anthropic["input_cost_per_token_cache_hit"]
+            == native["input_cost_per_token_cache_hit"]
+        )
+        assert anthropic["supports_function_calling"] is True
+
+    def test_main_json_anthropic_deepseek_v4_pro_pricing_exists(self):
+        main_path = os.path.join(
+            os.path.dirname(os.path.dirname(litellm.__file__)),
+            "model_prices_and_context_window.json",
+        )
+        with open(main_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        entry = data["anthropic/deepseek-v4-pro"]
+        assert entry["litellm_provider"] == "anthropic"
+        assert entry["input_cost_per_token"] == 4.35e-07
+        assert entry["output_cost_per_token"] == 8.7e-07
+
 
 # ---------------------------------------------------------------------------
 # API-level tests – verify supports_response_schema returns True
@@ -126,6 +153,15 @@ class TestSupportsResponseSchemaDeepSeek:
             )
             is True
         )
+
+    def test_anthropic_deepseek_v4_pro_has_model_info_for_costing(self):
+        model_info = litellm.get_model_info(
+            model="anthropic/deepseek-v4-pro",
+            custom_llm_provider="anthropic",
+        )
+
+        assert model_info["input_cost_per_token"] == 4.35e-07
+        assert model_info["output_cost_per_token"] == 8.7e-07
 
 
 # ---------------------------------------------------------------------------
