@@ -2,8 +2,9 @@
 Translates from OpenAI's `/v1/chat/completions` to DeepSeek's `/v1/chat/completions`
 """
 
-from typing import Any, Coroutine, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Coroutine, List, Literal, Optional, Tuple, Union, cast, overload
 
+import litellm
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     handle_messages_with_content_list_to_str_conversion,
 )
@@ -12,6 +13,7 @@ from litellm.llms.bedrock.common_utils import (
 )
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import AllMessageValues
+from litellm.utils import supports_reasoning
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 
@@ -65,33 +67,81 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
 
         return optional_params
 
-    def transform_request(
-        self,
-        model: str,
-        messages: List[AllMessageValues],
-        optional_params: dict,
-        litellm_params: dict,
-        headers: dict,
-    ) -> dict:
-        # DeepSeek 不支持非标准 JSON Schema 类型（如 Anthropic 的 "custom"）
+    @staticmethod
+    def _normalize_openai_tool_schemas(optional_params: dict) -> None:
         tools = optional_params.get("tools")
-        if isinstance(tools, list):
-            for tool in tools:
-                if not isinstance(tool, dict):
-                    continue
-                func = tool.get("function")
-                if not isinstance(func, dict):
-                    continue
-                params = func.get("parameters")
-                if isinstance(params, dict):
-                    normalize_json_schema_custom_types_to_object(params)
-        return super().transform_request(
-            model=model,
-            messages=messages,
-            optional_params=optional_params,
-            litellm_params=litellm_params,
-            headers=headers,
-        )
+        if not isinstance(tools, list):
+            return
+
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            func = tool.get("function")
+            if not isinstance(func, dict):
+                continue
+            params = func.get("parameters")
+            if isinstance(params, dict):
+                # DeepSeek 不支持 Anthropic custom JSON Schema 类型。
+                normalize_json_schema_custom_types_to_object(params)
+
+    def _fill_reasoning_content(
+        self, messages: List[AllMessageValues]
+    ) -> List[AllMessageValues]:
+        """
+        DeepSeek thinking mode requires `reasoning_content` to be passed back on
+        every assistant message in multi-turn conversations. If it is missing,
+        the API returns:
+          "The reasoning_content in the thinking mode must be passed back to the API."
+
+        For each assistant message that is missing `reasoning_content`:
+          1. Promote it from `thinking_blocks` if present.
+          2. Promote it from `provider_specific_fields["reasoning_content"]` if present
+             (LiteLLM stores provider-specific response fields there).
+          3. Otherwise inject a single space — the minimum value the API accepts.
+        """
+        result: List[AllMessageValues] = []
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                result.append(msg)
+                continue
+
+            patched = dict(cast(dict, msg))
+            thinking_blocks = patched.pop("thinking_blocks", None)
+            if not patched.get("reasoning_content"):
+                reasoning_content = None
+                reasoning_content_from_provider = False
+                if isinstance(thinking_blocks, list):
+                    reasoning_content = " ".join(
+                        block.get("thinking") or ""
+                        for block in thinking_blocks
+                        if isinstance(block, dict) and block.get("type") == "thinking"
+                    )
+
+                provider_fields = patched.get("provider_specific_fields") or {}
+                if not reasoning_content and isinstance(provider_fields, dict):
+                    reasoning_content = provider_fields.get("reasoning_content")
+                    reasoning_content_from_provider = bool(reasoning_content)
+
+                if reasoning_content:
+                    patched["reasoning_content"] = reasoning_content
+                    if reasoning_content_from_provider:
+                        cleaned = dict(provider_fields)
+                        cleaned.pop("reasoning_content", None)
+                        patched["provider_specific_fields"] = cleaned
+                else:
+                    litellm.verbose_logger.warning(
+                        "DeepSeek thinking mode: assistant message is missing "
+                        "`reasoning_content` and none was saved in "
+                        "`provider_specific_fields`. A single-space placeholder "
+                        "is being injected to satisfy API validation, but the "
+                        "model will receive a blank reasoning chain for this turn, "
+                        "which may silently degrade multi-turn response quality. "
+                        "Preserve `reasoning_content` from the original assistant "
+                        "response when building multi-turn conversation history."
+                    )
+                    patched["reasoning_content"] = " "
+            result.append(cast(AllMessageValues, patched))
+        return result
 
     @overload
     def _transform_messages(
@@ -106,42 +156,6 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         is_async: Literal[False] = False,
     ) -> List[AllMessageValues]: ...
 
-    def _ensure_reasoning_content_on_assistant_messages(
-        self, messages: List[AllMessageValues]
-    ) -> List[AllMessageValues]:
-        """
-        DeepSeek V4 thinking mode 要求每条 assistant 历史消息都携带 reasoning_content，
-        缺失则返回 HTTP 400。
-
-        Anthropic 适配器将 thinking 内容存为 thinking_blocks 而非 reasoning_content，
-        需要同时检测两种格式，并将 thinking_blocks 转换为 reasoning_content。
-        """
-        thinking_active = any(
-            msg.get("role") == "assistant"
-            and ("reasoning_content" in msg or msg.get("thinking_blocks"))
-            for msg in messages
-        )
-        if not thinking_active:
-            return messages
-        for message in messages:
-            if message.get("role") != "assistant":
-                continue
-            # 将 thinking_blocks 转换为 reasoning_content
-            if "reasoning_content" not in message:
-                thinking_blocks = message.get("thinking_blocks") or []
-                if thinking_blocks:
-                    message["reasoning_content"] = " ".join(
-                        block.get("thinking") or ""
-                        for block in thinking_blocks
-                        if isinstance(block, dict)
-                        and block.get("type") == "thinking"
-                    )
-                else:
-                    message["reasoning_content"] = ""
-            # DeepSeek 不识别 thinking_blocks 字段
-            message.pop("thinking_blocks", None)  # type: ignore
-        return messages
-
     def _transform_messages(
         self, messages: List[AllMessageValues], model: str, is_async: bool = False
     ) -> Union[List[AllMessageValues], Coroutine[Any, Any, List[AllMessageValues]]]:
@@ -149,7 +163,6 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         DeepSeek does not support content in list format.
         """
         messages = handle_messages_with_content_list_to_str_conversion(messages)
-        messages = self._ensure_reasoning_content_on_assistant_messages(messages)
         if is_async:
             return super()._transform_messages(
                 messages=messages, model=model, is_async=True
@@ -158,6 +171,68 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
             return super()._transform_messages(
                 messages=messages, model=model, is_async=False
             )
+
+    def _thinking_mode_active(self, model: str, optional_params: dict) -> bool:
+        """
+        Returns True only when thinking mode is actually active for this request:
+          - model supports reasoning (capability check)
+          - user explicitly passed thinking={"type": "enabled"} (opt-in check)
+        """
+        return (
+            supports_reasoning(model=model, custom_llm_provider="deepseek")
+            and (optional_params.get("thinking") or {}).get("type") == "enabled"
+        )
+
+    def transform_request(
+        self,
+        model: str,
+        messages: List[AllMessageValues],
+        optional_params: dict,
+        litellm_params: dict,
+        headers: dict,
+    ) -> dict:
+        """
+        Ensures `reasoning_content` is forwarded on assistant messages for
+        multi-turn thinking-mode conversations (issue #28045).
+
+        Only runs when thinking mode is actually active - guarded by both
+        supports_reasoning() (model capability) and optional_params["thinking"]
+        (user explicitly enabled it), preventing spurious injection on models
+        like deepseek-v3.2 that support thinking as opt-in but not always-on.
+        """
+        if self._thinking_mode_active(model=model, optional_params=optional_params):
+            messages = self._fill_reasoning_content(messages)
+        self._normalize_openai_tool_schemas(optional_params)
+        return super().transform_request(
+            model=model,
+            messages=messages,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            headers=headers,
+        )
+
+    async def async_transform_request(
+        self,
+        model: str,
+        messages: List[AllMessageValues],
+        optional_params: dict,
+        litellm_params: dict,
+        headers: dict,
+    ) -> dict:
+        """
+        Async equivalent of transform_request — applies the same reasoning_content
+        fix for multi-turn thinking-mode conversations.
+        """
+        if self._thinking_mode_active(model=model, optional_params=optional_params):
+            messages = self._fill_reasoning_content(messages)
+        self._normalize_openai_tool_schemas(optional_params)
+        return await super().async_transform_request(
+            model=model,
+            messages=messages,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            headers=headers,
+        )
 
     def _get_openai_compatible_provider_info(
         self, api_base: Optional[str], api_key: Optional[str]

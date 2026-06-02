@@ -1,14 +1,13 @@
 import litellm
-from litellm.llms.anthropic.experimental_pass_through.messages.transformation import (
+from litellm.llms.deepseek.messages.transformation import (
     DEEPSEEK_ANTHROPIC_API_BASE,
-    AnthropicMessagesConfig,
     DeepSeekAnthropicMessagesConfig,
 )
 from litellm.utils import ProviderConfigManager
 
 
 def test_deepseek_anthropic_sanitizes_custom_tool_wrapper_fields():
-    config = AnthropicMessagesConfig()
+    config = DeepSeekAnthropicMessagesConfig()
     optional_params = {
         "max_tokens": 1024,
         "tools": [
@@ -34,7 +33,7 @@ def test_deepseek_anthropic_sanitizes_custom_tool_wrapper_fields():
         model="deepseek-v4-pro",
         messages=[{"role": "user", "content": "hello"}],
         anthropic_messages_optional_request_params=optional_params,
-        litellm_params={"api_base": DEEPSEEK_ANTHROPIC_API_BASE},
+        litellm_params={},
         headers={},
     )
 
@@ -54,14 +53,14 @@ def test_deepseek_anthropic_sanitizes_custom_tool_wrapper_fields():
 
 
 def test_deepseek_anthropic_does_not_auto_add_anthropic_beta_header():
-    config = AnthropicMessagesConfig()
+    config = DeepSeekAnthropicMessagesConfig()
 
     headers, _ = config.validate_anthropic_messages_environment(
         headers={},
         model="deepseek-v4-pro",
         messages=[{"role": "user", "content": "hello"}],
         optional_params={"output_format": {"type": "json_schema", "schema": {}}},
-        litellm_params={"api_base": DEEPSEEK_ANTHROPIC_API_BASE},
+        litellm_params={},
         api_key="deepseek-key",
         api_base=None,
     )

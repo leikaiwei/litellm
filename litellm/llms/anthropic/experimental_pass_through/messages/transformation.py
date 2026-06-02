@@ -1,5 +1,4 @@
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 import httpx
 
@@ -7,9 +6,6 @@ from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.litellm_core_utils.litellm_logging import verbose_logger
 from litellm.llms.base_llm.anthropic_messages.transformation import (
     BaseAnthropicMessagesConfig,
-)
-from litellm.llms.bedrock.common_utils import (
-    normalize_json_schema_custom_types_to_object,
 )
 from litellm.types.llms.anthropic import (
     ANTHROPIC_ADVISOR_TOOL_TYPE,
@@ -30,28 +26,6 @@ from ...common_utils import (
 )
 
 DEFAULT_ANTHROPIC_API_VERSION = "2023-06-01"
-DEEPSEEK_ANTHROPIC_API_BASE = "https://api.deepseek.com/anthropic"
-_DEEPSEEK_CUSTOM_TOOL_ALLOWED_FIELDS = {
-    "cache_control",
-    "description",
-    "input_schema",
-    "name",
-}
-
-
-def _is_deepseek_anthropic_api_base(api_base: Optional[str]) -> bool:
-    if not api_base:
-        return False
-    parsed_url = urlparse(api_base)
-    return parsed_url.netloc == "api.deepseek.com" and parsed_url.path.rstrip(
-        "/"
-    ).startswith("/anthropic")
-
-
-def _get_litellm_param(litellm_params: Any, key: str) -> Any:
-    if isinstance(litellm_params, dict):
-        return litellm_params.get(key)
-    return getattr(litellm_params, key, None)
 
 
 class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
@@ -162,46 +136,6 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             api_base = f"{api_base}/v1/messages"
         return api_base
 
-    @staticmethod
-    def _sanitize_deepseek_anthropic_tools(optional_params: Dict) -> None:
-        """
-        DeepSeek 的 Anthropic 兼容接口只支持自定义工具的基础字段。
-
-        Claude Code 的 Agent/Bash/Read/Edit 等工具仍按 Anthropic 原生 tools
-        数组转发；这里只移除 DeepSeek schema 明确不接受的 custom tool
-        包装字段，避免把工具链转换成 OpenAI function calling。
-        """
-        tools = optional_params.get("tools")
-        if not isinstance(tools, list):
-            return
-
-        sanitized_tools: List[Any] = []
-        for tool in tools:
-            if not isinstance(tool, dict):
-                sanitized_tools.append(tool)
-                continue
-
-            tool_type = tool.get("type")
-            if isinstance(tool_type, str) and tool_type.startswith("web_search_"):
-                sanitized_tools.append(tool)
-                continue
-
-            if tool_type in (None, "custom") and "name" in tool:
-                sanitized_tool = {
-                    key: value
-                    for key, value in tool.items()
-                    if key in _DEEPSEEK_CUSTOM_TOOL_ALLOWED_FIELDS
-                }
-                input_schema = sanitized_tool.get("input_schema")
-                if isinstance(input_schema, dict):
-                    normalize_json_schema_custom_types_to_object(input_schema)
-                sanitized_tools.append(sanitized_tool)
-                continue
-
-            sanitized_tools.append(tool)
-
-        optional_params["tools"] = sanitized_tools
-
     def validate_anthropic_messages_environment(
         self,
         headers: dict,
@@ -212,14 +146,10 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
     ) -> Tuple[dict, Optional[str]]:
-        is_deepseek_anthropic = _is_deepseek_anthropic_api_base(
-            api_base or _get_litellm_param(litellm_params, "api_base")
-        )
         # Check for Anthropic OAuth token in Authorization header
-        if not is_deepseek_anthropic:
-            headers, api_key = optionally_handle_anthropic_oauth(
-                headers=headers, api_key=api_key
-            )
+        headers, api_key = optionally_handle_anthropic_oauth(
+            headers=headers, api_key=api_key
+        )
 
         if "x-api-key" not in headers and "authorization" not in headers:
             auth_header = AnthropicModelInfo.get_auth_header(api_key)
@@ -230,11 +160,10 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
         if "content-type" not in headers:
             headers["content-type"] = "application/json"
 
-        if not is_deepseek_anthropic:
-            headers = self._update_headers_with_anthropic_beta(
-                headers=headers,
-                optional_params=optional_params,
-            )
+        headers = self._update_headers_with_anthropic_beta(
+            headers=headers,
+            optional_params=optional_params,
+        )
 
         return headers, api_base
 
@@ -301,6 +230,8 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
         """Translate legacy ``thinking.type=enabled`` to adaptive for 4.6/4.7.
         Caller-provided ``output_config.effort`` is never overridden.
         """
+        from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
         if not AnthropicModelInfo._is_adaptive_thinking_model(model):
             return
         thinking = optional_params.get("thinking")
@@ -308,7 +239,7 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             return
 
         budget = int(thinking.get("budget_tokens") or 0)
-        if budget >= 24000:
+        if budget >= 24000 and AnthropicConfig._supports_effort_level(model, "xhigh"):
             effort = "xhigh"
         elif budget >= 10000:
             effort = "high"
@@ -382,15 +313,11 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
                     transformed_context_management
                 )
 
-        if _is_deepseek_anthropic_api_base(
-            _get_litellm_param(litellm_params, "api_base")
-        ):
-            self._sanitize_deepseek_anthropic_tools(
-                anthropic_messages_optional_request_params
-            )
-
         ####### get required params for all anthropic messages requests ######
-        verbose_logger.debug(f"TRANSFORMATION DEBUG - Messages: {messages}")
+        # Lazy %s: the f-string previously stringified the entire messages
+        # payload on every request regardless of log level (a full scan of the
+        # request body on the hot path). Defer it to when DEBUG is enabled.
+        verbose_logger.debug("TRANSFORMATION DEBUG - Messages: %s", messages)
 
         # Auto-strip advisor blocks from history if advisor tool is absent.
         # Prevents Anthropic 400: advisor_tool_result in history requires advisor tool.
@@ -502,8 +429,13 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
                     ANTHROPIC_BETA_HEADER_VALUES.CONTEXT_MANAGEMENT_2025_06_27.value
                 )
 
-        # Check for structured outputs
-        if optional_params.get("output_format") is not None:
+        # Check for structured outputs. Anthropic's newer request shape nests
+        # the schema under output_config.format; the older top-level
+        # output_format remains supported for backwards compatibility.
+        output_config = optional_params.get("output_config")
+        if optional_params.get("output_format") is not None or (
+            isinstance(output_config, dict) and output_config.get("format") is not None
+        ):
             beta_values.add(
                 ANTHROPIC_BETA_HEADER_VALUES.STRUCTURED_OUTPUT_2025_09_25.value
             )
@@ -538,21 +470,3 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             headers["anthropic-beta"] = ",".join(sorted(beta_values))
 
         return headers
-
-
-class DeepSeekAnthropicMessagesConfig(AnthropicMessagesConfig):
-    def get_complete_url(
-        self,
-        api_base: Optional[str],
-        api_key: Optional[str],
-        model: str,
-        optional_params: dict,
-        litellm_params: dict,
-        stream: Optional[bool] = None,
-    ) -> str:
-        api_base = api_base or _get_litellm_param(litellm_params, "api_base")
-        api_base = api_base or DEEPSEEK_ANTHROPIC_API_BASE
-        api_base = api_base.rstrip("/")
-        if not api_base.endswith("/v1/messages"):
-            api_base = f"{api_base}/v1/messages"
-        return api_base
