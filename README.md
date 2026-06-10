@@ -384,10 +384,144 @@ You can use LiteLLM through either the Proxy Server or Python SDK. Both give you
 
 Support for more providers. Missing a provider or LLM Platform, raise a [feature request](https://github.com/BerriAI/litellm/issues/new?assignees=&labels=enhancement&projects=&template=feature_request.yml&title=%5BFeature%5D%3A+).
 
+### Deploy on AWS or GCP with Terraform
+
+Run the LiteLLM proxy as a production-ready componentized stack (gateway, backend, UI on separate services; managed Postgres + Redis + object store) using the published Terraform modules. Both modules are on the [public Terraform Registry](https://registry.terraform.io/namespaces/BerriAI) — no auth needed.
+
+#### AWS — ECS Fargate + Aurora + ElastiCache + ALB
+
+[![Launch in AWS CloudShell](https://img.shields.io/badge/Launch-AWS_CloudShell-FF9900?logo=amazon-aws&logoColor=white)](https://console.aws.amazon.com/cloudshell/home) — opens an in-browser shell, already authenticated to your AWS account. Once inside, run:
+
+```bash
+git clone https://github.com/BerriAI/litellm.git
+cd litellm/terraform/litellm/aws/examples/default
+cp terraform.tfvars.example terraform.tfvars   # edit region/tenant/env
+terraform init && terraform apply
+```
+
+[Module page →](https://registry.terraform.io/modules/BerriAI/litellm/aws/latest)
+
+Or call the module from your own root config:
+
+```hcl
+# main.tf
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 5.60" }
+  }
+}
+
+provider "aws" {
+  region = "us-west-2"
+}
+
+module "litellm" {
+  source  = "BerriAI/litellm/aws"
+  version = "~> 1.89"
+
+  region = "us-west-2"
+  azs    = ["us-west-2a", "us-west-2b"]
+  tenant = "acme"
+  env    = "prod"
+
+  # Production: provide an ACM cert. Without one, set allow_plaintext_alb = true
+  # (dev/trial only).
+  # acm_certificate_arn = "arn:aws:acm:us-west-2:111122223333:certificate/..."
+  allow_plaintext_alb = true
+}
+
+output "litellm_url" {
+  value = module.litellm.alb_dns_name
+}
+```
+
+```bash
+terraform init
+terraform apply
+```
+
+Provider API keys live in AWS Secrets Manager; reference ARNs via `gateway_extra_secrets`. Full input list and architecture diagram on the [registry page](https://registry.terraform.io/modules/BerriAI/litellm/aws/latest?tab=inputs).
+
+#### GCP — Cloud Run + Cloud SQL + Memorystore + HTTPS LB
+
+[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.png)](https://ssh.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https%3A%2F%2Fgithub.com%2FBerriAI%2Flitellm&cloudshell_workspace=terraform%2Flitellm%2Fgcp%2Fexamples%2Fdefault&cloudshell_tutorial=TUTORIAL.md&cloudshell_image=gcr.io/ds-artifacts-cloudshell/deploystack_custom_image&shellonly=true)
+
+Real 1-click. Opens Cloud Shell, clones this repo, and walks you through `terraform apply` via a built-in [DeployStack tutorial](./terraform/litellm/gcp/examples/default/TUTORIAL.md) — pick the project, the tutorial sets up the Artifact Registry remote repo, writes `terraform.tfvars` from your answers, and runs apply.
+
+[Module page →](https://registry.terraform.io/modules/BerriAI/litellm/google/latest)
+
+To call the module from your own config instead, Cloud Run can't pull from `ghcr.io` directly, so first set up a one-time Artifact Registry remote repo backed by GHCR:
+
+```bash
+gcloud artifacts repositories create litellm \
+  --location=us-central1 \
+  --repository-format=docker \
+  --mode=remote-repository \
+  --remote-docker-repo=https://ghcr.io \
+  --project=my-gcp-project
+```
+
+Then:
+
+```hcl
+# main.tf
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers {
+    google      = { source = "hashicorp/google",      version = "~> 6.10" }
+    google-beta = { source = "hashicorp/google-beta", version = "~> 6.10" }
+  }
+}
+
+provider "google"      { project = "my-gcp-project"; region = "us-central1" }
+provider "google-beta" { project = "my-gcp-project"; region = "us-central1" }
+
+module "litellm" {
+  source  = "BerriAI/litellm/google"
+  version = "~> 1.89"
+
+  project_id = "my-gcp-project"
+  region     = "us-central1"
+  tenant     = "acme"
+  env        = "prod"
+
+  # Replace my-gcp-project with your GCP project ID (same value as project_id above).
+  image_registry = "us-central1-docker.pkg.dev/my-gcp-project/litellm/berriai"
+
+  # Production: provide DNS already pointing at the LB IP for Google-managed certs.
+  # Without one, set allow_plaintext_lb = true (dev/trial only).
+  # lb_domains         = ["proxy.example.com"]
+  allow_plaintext_lb = true
+}
+
+output "litellm_url" {
+  value = module.litellm.load_balancer_url
+}
+```
+
+```bash
+terraform init
+terraform apply
+```
+
+Provider API keys live in Secret Manager; reference resource IDs (e.g. `projects/my-gcp-project/secrets/openai-api-key`) via `gateway_extra_secrets`. Full input list and architecture diagram on the [registry page](https://registry.terraform.io/modules/BerriAI/litellm/google/latest?tab=inputs).
+
+#### Both stacks include
+
+- The full componentized split (gateway / backend / UI as independent services)
+- Managed Postgres (writer + reader) and Redis
+- Versioned object store for proxy state + file uploads
+- An auto-generated `LITELLM_MASTER_KEY` in your cloud's secret manager
+- A one-off migration job that runs `prisma migrate deploy` before the proxy starts
+- The same `proxy_config` surface as the [Helm chart](./helm/litellm/) — pass YAML as a typed map
+
+The Terraform modules live at [`terraform/litellm/aws/`](./terraform/litellm/aws/) and [`terraform/litellm/gcp/`](./terraform/litellm/gcp/) in this repo; the registry entries are read-only mirrors updated on each release.
+
 ### Run in Developer Mode
 #### Services
 1. Setup .env file in root
-2. Run dependant services `docker-compose up db prometheus`
+2. Run dependent services `docker-compose up db prometheus`
 
 #### Backend
 1. (In root) create virtual environment `python -m venv .venv`
