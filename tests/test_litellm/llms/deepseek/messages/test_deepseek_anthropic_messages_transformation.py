@@ -207,11 +207,11 @@ def test_should_retry_on_deepseek_redacted_thinking_400():
     assert config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}) is True
 
 
-def test_should_retry_on_deepseek_reasoning_content_must_be_passed_back_400():
+def test_should_retry_on_deepseek_thinking_must_be_passed_back_400():
     config = DeepSeekAnthropicMessagesConfig()
     error = _http_status_error(
         400,
-        '{"error":{"message":"The reasoning_content in the thinking mode must be passed back to the API."}}',
+        '{"error":{"message":"The `content[].thinking` in the thinking mode must be passed back to the API."}}',
     )
 
     assert config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}) is True
@@ -247,17 +247,15 @@ def test_non_400_not_retried():
     assert config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}) is False
 
 
-def test_transform_on_error_strips_thinking_and_param():
+def test_transform_on_error_converts_redacted_thinking_to_placeholder():
     config = DeepSeekAnthropicMessagesConfig()
     request_data = {
         "model": "deepseek-v4-pro",
-        "thinking": {"type": "enabled"},
         "messages": [
             {"role": "user", "content": "hi"},
             {
                 "role": "assistant",
                 "content": [
-                    {"type": "thinking", "thinking": "foreign chain", "signature": "sig"},
                     {"type": "redacted_thinking", "data": "opaque"},
                     {"type": "text", "text": "answer"},
                 ],
@@ -268,21 +266,86 @@ def test_transform_on_error_strips_thinking_and_param():
 
     result = config.transform_anthropic_messages_request_on_http_error(e=error, request_data=request_data)
 
-    assert "thinking" not in result
     assistant_content = result["messages"][1]["content"]
-    assert all(block.get("type") not in ("thinking", "redacted_thinking") for block in assistant_content)
-    assert assistant_content == [{"type": "text", "text": "answer"}]
+    assert not any(block.get("type") == "redacted_thinking" for block in assistant_content)
+    assert assistant_content == [{"type": "thinking", "thinking": " "}, {"type": "text", "text": "answer"}]
+
+
+def test_transform_on_error_injects_thinking_for_bare_tool_use():
+    config = DeepSeekAnthropicMessagesConfig()
+    request_data = {
+        "model": "deepseek-v4-pro",
+        "messages": [
+            {"role": "user", "content": "北京天气"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "我查一下"},
+                    {"type": "tool_use", "id": "toolu_abc", "name": "get_weather", "input": {"city": "北京"}},
+                ],
+            },
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_abc", "content": "晴"}]},
+        ],
+    }
+    error = _http_status_error(400, "The `content[].thinking` in the thinking mode must be passed back to the API.")
+
+    result = config.transform_anthropic_messages_request_on_http_error(e=error, request_data=request_data)
+
+    assistant_content = result["messages"][1]["content"]
+    assert assistant_content[0] == {"type": "thinking", "thinking": " "}
+    assert any(block.get("type") == "tool_use" for block in assistant_content)
+
+
+def test_transform_on_error_redacted_thinking_with_tool_use_stays_valid():
+    """混合场景：[redacted_thinking, tool_use] 转换后仍保留 thinking 块，不会退化触发 must-be-passed-back。"""
+    config = DeepSeekAnthropicMessagesConfig()
+    request_data = {
+        "model": "deepseek-v4-pro",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "tool_use", "id": "toolu_x", "name": "f", "input": {}},
+                ],
+            },
+        ],
+    }
+    error = _http_status_error(400, "unknown variant `redacted_thinking`")
+
+    result = config.transform_anthropic_messages_request_on_http_error(e=error, request_data=request_data)
+
+    assistant_content = result["messages"][0]["content"]
+    assert not any(block.get("type") == "redacted_thinking" for block in assistant_content)
+    assert any(block.get("type") == "thinking" for block in assistant_content)
+    assert any(block.get("type") == "tool_use" for block in assistant_content)
+
+
+def test_transform_on_error_mutates_request_data_in_place():
+    """handler 丢弃返回值、依赖原地修改，锁死这个契约。"""
+    config = DeepSeekAnthropicMessagesConfig()
+    request_data = {
+        "model": "deepseek-v4-pro",
+        "messages": [
+            {"role": "assistant", "content": [{"type": "redacted_thinking", "data": "opaque"}]},
+        ],
+    }
+    error = _http_status_error(400, "unknown variant `redacted_thinking`")
+
+    result = config.transform_anthropic_messages_request_on_http_error(e=error, request_data=request_data)
+
+    assert result is request_data
+    assert request_data["messages"][0]["content"][0]["type"] == "thinking"
 
 
 def test_transform_on_error_noop_for_unrelated_400():
     config = DeepSeekAnthropicMessagesConfig()
     request_data = {
         "model": "deepseek-v4-pro",
-        "thinking": {"type": "enabled"},
         "messages": [
             {
                 "role": "assistant",
-                "content": [{"type": "thinking", "thinking": "keep me", "signature": "sig"}],
+                "content": [{"type": "redacted_thinking", "data": "opaque"}],
             },
         ],
     }
@@ -290,5 +353,4 @@ def test_transform_on_error_noop_for_unrelated_400():
 
     result = config.transform_anthropic_messages_request_on_http_error(e=error, request_data=request_data)
 
-    assert result["thinking"] == {"type": "enabled"}
-    assert result["messages"][0]["content"][0]["type"] == "thinking"
+    assert result["messages"][0]["content"][0]["type"] == "redacted_thinking"
