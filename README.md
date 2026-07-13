@@ -5,11 +5,12 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 **PostgreSQL 空字节修复** — `proxy/utils.py`
 - 清洗 spend logs 中的 `\x00` 空字节，避免 PostgreSQL jsonb 写入失败（22P05）
 
-**DeepSeek V4 支持及兼容性修复** — `llms/deepseek/chat/transformation.py`
+**DeepSeek V4 支持及兼容性修复** — `llms/deepseek/chat/transformation.py`、`llms/deepseek/messages/transformation.py`
 - 注册 deepseek-v4-flash / deepseek-v4-pro 模型（1M input, 384K output），支持裸名路由
 - 修复 thinking mode 多轮对话中 reasoning_content 缺失导致 API 400 的问题
 - 修复 tool schema 中 Anthropic `type:"custom"` 未转换为标准 `"object"` 的问题
 - 修复 Anthropic thinking_blocks 到 DeepSeek reasoning_content 的转换
+- 修复 Anthropic 兼容端点 fallback（如 qwen/claude 回退到 deepseek）时，历史里外来 thinking 块（含 redacted_thinking）导致 DeepSeek 400 的问题；命中该 400 时自动剥离 thinking 块并重试，直连场景不受影响
 
 **OpenRouter OpenAI 系列模型兼容性修复** — `llms/openrouter/chat/transformation.py`
 - 修复 Claude Code `Agent` tool schema 中 Anthropic `type:"custom"` 透传导致 OpenRouter 下游 OpenAI/Azure 模型 API 400 的问题

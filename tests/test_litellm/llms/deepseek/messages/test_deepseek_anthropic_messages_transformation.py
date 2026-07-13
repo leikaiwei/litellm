@@ -1,3 +1,5 @@
+import httpx
+
 import litellm
 from litellm.llms.anthropic.experimental_pass_through.messages.transformation import (
     AnthropicMessagesConfig,
@@ -7,6 +9,12 @@ from litellm.llms.deepseek.messages.transformation import (
 )
 from litellm.types.router import GenericLiteLLMParams
 from litellm.utils import ProviderConfigManager
+
+
+def _http_status_error(status_code: int, body: str) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://api.deepseek.com/anthropic/v1/messages")
+    response = httpx.Response(status_code, content=body.encode(), request=request)
+    return httpx.HTTPStatusError("error", request=request, response=response)
 
 
 def test_deepseek_provider_uses_anthropic_messages_config():
@@ -187,3 +195,100 @@ def test_deepseek_anthropic_messages_preserves_thinking_and_sanitizes_custom_too
         "input_schema": {"type": "object"},
     }
     assert request["tools"][1]["type"] == "web_search_20260209"
+
+
+def test_should_retry_on_deepseek_redacted_thinking_400():
+    config = DeepSeekAnthropicMessagesConfig()
+    error = _http_status_error(
+        400,
+        '{"error":{"message":"unknown variant `redacted_thinking`, expected one of `text`, `thinking`"}}',
+    )
+
+    assert config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}) is True
+
+
+def test_should_retry_on_deepseek_reasoning_content_must_be_passed_back_400():
+    config = DeepSeekAnthropicMessagesConfig()
+    error = _http_status_error(
+        400,
+        '{"error":{"message":"The reasoning_content in the thinking mode must be passed back to the API."}}',
+    )
+
+    assert config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}) is True
+
+
+def test_should_not_retry_on_unrelated_400():
+    config = DeepSeekAnthropicMessagesConfig()
+    error = _http_status_error(
+        400,
+        '{"error":{"message":"max_tokens is required"}}',
+    )
+
+    assert config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}) is False
+
+
+def test_should_retry_still_handles_signature_error():
+    config = DeepSeekAnthropicMessagesConfig()
+    error = _http_status_error(
+        400,
+        "messages.1.content.0: Invalid `signature` in `thinking` block",
+    )
+
+    assert config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}) is True
+
+
+def test_non_400_not_retried():
+    config = DeepSeekAnthropicMessagesConfig()
+    error = _http_status_error(
+        500,
+        "unknown variant `redacted_thinking`",
+    )
+
+    assert config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}) is False
+
+
+def test_transform_on_error_strips_thinking_and_param():
+    config = DeepSeekAnthropicMessagesConfig()
+    request_data = {
+        "model": "deepseek-v4-pro",
+        "thinking": {"type": "enabled"},
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "foreign chain", "signature": "sig"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "text", "text": "answer"},
+                ],
+            },
+        ],
+    }
+    error = _http_status_error(400, "unknown variant `redacted_thinking`")
+
+    result = config.transform_anthropic_messages_request_on_http_error(e=error, request_data=request_data)
+
+    assert "thinking" not in result
+    assistant_content = result["messages"][1]["content"]
+    assert all(block.get("type") not in ("thinking", "redacted_thinking") for block in assistant_content)
+    assert assistant_content == [{"type": "text", "text": "answer"}]
+
+
+def test_transform_on_error_noop_for_unrelated_400():
+    config = DeepSeekAnthropicMessagesConfig()
+    request_data = {
+        "model": "deepseek-v4-pro",
+        "thinking": {"type": "enabled"},
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "keep me", "signature": "sig"}],
+            },
+        ],
+    }
+    error = _http_status_error(400, "max_tokens is required")
+
+    result = config.transform_anthropic_messages_request_on_http_error(e=error, request_data=request_data)
+
+    assert result["thinking"] == {"type": "enabled"}
+    assert result["messages"][0]["content"][0]["type"] == "thinking"

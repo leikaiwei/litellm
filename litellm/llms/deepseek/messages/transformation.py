@@ -4,7 +4,12 @@ DeepSeek Anthropic-compatible messages transformation config.
 
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
+
 import litellm
+from litellm.llms.anthropic.common_utils import (
+    strip_thinking_blocks_from_anthropic_messages_request_dict,
+)
 from litellm.llms.anthropic.experimental_pass_through.messages.transformation import (
     AnthropicMessagesConfig,
 )
@@ -21,6 +26,31 @@ _DEEPSEEK_CUSTOM_TOOL_ALLOWED_FIELDS = {
     "input_schema",
     "name",
 }
+
+
+def _is_deepseek_thinking_block_error(error_text: str) -> bool:
+    """
+    检测 DeepSeek Anthropic 兼容 /v1/messages 因 assistant 历史里的 thinking 块
+    而返回的 400。
+
+    fallback 时（如 qwen/claude 回退到 deepseek）另一模型产的推理内容被原样回放：
+    DeepSeek 不认 Anthropic 原生 `redacted_thinking` 变体，也会在 thinking 模式下
+    要求回传却缺失时报错。剥掉 thinking 块与顶层 thinking 参数后重试即可恢复。
+
+    已知错误串：
+      "unknown variant `redacted_thinking`"
+      "reasoning_content in the thinking mode must be passed back to the API"
+    """
+    if not error_text:
+        return False
+    lower = error_text.lower()
+    if "redacted_thinking" in lower:
+        return True
+    if "unknown variant" in lower and "thinking" in lower:
+        return True
+    if "must be passed back" in lower and ("reasoning_content" in lower or "thinking" in lower):
+        return True
+    return False
 
 
 class DeepSeekAnthropicMessagesConfig(AnthropicMessagesConfig):
@@ -118,9 +148,7 @@ class DeepSeekAnthropicMessagesConfig(AnthropicMessagesConfig):
 
             if tool_type in (None, "custom") and "name" in tool:
                 sanitized_tool = {
-                    key: value
-                    for key, value in tool.items()
-                    if key in _DEEPSEEK_CUSTOM_TOOL_ALLOWED_FIELDS
+                    key: value for key, value in tool.items() if key in _DEEPSEEK_CUSTOM_TOOL_ALLOWED_FIELDS
                 }
                 input_schema = sanitized_tool.get("input_schema")
                 if isinstance(input_schema, dict):
@@ -149,3 +177,25 @@ class DeepSeekAnthropicMessagesConfig(AnthropicMessagesConfig):
         if "tools" in anthropic_messages_request:
             anthropic_messages_request["tools"] = self._sanitize_tools_for_deepseek(anthropic_messages_request["tools"])
         return anthropic_messages_request
+
+    def should_retry_anthropic_messages_on_http_error(self, e: httpx.HTTPStatusError, litellm_params: dict) -> bool:
+        """
+        除父类的无效签名恢复外，额外覆盖 DeepSeek 因外来 thinking 块导致的 400。
+
+        fallback 到 DeepSeek 时（qwen/claude -> deepseek），assistant 历史带着另一
+        模型产的 thinking 块，DeepSeek 拒绝；剥掉后重试即可恢复。检测只能基于错误
+        文本，因为此钩子拿不到请求体。
+        """
+        if super().should_retry_anthropic_messages_on_http_error(e=e, litellm_params=litellm_params):
+            return True
+        return e.response.status_code == 400 and _is_deepseek_thinking_block_error(e.response.text)
+
+    def transform_anthropic_messages_request_on_http_error(self, e: httpx.HTTPStatusError, request_data: dict) -> dict:
+        """
+        命中 DeepSeek thinking 块 400 时，剥掉 assistant 历史里的 thinking/redacted_thinking
+        块与顶层 thinking 参数后重试。父类的签名错误场景由 super() 处理。
+        """
+        request_data = super().transform_anthropic_messages_request_on_http_error(e=e, request_data=request_data)
+        if e.response.status_code == 400 and _is_deepseek_thinking_block_error(e.response.text):
+            strip_thinking_blocks_from_anthropic_messages_request_dict(request_data)
+        return request_data
