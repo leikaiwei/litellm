@@ -354,3 +354,38 @@ def test_transform_on_error_noop_for_unrelated_400():
     result = config.transform_anthropic_messages_request_on_http_error(e=error, request_data=request_data)
 
     assert result["messages"][0]["content"][0]["type"] == "redacted_thinking"
+
+
+def test_transform_on_error_leaves_plain_text_assistant_untouched():
+    """
+    实测（api.deepseek.com/anthropic/v1/messages）：thinking 模式下纯文本 assistant
+    历史（无 thinking 块、无 tool_use）本就返回 200，must-be-passed-back 只由 tool_use
+    缺 thinking 块触发。锁死注入门控：混合历史下只给 tool_use 那条注入占位块，纯文本
+    那条原样保留，避免把注入放宽成"每条 assistant 都注入"从而伪造空推理链。
+    """
+    config = DeepSeekAnthropicMessagesConfig()
+    request_data = {
+        "model": "deepseek-v4-pro",
+        "messages": [
+            {"role": "user", "content": "1+1?"},
+            {"role": "assistant", "content": [{"type": "text", "text": "2"}]},
+            {"role": "user", "content": "北京天气?"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "我查一下"},
+                    {"type": "tool_use", "id": "toolu_abc", "name": "get_weather", "input": {"city": "北京"}},
+                ],
+            },
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_abc", "content": "晴"}]},
+        ],
+    }
+    error = _http_status_error(400, "The `content[].thinking` in the thinking mode must be passed back to the API.")
+
+    result = config.transform_anthropic_messages_request_on_http_error(e=error, request_data=request_data)
+
+    plain_text_assistant = result["messages"][1]["content"]
+    assert plain_text_assistant == [{"type": "text", "text": "2"}]
+    tool_use_assistant = result["messages"][3]["content"]
+    assert tool_use_assistant[0] == {"type": "thinking", "thinking": " "}
+    assert [block["type"] for block in tool_use_assistant] == ["thinking", "text", "tool_use"]
