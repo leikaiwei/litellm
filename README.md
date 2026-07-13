@@ -18,6 +18,10 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 **Docker 自动发布** — `docker_release_auto.yml`
 - tag/release 时自动构建多架构镜像推送 DockerHub 和 GHCR
 
+已移除的补丁（保留记录，便于回溯）：
+
+- ~~**Anthropic passthrough 非标准 SSE 帧健壮性**~~ — 我们提交的 PR [#26000](https://github.com/BerriAI/litellm/pull/26000) 已并入上游，本地补丁移除
+
 ---
 
 Use it as a **Python SDK** for direct library integration, or deploy the **AI Gateway (Proxy Server)** as a centralized service for your team or organization.
