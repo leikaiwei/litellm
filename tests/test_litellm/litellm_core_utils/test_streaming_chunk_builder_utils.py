@@ -8,6 +8,11 @@ sys.path.insert(
     0, os.path.abspath("../../..")
 )  # Adds the parent directory to the system path
 
+from openai.types.completion_usage import (
+    CompletionTokensDetails as OpenAICompletionTokensDetails,
+)
+from openai.types.completion_usage import CompletionUsage as OpenAICompletionUsage
+
 from litellm import ChatCompletionUsageBlock, stream_chunk_builder
 from litellm.types.utils import GenericStreamingChunk
 from litellm.litellm_core_utils.streaming_chunk_builder_utils import ChunkProcessor
@@ -992,3 +997,78 @@ def test_cost_field_in_usage_chunks():
     assert usage.cost == 0.00025
     assert usage.prompt_tokens == 10
     assert usage.completion_tokens == 5
+
+
+def test_provider_native_completion_usage_is_not_replaced_by_estimate():
+    """Real token counts must survive a provider-native openai CompletionUsage.
+
+    Every other test in this file builds usage with litellm's own ``Usage``,
+    which defines ``__contains__``. An OpenAI-compatible backend hands us
+    ``openai.types.completion_usage.CompletionUsage`` instead, and that class
+    falls back to pydantic's ``__iter__`` -- yielding ``(key, value)`` tuples,
+    so ``"prompt_tokens" in usage_chunk`` was always False and the real counts
+    were silently swapped for ``token_counter()`` estimates.
+
+    The usage object must be attached by assignment, not via the
+    ``ModelResponseStream(usage=...)`` constructor: the constructor coerces it
+    into a litellm ``Usage``, which would restore ``__contains__`` and make
+    this test pass even against the unfixed code. Assignment is also what the
+    real streaming path does (``model_response.usage = chunk.usage``).
+    """
+    chunk = ModelResponseStream(
+        id="chatcmpl-native-usage",
+        created=1745513206,
+        model="deepseek-v4-flash",
+        choices=[
+            StreamingChoices(finish_reason="stop", index=0, delta=Delta(content=""))
+        ],
+    )
+    chunk.usage = OpenAICompletionUsage(
+        prompt_tokens=87,
+        completion_tokens=18,
+        total_tokens=105,
+        completion_tokens_details=OpenAICompletionTokensDetails(reasoning_tokens=16),
+    )
+    assert type(chunk.usage) is OpenAICompletionUsage, "must stay provider-native"
+
+    processor = ChunkProcessor(chunks=[chunk])
+    usage = processor.calculate_usage(
+        chunks=[chunk],
+        model="deepseek-v4-flash",
+        # A short prompt/output so a token_counter fallback lands nowhere near
+        # 87/18 -- that gap is what makes this assertion meaningful.
+        completion_output="hi",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert usage.prompt_tokens == 87
+    assert usage.completion_tokens == 18
+    assert usage.completion_tokens_details is not None
+    assert usage.completion_tokens_details.reasoning_tokens == 16
+
+
+def test_missing_usage_still_falls_back_to_estimate():
+    """The getattr-based read must not turn "no usage reported" into zeros.
+
+    Providers that never send usage still need the token_counter fallback, so
+    fixing the provider-native path must not regress into reporting 0/0.
+    """
+    chunk = ModelResponseStream(
+        id="chatcmpl-no-usage",
+        created=1745513206,
+        model="gpt-4o",
+        choices=[
+            StreamingChoices(finish_reason="stop", index=0, delta=Delta(content="hello"))
+        ],
+    )
+
+    processor = ChunkProcessor(chunks=[chunk])
+    usage = processor.calculate_usage(
+        chunks=[chunk],
+        model="gpt-4o",
+        completion_output="hello",
+        messages=[{"role": "user", "content": "say hello"}],
+    )
+
+    assert usage.prompt_tokens > 0
+    assert usage.completion_tokens > 0

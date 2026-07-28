@@ -1449,6 +1449,45 @@ def test_calculate_total_usage_with_dict_usage_cost():
     assert getattr(usage, "cost", None) == 0.00025
 
 
+def test_calculate_total_usage_with_provider_native_completion_usage():
+    """Regression: a provider-native openai ``CompletionUsage`` must be read.
+
+    ``calculate_total_usage`` used ``"prompt_tokens" in usage``, but only
+    litellm's own ``Usage`` defines ``__contains__``. An OpenAI-compatible
+    backend supplies ``openai.types.completion_usage.CompletionUsage``, whose
+    ``in`` falls back to pydantic's ``__iter__`` over ``(key, value)`` tuples,
+    so both tests were False and this function reported 0/0 -- zeroing the
+    tokens recorded for the request.
+
+    Attach usage by assignment, not through the ``ModelResponseStream``
+    constructor: the constructor coerces it to a litellm ``Usage`` and the test
+    would then pass against the unfixed code. Assignment mirrors the real
+    streaming path.
+    """
+    from openai.types.completion_usage import CompletionUsage as OpenAICompletionUsage
+
+    from litellm.litellm_core_utils.streaming_handler import calculate_total_usage
+
+    chunk = ModelResponseStream(
+        id="test-native",
+        created=1745513206,
+        model="deepseek-v4-flash",
+        choices=[
+            StreamingChoices(finish_reason="stop", index=0, delta=Delta(content=""))
+        ],
+    )
+    chunk.usage = OpenAICompletionUsage(
+        prompt_tokens=87, completion_tokens=18, total_tokens=105
+    )
+    assert type(chunk.usage) is OpenAICompletionUsage, "must stay provider-native"
+
+    usage = calculate_total_usage([chunk])
+
+    assert usage.prompt_tokens == 87
+    assert usage.completion_tokens == 18
+    assert usage.total_tokens == 105
+
+
 @pytest.mark.asyncio
 async def test_openrouter_streaming_cost_after_finish_reason(logging_obj: Logging):
     from litellm.utils import ModelResponseListIterator
