@@ -25,6 +25,13 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 **Docker 自动发布** — `docker_release_auto.yml`
 - tag/release 时自动构建多架构镜像推送 DockerHub 和 GHCR
 
+**流式 tokens 统计修复** — `litellm_core_utils/streaming_chunk_builder_utils.py`、`litellm_core_utils/streaming_handler.py`
+- 症状：OpenAI 兼容后端流式调用时 tokens 严重偏低。实测同一 prompt 真实 87/18，客户端与日志只记 15/2；不带 `include_usage` 的那条路径更是直接记 0
+- 根因：统计代码用 `"prompt_tokens" in usage` 判断字段存在，而只有 litellm 自己的 `Usage` 定义了 `__contains__`；OpenAI 兼容后端解析出的是 SDK 原生 `CompletionUsage`，`in` 退化为遍历 `(key, value)` 元组，恒为 False，于是真实 token 数被丢弃、回落到本地 `token_counter` 估算
+- 影响面：所有走流式的客户端，不限于 Claude Code。tokens 是限流、配额与用量分析的依据，偏低会让这些全部失真
+- 修复：改用 shape-aware 读取（dict 用 `.get()`，pydantic 模型用 `getattr`），三种 usage 形状均正确；后端确实未返回 usage 时仍保留估算兜底
+- 上游同样未修，且无对应 issue / PR
+
 已移除的补丁（保留记录，便于回溯）：
 
 - ~~**Anthropic passthrough 非标准 SSE 帧健壮性**~~ — 我们提交的 PR [#26000](https://github.com/BerriAI/litellm/pull/26000) 已并入上游，本地补丁移除
