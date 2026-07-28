@@ -172,6 +172,34 @@ def test_trailing_empty_choices_usage_chunk_emits_message_delta_usage():
     assert message_delta["usage"]["output_tokens"] == 5
 
 
+def test_trailing_empty_choices_chunk_without_usage_does_not_crash_stream():
+    """Real-world shape captured from opencode Go's OpenAI-compatible endpoint.
+
+    Its stream ends with a vendor-private cost frame -- ``choices: []`` and
+    ``usage: null`` -- arriving *after* a ``finish_reason`` chunk that already
+    carried the real usage. Because ``usage`` is None the hold-and-merge path
+    never fires, so this frame exercises the guards on their own. The stream
+    must still terminate cleanly with the usage from the finish chunk.
+    """
+    chunks = [
+        ModelResponseStream(
+            choices=[StreamingChoices(index=0, delta=Delta(content="Hi"), finish_reason=None)],
+        ),
+        ModelResponseStream(
+            choices=[StreamingChoices(index=0, delta=Delta(content=""), finish_reason="stop")],
+            usage=Usage(prompt_tokens=87, completion_tokens=18, total_tokens=105),
+        ),
+        ModelResponseStream(choices=[]),
+    ]
+    wrapper = AnthropicStreamWrapper(completion_stream=iter(chunks), model="gpt-4o")
+    events = list(wrapper)
+
+    message_delta = next(event for event in events if event.get("type") == "message_delta")
+    assert message_delta["usage"]["input_tokens"] == 87
+    assert message_delta["usage"]["output_tokens"] == 18
+    assert any(event.get("type") == "message_stop" for event in events)
+
+
 def test_leading_empty_choices_chunk_does_not_crash_stream():
     """Azure emits a leading ``prompt_filter_results`` chunk with ``choices: []``
     before any content. It must be tolerated and the following content emitted."""
