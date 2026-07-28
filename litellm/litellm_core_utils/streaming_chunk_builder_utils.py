@@ -460,25 +460,18 @@ class ChunkProcessor:
         )
 
     def _usage_chunk_calculation_helper(self, usage_chunk: Usage) -> dict:
-        prompt_tokens = 0
-        completion_tokens = 0
-        ## anthropic prompt caching information ##
-        cache_creation_input_tokens: Optional[int] = None
-        cache_read_input_tokens: Optional[int] = None
         completion_tokens_details: Optional[CompletionTokensDetails] = None
         prompt_tokens_details: Optional[PromptTokensDetailsWrapper] = None
-        cost: Optional[float] = None
 
-        if "prompt_tokens" in usage_chunk:
-            prompt_tokens = usage_chunk.get("prompt_tokens", 0) or 0
-        if "completion_tokens" in usage_chunk:
-            completion_tokens = usage_chunk.get("completion_tokens", 0) or 0
-        if "cache_creation_input_tokens" in usage_chunk:
-            cache_creation_input_tokens = usage_chunk.get("cache_creation_input_tokens")
-        if "cache_read_input_tokens" in usage_chunk:
-            cache_read_input_tokens = usage_chunk.get("cache_read_input_tokens")
-        if "cost" in usage_chunk:
-            cost = usage_chunk.get("cost")
+        # getattr, not `in`: only litellm's Usage defines __contains__, so `in`
+        # was always False for a provider-native openai CompletionUsage and real
+        # token counts got replaced by token_counter() estimates.
+        prompt_tokens: int = getattr(usage_chunk, "prompt_tokens", 0) or 0
+        completion_tokens: int = getattr(usage_chunk, "completion_tokens", 0) or 0
+        ## anthropic prompt caching information ##
+        cache_creation_input_tokens: Optional[int] = getattr(usage_chunk, "cache_creation_input_tokens", None)
+        cache_read_input_tokens: Optional[int] = getattr(usage_chunk, "cache_read_input_tokens", None)
+        cost: Optional[float] = getattr(usage_chunk, "cost", None)
         if hasattr(usage_chunk, "completion_tokens_details"):
             if isinstance(usage_chunk.completion_tokens_details, dict):
                 completion_tokens_details = CompletionTokensDetails(**usage_chunk.completion_tokens_details)
