@@ -2254,6 +2254,12 @@ class CustomStreamWrapper:
         return chunk
 
 
+def _read_usage_int(usage: Union[dict, BaseModel], field: str) -> int:
+    """Read an int token count from a usage object of any supported shape."""
+    raw = usage.get(field) if isinstance(usage, dict) else getattr(usage, field, None)
+    return raw or 0
+
+
 def calculate_total_usage(chunks: List[ModelResponse]) -> Usage:
     """Assume most recent usage chunk has total usage uptil then."""
     prompt_tokens: int = 0
@@ -2264,10 +2270,11 @@ def calculate_total_usage(chunks: List[ModelResponse]) -> Usage:
         if "usage" in chunk and chunk["usage"] is not None:
             usage = chunk["usage"]
             latest_usage_chunk = usage
-            if "prompt_tokens" in usage:
-                prompt_tokens = usage.get("prompt_tokens", 0) or 0
-            if "completion_tokens" in usage:
-                completion_tokens = usage.get("completion_tokens", 0) or 0
+            # `usage` may be a dict, a litellm Usage, or a provider-native openai
+            # CompletionUsage. The old `"prompt_tokens" in usage` test was always
+            # False for the last one, zeroing every token count.
+            prompt_tokens = _read_usage_int(usage, "prompt_tokens")
+            completion_tokens = _read_usage_int(usage, "completion_tokens")
 
     returned_usage_chunk = Usage(
         prompt_tokens=prompt_tokens,
