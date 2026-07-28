@@ -14,7 +14,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 **Anthropic 流式适配器空 choices 防护** — `llms/anthropic/experimental_pass_through/adapters/streaming_iterator.py`、`llms/anthropic/experimental_pass_through/adapters/transformation.py`、`responses/litellm_completion_transformation/streaming_iterator.py`
 - 症状：Claude Code 等 `/v1/messages` 客户端流式调用 OpenAI 形状后端（如 `custom_openai`）时，内容能完整收到，但请求被记为错误且 tokens=0，日志里是 `IndexError: list index out of range`
-- 根因：适配器对流式请求强制 `stream_options={"include_usage": True}`，OpenAI 兼容后端因此在流末尾追发一个 `choices: []` 只带 usage 的 chunk（OpenAI 规范标准行为），而适配器多处裸取 `choices[0]`。崩溃发生在响应头已发出之后，所以状态码仍是 200，只是缺了 `message_delta` 和 `message_stop`
+- 根因：OpenAI 兼容后端会在流末尾发出 `choices: []` 的空帧，而适配器多处裸取 `choices[0]`。空帧有两种来源：OpenAI 规范里 `include_usage` 的 usage-only 尾帧（适配器对流式请求强制开启该选项），以及厂商私有帧（实测 opencode Go 发的是 `x-opencode-type: inference-cost` 成本帧，`usage` 为 null，真实 usage 挂在前一个 `finish_reason` 帧上）。崩溃发生在响应头已发出之后，所以状态码仍是 200，只是缺了 `message_delta` 和 `message_stop`
 - 修复：空 choices 的 chunk 不丢弃，加判空守卫后继续走已有的 usage 合并路径，usage 仍能进 `message_delta`。同类问题在 Responses API 桥接层一并修掉（Azure 前导 `prompt_filter_results` 空帧也走这条路）
 - 对应上游 open PR [#34455](https://github.com/BerriAI/litellm/pull/34455)，改法与其一致；上游合并后本地补丁可移除
 
