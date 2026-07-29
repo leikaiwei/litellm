@@ -54,6 +54,9 @@ DEFAULT_VISION_PROMPT = (
 DEFAULT_DESCRIPTION_TEMPLATE = "[Image description: {description}]"
 DEFAULT_FAILURE_TEMPLATE = "[Image could not be processed: {error}]"
 DEFAULT_CACHE_TTL_SECONDS = 3600
+# 视觉模型常指向负载均衡组，组内成员可能限流或临时不可用。组内重试能换到别的成员，
+# 所以默认给 2 次；跨组 fallback 另行禁掉（见 _call_vision_model）
+DEFAULT_VISION_NUM_RETRIES = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +178,7 @@ class VisionToTextGuardrail(CustomGuardrail):
         failure_template: Optional[str] = None,
         max_images: Optional[int] = None,
         vision_timeout: Optional[float] = None,
+        vision_num_retries: int = DEFAULT_VISION_NUM_RETRIES,
         cache_ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS,
         llm_router: Optional["Router"] = None,
         **kwargs: Any,
@@ -187,6 +191,8 @@ class VisionToTextGuardrail(CustomGuardrail):
         self.failure_template = failure_template or DEFAULT_FAILURE_TEMPLATE
         self.max_images = max_images
         self.vision_timeout = vision_timeout
+        # 组内重试可绕开负载均衡组里不支持图片的成员；跨组 fallback 一律禁掉（见 _call_vision_model）
+        self.vision_num_retries = vision_num_retries
         self.cache_ttl_seconds = cache_ttl_seconds
         self._llm_router = llm_router
         # 外部 guardrail 不会被注入 llm_router，其余 litellm_params 由 **kwargs 吸收
@@ -285,11 +291,16 @@ class VisionToTextGuardrail(CustomGuardrail):
         try:
             # 不传 guardrails，deployment 级 hook 会早退；SDK 层调用本就不过 proxy 的 pre_call_hook
             if router is not None:
+                # 必须禁掉 fallback：识图失败若降级到纯文本模型，那个模型看不见图却会照样
+                # 编一段"描述"，被当成真结果写进 messages。宁可 fail-open 插占位文本，
+                # 也不能把幻觉描述喂给下游
                 response = await router.acompletion(
                     model=self.vision_model,
                     messages=messages,
                     stream=False,
                     timeout=self.vision_timeout,
+                    num_retries=self.vision_num_retries,
+                    fallbacks=[],
                 )
             else:
                 response = await litellm.acompletion(

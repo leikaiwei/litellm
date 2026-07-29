@@ -365,6 +365,41 @@ async def test_vision_call_omits_guardrails_so_it_cannot_re_enter_this_hook():
 
 
 @pytest.mark.asyncio
+async def test_vision_call_disables_fallbacks():
+    """
+    识图调用绝不能 fallback。视觉模型组的降级目标往往是纯文本模型，那个模型看不见图
+    却会编一段"描述"，会被当成真结果写进 messages —— 比报错更糟。宁可走占位符。
+    """
+    router = _router("described")
+
+    await _run(_make_guardrail(router=router), [{"role": "user", "content": [OPENAI_IMAGE]}])
+
+    assert router.acompletion.call_args.kwargs["fallbacks"] == []
+
+
+@pytest.mark.asyncio
+async def test_vision_call_retries_within_the_group_by_default():
+    """组内重试能换到别的成员，绕开限流或临时不可用的部署"""
+    router = _router("described")
+
+    await _run(_make_guardrail(router=router), [{"role": "user", "content": [OPENAI_IMAGE]}])
+
+    assert router.acompletion.call_args.kwargs["num_retries"] == 2
+
+
+@pytest.mark.asyncio
+async def test_vision_num_retries_is_configurable():
+    router = _router("described")
+
+    await _run(
+        _make_guardrail(router=router, vision_num_retries=0),
+        [{"role": "user", "content": [OPENAI_IMAGE]}],
+    )
+
+    assert router.acompletion.call_args.kwargs["num_retries"] == 0
+
+
+@pytest.mark.asyncio
 async def test_custom_prompt_and_template_are_used():
     router = _router("described")
     guardrail = _make_guardrail(

@@ -61,7 +61,9 @@ guardrails:
 ```
 
 可选参数：`vision_prompt`、`description_template`、`failure_template`、`max_images`、
-`vision_timeout`、`cache_ttl_seconds`。
+`vision_timeout`、`vision_num_retries`（默认 2）、`cache_ttl_seconds`。
+
+`vision_model` 可以直接指向一个负载均衡组（组里成员支持视觉即可），不必是单个部署。
 
 ### 只对指定模型生效
 
@@ -85,7 +87,12 @@ guardrail 写在 deployment 的 `litellm_params.guardrails` 上，由
 直接复用会静默漏掉 Claude Code 的全部图片，所以本文件自带覆盖两种形状、保留完整 data URL 的提取逻辑。
 
 **失败处理**：fail-open。识图失败或返回空时替换成 `[Image could not be processed: ...]`，
-请求继续，模型知道此处原本有图。失败结果不入缓存，下次请求重试。
+主请求继续、绝不中断，模型也知道此处原本有图。失败结果不入缓存，下次请求会重试。
+
+**识图调用禁 fallback**（`fallbacks=[]`）：视觉模型组的降级目标往往是纯文本模型，而那个模型
+看不见图却会煞有介事地编一段"描述"，会被当成真结果写进 messages。这比报错更糟——报错会走占位符，
+你知道图没读到；幻觉描述则看起来完全正常。组内重试（`num_retries`，默认 2）保留，它只在同组内
+换部署，能绕开限流或临时不可用的成员。
 
 **prompt caching**：改写前缀会破坏缓存命中，故按 (视觉模型, prompt, 模板, 图片 URL) 的
 sha256 缓存描述文本，保证同图产出逐字节相同。
@@ -105,7 +112,11 @@ sha256 缓存描述文本，保证同图产出逐字节相同。
 
 ### 待补 / 已知问题
 
-- 识图侧目前无可用视觉后端（newapi 上只有两个 deepseek），端到端识图**准确性**尚未用真实视觉模型验证；
-  上面的实测走的是 fail-open 路径，证明的是改写机制通、图片没漏给后端
-- 与本 guardrail 无关的既有 bug：`/v1/messages` 打 newapi 时 litellm 解析响应报
+- 端到端识图**准确性**尚未用真实视觉模型验证。上面的实测走的是 fail-open 路径，
+  证明的是改写机制通、两个端点都生效、图片没漏给后端。生产上把 `vision_model` 指向
+  已有的、成员支持视觉的模型组即可，但该组只存在于生产，本地跑不到（凭据在生产 DB 里加密），
+  所以这一步要在生产验证
+- 视觉调用未设 `max_tokens`。若组内命中推理模型，描述那次调用可能在 reasoning 上多花 token，
+  真实用量出来后可按需加上限
+- 与本 guardrail 无关的既有 bug：`/v1/messages` 打 OpenAI 形状后端时 litellm 解析响应报
   `APIError: OpenAIException`（后端其实正常返回了）。纯文本、不挂 guardrail 也复现，属于独立问题
