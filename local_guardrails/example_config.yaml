@@ -1,0 +1,36 @@
+model_list:
+  # 纯文本模型：挂 guardrail，带图请求会被改写成文本
+  - model_name: deepseek-v4-flash
+    litellm_params:
+      model: openai/deepseek-v4-flash
+      api_base: os.environ/TEXT_MODEL_API_BASE
+      api_key: os.environ/TEXT_MODEL_API_KEY
+      guardrails: ["vision-to-text"]
+
+  # 对照：同一后端不挂 guardrail，带图仍会失败
+  - model_name: deepseek-no-guardrail
+    litellm_params:
+      model: openai/deepseek-v4-flash
+      api_base: os.environ/TEXT_MODEL_API_BASE
+      api_key: os.environ/TEXT_MODEL_API_KEY
+
+  # 识图侧部署。换成任意支持视觉的模型即可
+  - model_name: vision-describer
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/VISION_MODEL_API_KEY
+
+guardrails:
+  - guardrail_name: "vision-to-text"
+    litellm_params:
+      guardrail: vision_to_text.VisionToTextGuardrail
+      mode: "pre_call"
+      default_on: false
+      vision_model: vision-describer
+      vision_timeout: 60
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
