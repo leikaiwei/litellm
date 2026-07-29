@@ -140,6 +140,26 @@ if TYPE_CHECKING:
     from litellm.types.llms.anthropic import ContentBlockContentBlockDict
 
 
+# Anthropic 独有的顶层参数，OpenAI Chat Completions 侧无对应字段，也不是
+# litellm.completion() 的正式参数。不显式丢弃的话会经
+# _copy_untranslated_anthropic_params 原样进 litellm.acompletion(**kwargs)，
+# 一路漏到 OpenAI SDK 抛 "got an unexpected keyword argument" -> 500。
+# drop_params 拦不住：它只比对 supported_openai_params，这些名字压根不在表里。
+#
+# 刻意不含 top_k：它同样会漏成 500，但 vertex_ai 等 provider 真支持它，
+# 而本适配层拿不到解析后的 provider（model 此处是 model_group 名），
+# 在这里无条件丢弃会让 gemini 等后端静默失去 top_k。
+# 需要按 provider 能力决定去留，另行修复。
+ANTHROPIC_ONLY_PARAMS_WITHOUT_OPENAI_EQUIVALENT: frozenset[str] = frozenset(
+    {
+        "cache_control",
+        "inference_geo",
+        "mcp_servers",
+        "speed",
+    }
+)
+
+
 class AnthropicAdapter:
     def __init__(self) -> None:
         pass
@@ -325,6 +345,7 @@ class LiteLLMAnthropicMessagesAdapter:
         return [
             "messages",
             "metadata",
+            "stop_sequences",
             "system",
             "tool_choice",
             "tools",
@@ -582,6 +603,14 @@ class LiteLLMAnthropicMessagesAdapter:
                     assistant_content = "".join(block.get("text", "") for block in assistant_content_list)
                 else:
                     assistant_content = assistant_message_str
+
+                # OpenAI 规范只允许带 tool_calls 的 assistant 消息省略 content。
+                # 仅含 thinking 块的历史消息（Claude Code 回放 thinking-only 那一轮，
+                # 且空 text 块已被 strip_empty_text_blocks_from_anthropic_messages 摘掉）
+                # 会走到这里拿到 None，随后被 utils.py 的 cleanup_none_field_in_message
+                # 连键一起删掉，产出既无 content 又无 tool_calls 的非法消息 -> 上游 400。
+                if assistant_content is None and len(tool_calls) == 0:
+                    assistant_content = ""
 
                 assistant_message = ChatCompletionAssistantMessage(
                     role="assistant",
@@ -1031,14 +1060,39 @@ class LiteLLMAnthropicMessagesAdapter:
         if response_format:
             new_kwargs["response_format"] = response_format
 
+    def _translate_stop_sequences_to_openai(
+        self,
+        anthropic_message_request: AnthropicMessagesRequest,
+        new_kwargs: ChatCompletionRequest,
+    ) -> None:
+        """把 Anthropic 的 ``stop_sequences`` 映射成 OpenAI 的 ``stop``。
+
+        没有这一步时 ``stop_sequences`` 会被原样拷进 ``litellm.acompletion``，
+        漏到 OpenAI SDK 抛 ``TypeError: got an unexpected keyword argument
+        'stop_sequences'`` -> 500。``stop`` 是 OpenAI 的标准参数，
+        OpenAI 兼容后端（含 custom_openai）都在 supported_openai_params 里。
+        """
+        stop_sequences: Any = anthropic_message_request.get("stop_sequences")
+        if not stop_sequences:
+            return
+        new_kwargs["stop"] = stop_sequences
+
     def _copy_untranslated_anthropic_params(
         self,
         anthropic_message_request: AnthropicMessagesRequest,
         new_kwargs: ChatCompletionRequest,
     ) -> None:
-        """Copy through anthropic params that do not require translation."""
+        """Copy through anthropic params that do not require translation.
+
+        Anthropic-only params without an OpenAI equivalent are skipped: copying
+        them here lands them in ``litellm.acompletion(**kwargs)`` and then in the
+        OpenAI SDK call, which raises ``TypeError: got an unexpected keyword
+        argument`` -> 500 on every OpenAI-shaped backend.
+        """
         translatable_params = self.translatable_anthropic_params()
         for k, v in anthropic_message_request.items():
+            if k in ANTHROPIC_ONLY_PARAMS_WITHOUT_OPENAI_EQUIVALENT:
+                continue
             if k not in translatable_params:  # pass remaining params as is
                 new_kwargs[k] = v  # type: ignore
 
@@ -1100,6 +1154,11 @@ class LiteLLMAnthropicMessagesAdapter:
         )
         ## CONVERT OUTPUT_FORMAT to RESPONSE_FORMAT
         self._translate_output_format_to_openai(
+            anthropic_message_request=anthropic_message_request,
+            new_kwargs=new_kwargs,
+        )
+        ## CONVERT STOP_SEQUENCES to STOP
+        self._translate_stop_sequences_to_openai(
             anthropic_message_request=anthropic_message_request,
             new_kwargs=new_kwargs,
         )

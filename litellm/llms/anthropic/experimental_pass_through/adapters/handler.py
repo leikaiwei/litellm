@@ -16,6 +16,7 @@ import litellm
 from litellm._logging import verbose_logger
 from litellm.litellm_core_utils.asyncify import run_async_function
 from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+    ANTHROPIC_ONLY_PARAMS_WITHOUT_OPENAI_EQUIVALENT,
     AnthropicAdapter,
 )
 from litellm.llms.anthropic.experimental_pass_through.context_management import (
@@ -37,7 +38,14 @@ if TYPE_CHECKING:
 
 
 # Anthropic-only keys already mapped by the translator; strip on extra_kwargs re-merge.
-ANTHROPIC_ONLY_REQUEST_KEYS: frozenset[str] = frozenset({"output_config"})
+# Params in ANTHROPIC_ONLY_PARAMS_WITHOUT_OPENAI_EQUIVALENT reach this method via
+# ``extra_kwargs`` (they are not named args of ``_prepare_completion_kwargs``, so the
+# translator never sees them) and would otherwise be re-merged into
+# ``completion_kwargs`` -> OpenAI SDK -> ``TypeError: got an unexpected keyword
+# argument`` -> 500 on every OpenAI-shaped backend.
+ANTHROPIC_ONLY_REQUEST_KEYS: frozenset[str] = frozenset({"output_config"}) | (
+    ANTHROPIC_ONLY_PARAMS_WITHOUT_OPENAI_EQUIVALENT
+)
 
 
 def _messages_have_compaction_block(messages: List[Dict]) -> bool:
