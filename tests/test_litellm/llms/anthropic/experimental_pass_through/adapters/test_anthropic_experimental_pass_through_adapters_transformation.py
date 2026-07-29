@@ -3147,3 +3147,130 @@ def test_translate_anthropic_tools_to_openai_preserves_parameters_type():
     params = new_tools[0]["function"]["parameters"]
     assert params["type"] == "object"
     assert new_tools[0]["type"] == "function"
+
+
+def test_translate_anthropic_messages_to_openai_thinking_only_assistant_keeps_content_key():
+    """A thinking-only assistant history message must carry ``content: ""``.
+
+    OpenAI only allows omitting ``content`` when the assistant message carries
+    ``tool_calls``. Claude Code replays the thinking-only turn as history, and
+    ``strip_empty_text_blocks_from_anthropic_messages`` removes the accompanying
+    ``{"type": "text", "text": ""}`` block before translation, so the adapter used
+    to emit ``content=None``. ``validate_and_fix_openai_messages`` then dropped the
+    key entirely, producing a message with neither ``content`` nor ``tool_calls``
+    that OpenAI-shaped backends reject with a 400.
+    """
+    from litellm.utils import validate_and_fix_openai_messages
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result = adapter.translate_anthropic_messages_to_openai(
+        messages=[
+            AnthropicMessagesUserMessageParam(role="user", content=[{"type": "text", "text": "explain CAP"}]),
+            AnthopicMessagesAssistantMessageParam(
+                role="assistant",
+                content=[{"type": "thinking", "thinking": "CAP has three parts", "signature": "sig"}],
+            ),
+        ]
+    )
+
+    assistant = result[1]
+    assert assistant["content"] == ""
+
+    # The key must still be there after the None-stripping pass that deleted it before.
+    validated = validate_and_fix_openai_messages(messages=result)
+    assert "content" in validated[1], "content key was dropped -> backend 400"
+    assert validated[1]["content"] == ""
+
+
+def test_translate_anthropic_messages_to_openai_tool_call_only_assistant_omits_content():
+    """``tool_calls``-only assistant messages may legally omit ``content``.
+
+    Guards the fix above from over-reaching: OpenAI permits a missing ``content``
+    exactly when ``tool_calls`` is present, so no empty string should be injected.
+    """
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result = adapter.translate_anthropic_messages_to_openai(
+        messages=[
+            AnthropicMessagesUserMessageParam(role="user", content=[{"type": "text", "text": "weather?"}]),
+            AnthopicMessagesAssistantMessageParam(
+                role="assistant",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "call_00_abc",
+                        "name": "get_weather",
+                        "input": {"location": "Tokyo"},
+                    }
+                ],
+            ),
+        ]
+    )
+
+    assistant = result[1]
+    assert assistant["content"] is None
+    assert len(assistant["tool_calls"]) == 1
+
+
+def test_translate_anthropic_to_openai_maps_stop_sequences_to_stop():
+    """``stop_sequences`` must become OpenAI ``stop``.
+
+    Left untranslated it was copied verbatim into ``litellm.acompletion(**kwargs)``
+    and reached the OpenAI SDK, raising ``TypeError: got an unexpected keyword
+    argument 'stop_sequences'`` -> HTTP 500 on every OpenAI-shaped backend.
+    """
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    new_kwargs, _ = adapter.translate_anthropic_to_openai(
+        {
+            "model": "deepseek-v4-pro",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop_sequences": ["END"],
+        }
+    )
+
+    assert new_kwargs["stop"] == ["END"]
+    assert "stop_sequences" not in new_kwargs
+
+
+def test_translate_anthropic_to_openai_drops_anthropic_only_params():
+    """Anthropic-only params with no OpenAI equivalent must not be copied through.
+
+    Each of these previously reached the OpenAI SDK as an unexpected keyword
+    argument and turned into a 500. ``drop_params`` does not help: they are absent
+    from ``supported_openai_params``, so nothing compares against them.
+    """
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    new_kwargs, _ = adapter.translate_anthropic_to_openai(
+        {
+            "model": "deepseek-v4-pro",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "cache_control": {"type": "ephemeral"},
+            "inference_geo": "us",
+            "mcp_servers": [{"type": "url", "url": "https://example.com/mcp", "name": "x"}],
+            "speed": "fast",
+        }
+    )
+
+    for leaked in ("cache_control", "inference_geo", "mcp_servers", "speed"):
+        assert leaked not in new_kwargs, f"{leaked} leaks into the OpenAI SDK call -> 500"
+
+
+def test_translate_anthropic_to_openai_preserves_params_with_openai_equivalents():
+    """The drop list must not swallow params that legitimately pass through."""
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    new_kwargs, _ = adapter.translate_anthropic_to_openai(
+        {
+            "model": "deepseek-v4-pro",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "service_tier": "auto",
+        }
+    )
+
+    assert new_kwargs["temperature"] == 0.5
+    assert new_kwargs["top_p"] == 0.9
+    assert new_kwargs["service_tier"] == "auto"
+    assert new_kwargs["max_tokens"] == 64

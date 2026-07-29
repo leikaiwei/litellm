@@ -88,6 +88,80 @@ class TestAnthropicOnlyRequestKeysExport:
     def test_contains_output_config(self):
         assert "output_config" in ANTHROPIC_ONLY_REQUEST_KEYS
 
+    @pytest.mark.parametrize("param", ["cache_control", "inference_geo", "mcp_servers", "speed"])
+    def test_contains_anthropic_only_params_without_openai_equivalent(self, param):
+        """Anthropic-only params reach ``_prepare_completion_kwargs`` through
+        ``extra_kwargs`` — they are not named args, so the translator never sees
+        them and cannot drop them. They must be excluded here instead, or they
+        get re-merged into ``completion_kwargs`` and hit the OpenAI SDK as an
+        unexpected keyword argument (HTTP 500 on every OpenAI-shaped backend)."""
+        assert param in ANTHROPIC_ONLY_REQUEST_KEYS
+
+
+class TestAnthropicOnlyParamsStrippedFromCompletionKwargs:
+    """Regression: ``stop_sequences`` / ``top_k`` aside, Anthropic-only params
+    with no OpenAI equivalent used to leak through the ``extra_kwargs`` re-merge
+    and turn into ``TypeError: got an unexpected keyword argument`` -> 500."""
+
+    @pytest.mark.parametrize(
+        "param,value",
+        [
+            ("cache_control", {"type": "ephemeral"}),
+            ("inference_geo", "us"),
+            ("mcp_servers", [{"type": "url", "url": "https://example.com/mcp", "name": "x"}]),
+            ("speed", "fast"),
+        ],
+    )
+    def test_param_is_stripped(self, param, value):
+        extra_kwargs = {"custom_llm_provider": "custom_openai", param: value}
+
+        result = _call_prepare(extra_kwargs=extra_kwargs)
+        completion_kwargs = result[0] if isinstance(result, tuple) else result
+
+        assert param not in completion_kwargs, f"{param} reaches the OpenAI SDK -> 500"
+
+    def test_openai_equivalent_params_still_pass_through(self):
+        """Guards the strip from over-reaching: params the SDK accepts must survive."""
+        extra_kwargs = {
+            "custom_llm_provider": "custom_openai",
+            "user": "u-1",
+            "seed": 42,
+        }
+
+        result = _call_prepare(extra_kwargs=extra_kwargs)
+        completion_kwargs = result[0] if isinstance(result, tuple) else result
+
+        assert completion_kwargs["user"] == "u-1"
+        assert completion_kwargs["seed"] == 42
+
+    def test_stop_sequences_becomes_stop(self):
+        """``stop_sequences`` is a named arg, so the translator maps it to the
+        OpenAI ``stop`` param rather than leaking it into the SDK call.
+
+        Calls ``_prepare_completion_kwargs`` directly: the ``_call_prepare``
+        helper pins ``stop_sequences=None``.
+        """
+        completion_kwargs, _ = LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
+            max_tokens=1024,
+            messages=MESSAGES,
+            model="deepseek-v4-pro",
+            metadata=None,
+            stop_sequences=["END"],
+            stream=False,
+            system=None,
+            temperature=None,
+            thinking=None,
+            tool_choice=None,
+            tools=None,
+            top_k=None,
+            top_p=None,
+            output_format=None,
+            extra_kwargs={"custom_llm_provider": "custom_openai"},
+        )
+
+        assert completion_kwargs["stop"] == ["END"]
+        assert "stop_sequences" not in completion_kwargs
+
 
 class TestOutputConfigStrippedFromCompletionKwargs:
     """``output_config`` must not survive the post-translation re-merge into
