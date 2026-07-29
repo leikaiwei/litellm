@@ -1,8 +1,13 @@
 model_list:
   # 纯文本模型：挂 guardrail，带图请求会被改写成文本
+  #
+  # provider 必须写 custom_openai（或 anthropic），不要用 openai/ 前缀：
+  # 写 openai/ 时 /v1/messages 会被路由到 Responses API，litellm 解析响应报 APIError，
+  # 而后端其实正常返回了内容。这与本 guardrail 无关，但会让上线看起来像 guardrail 的问题
   - model_name: deepseek-v4-flash
     litellm_params:
-      model: openai/deepseek-v4-flash
+      model: custom_openai/deepseek-v4-flash
+      custom_llm_provider: custom_openai
       api_base: os.environ/TEXT_MODEL_API_BASE
       api_key: os.environ/TEXT_MODEL_API_KEY
       guardrails: ["vision-to-text"]
@@ -10,14 +15,23 @@ model_list:
   # 对照：同一后端不挂 guardrail，带图仍会失败
   - model_name: deepseek-no-guardrail
     litellm_params:
-      model: openai/deepseek-v4-flash
+      model: custom_openai/deepseek-v4-flash
+      custom_llm_provider: custom_openai
       api_base: os.environ/TEXT_MODEL_API_BASE
       api_key: os.environ/TEXT_MODEL_API_KEY
 
-  # 识图侧部署。换成任意支持视觉的模型即可
+  # 识图侧。vision_model 可以指向一个组，多写几个成员即可负载均衡
   - model_name: vision-describer
     litellm_params:
-      model: openai/gpt-4o
+      model: custom_openai/grok-4.5
+      custom_llm_provider: custom_openai
+      api_base: os.environ/VISION_MODEL_API_BASE
+      api_key: os.environ/VISION_MODEL_API_KEY
+  - model_name: vision-describer
+    litellm_params:
+      model: custom_openai/kimi-k3
+      custom_llm_provider: custom_openai
+      api_base: os.environ/VISION_MODEL_API_BASE
       api_key: os.environ/VISION_MODEL_API_KEY
 
 guardrails:
@@ -27,7 +41,7 @@ guardrails:
       mode: "pre_call"
       default_on: false
       vision_model: vision-describer
-      vision_timeout: 60
+      vision_timeout: 120
 
 litellm_settings:
   drop_params: true

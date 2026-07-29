@@ -32,7 +32,7 @@
 import asyncio
 import hashlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, cast
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -64,7 +64,8 @@ class ImageReference:
     """messages 里一个图片 content part 的位置与可直接传给视觉模型的 URL"""
 
     message_index: int
-    content_index: int
+    # 从 message 的 content 往下的下标路径。顶层图片是 (i,)，tool_result 里的是 (i, j)
+    path: Tuple[int, ...]
     image_url: str
 
 
@@ -108,61 +109,84 @@ def image_url_for_vision_call(content_item: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
-def _content_parts(message: AllMessageValues) -> Sequence[Mapping[str, Any]]:
-    content = message.get("content")
+def _walk_images(content: object, prefix: Tuple[int, ...]) -> Iterator[Tuple[Tuple[int, ...], str]]:
+    """
+    深度遍历 content，产出 (下标路径, 图片 URL)。
+
+    必须下钻而不能只扫顶层：Anthropic 的 tool_result 把图片嵌在自己的 content 数组里，
+    Claude Code 用 Read 读图片文件走的正是这个形状，只扫顶层会把它整个漏给纯文本模型。
+    下标按原始列表计数，因此 content 里混有非 dict 元素时也不会错位。
+    """
     if not isinstance(content, list):
-        return ()
-    return tuple(item for item in content if isinstance(item, dict))
+        return
+    for index, part in enumerate(content):
+        if not isinstance(part, dict):
+            continue
+        path = prefix + (index,)
+        image_url = image_url_for_vision_call(part)
+        if image_url is not None:
+            yield path, image_url
+            continue
+        yield from _walk_images(part.get("content"), path)
 
 
 def extract_image_references(messages: Sequence[AllMessageValues]) -> Tuple[ImageReference, ...]:
-    """找出 messages 里所有图片 content part，保留其位置"""
+    """找出 messages 里所有图片 content part（含嵌在 tool_result 里的），保留其位置"""
     return tuple(
-        ImageReference(message_index=message_index, content_index=content_index, image_url=image_url)
+        ImageReference(message_index=message_index, path=path, image_url=image_url)
         for message_index, message in enumerate(messages)
-        for content_index, content_item in enumerate(_content_parts(message))
-        if (image_url := image_url_for_vision_call(content_item)) is not None
+        for path, image_url in _walk_images(message.get("content"), ())
     )
+
+
+def _replace_part(
+    part: object,
+    path: Tuple[int, ...],
+    replacements: Mapping[Tuple[int, ...], str],
+) -> object:
+    if path in replacements:
+        return {"type": "text", "text": replacements[path]}
+    if not isinstance(part, dict) or not isinstance(part.get("content"), list):
+        return part
+    return {**part, "content": _replace_in_content(part["content"], path, replacements)}
+
+
+def _replace_in_content(
+    content: Sequence[object],
+    prefix: Tuple[int, ...],
+    replacements: Mapping[Tuple[int, ...], str],
+) -> List[object]:
+    return [_replace_part(part, prefix + (index,), replacements) for index, part in enumerate(content)]
 
 
 def _replace_message_images(
     message: AllMessageValues,
-    message_index: int,
-    replacements: Mapping[Tuple[int, int], str],
+    replacements: Mapping[Tuple[int, ...], str],
 ) -> AllMessageValues:
     content = message.get("content")
-    if not isinstance(content, list):
+    if not replacements or not isinstance(content, list):
         return message
-    return cast(
-        AllMessageValues,
-        {
-            **message,
-            "content": [
-                (
-                    {"type": "text", "text": replacements[(message_index, content_index)]}
-                    if (message_index, content_index) in replacements
-                    else content_item
-                )
-                for content_index, content_item in enumerate(content)
-            ],
-        },
-    )
+    return cast(AllMessageValues, {**message, "content": _replace_in_content(content, (), replacements)})
 
 
 def replace_images_with_text(
     messages: Sequence[AllMessageValues],
-    replacements: Mapping[Tuple[int, int], str],
+    replacements: Mapping[Tuple[int, Tuple[int, ...]], str],
 ) -> List[AllMessageValues]:
     """
     返回新的 messages，把指定位置的图片 part 换成 text part。
 
     {"type": "text", "text": ...} 在 OpenAI 与 Anthropic 两种形状里都合法，
-    所以这里不需要按形状分支。原 messages 不被修改。
+    tool_result 的 content 也接受 text 块，所以这里不需要按形状分支。原 messages 不被修改。
     """
     if not replacements:
         return list(messages)
     return [
-        _replace_message_images(message, message_index, replacements) for message_index, message in enumerate(messages)
+        _replace_message_images(
+            message,
+            {path: text for (index, path), text in replacements.items() if index == message_index},
+        )
+        for message_index, message in enumerate(messages)
     ]
 
 
@@ -235,14 +259,12 @@ class VisionToTextGuardrail(CustomGuardrail):
         self,
         references: Sequence[ImageReference],
         cache: "DualCache",
-    ) -> Dict[Tuple[int, int], str]:
+    ) -> Dict[Tuple[int, Tuple[int, ...]], str]:
         # 同一请求内重复出现的图片只识别一次
         unique_urls = tuple(dict.fromkeys(reference.image_url for reference in references))
         texts = await asyncio.gather(*(self._text_for_image(url, cache=cache) for url in unique_urls))
         by_url = dict(zip(unique_urls, texts))
-        return {
-            (reference.message_index, reference.content_index): by_url[reference.image_url] for reference in references
-        }
+        return {(reference.message_index, reference.path): by_url[reference.image_url] for reference in references}
 
     async def _text_for_image(self, image_url: str, cache: "DualCache") -> str:
         cache_key = self._cache_key(image_url)

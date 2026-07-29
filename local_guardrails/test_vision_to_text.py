@@ -32,6 +32,8 @@ ANTHROPIC_IMAGE = {
     "source": {"type": "base64", "media_type": "image/png", "data": "AAA"},
 }
 OTHER_IMAGE = {"type": "image_url", "image_url": {"url": "data:image/png;base64,ZZZ"}}
+# Claude Code 用 Read 读图片文件后的真实形状：图片嵌在 tool_result 自己的 content 里
+ANTHROPIC_TOOL_RESULT = {"type": "tool_result", "tool_use_id": "toolu_01", "content": [ANTHROPIC_IMAGE]}
 
 
 def _vision_response(text: Optional[str]) -> ModelResponse:
@@ -121,7 +123,7 @@ class TestImageExtraction:
         ]
         refs = extract_image_references(messages)
         assert len(refs) == 1
-        assert (refs[0].message_index, refs[0].content_index) == (1, 1)
+        assert (refs[0].message_index, refs[0].path) == (1, (1,))
 
     @pytest.mark.parametrize(
         "content",
@@ -144,18 +146,32 @@ class TestReplacement:
                 ],
             },
         ]
-        out = replace_images_with_text(messages, {(1, 1): "DESC"})
+        out = replace_images_with_text(messages, {(1, (1,)): "DESC"})
         assert out[0] == {"role": "system", "content": "stay brief"}
         assert [part["text"] for part in out[1]["content"]] == ["before", "DESC", "after"]
 
     def test_input_is_not_mutated(self):
         messages = [{"role": "user", "content": [OPENAI_IMAGE]}]
-        replace_images_with_text(messages, {(0, 0): "DESC"})
+        replace_images_with_text(messages, {(0, (0,)): "DESC"})
         assert messages[0]["content"][0]["type"] == "image_url"
 
     def test_no_replacements_returns_equivalent_list(self):
         messages = [{"role": "user", "content": "hi"}]
         assert replace_images_with_text(messages, {}) == messages
+
+    def test_tool_result_envelope_survives_replacement(self):
+        """
+        只换 tool_result 里面的图片，外壳必须原样保留。
+
+        把整个 tool_result 换成 text 会让前一条 assistant 的 tool_use 失去配对，
+        Anthropic 会直接拒掉整个请求。
+        """
+        messages = [{"role": "user", "content": [ANTHROPIC_TOOL_RESULT]}]
+        out = replace_images_with_text(messages, {(0, (0, 0)): "DESC"})
+        tool_result = out[0]["content"][0]
+        assert tool_result["type"] == "tool_result"
+        assert tool_result["tool_use_id"] == "toolu_01"
+        assert tool_result["content"] == [{"type": "text", "text": "DESC"}]
 
     def test_round_trip_leaves_no_images_behind(self):
         messages = [
@@ -171,7 +187,7 @@ class TestReplacement:
         refs = extract_image_references(messages)
         out = replace_images_with_text(
             messages,
-            {(r.message_index, r.content_index): f"IMG{i}" for i, r in enumerate(refs)},
+            {(r.message_index, r.path): f"IMG{i}" for i, r in enumerate(refs)},
         )
         assert [part["text"] for part in out[0]["content"]] == ["IMG0", "and", "IMG1"]
         assert extract_image_references(out) == ()
@@ -203,6 +219,55 @@ async def test_image_replaced_with_description_on_both_endpoints(image_part):
             ],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_image_nested_in_tool_result_is_described():
+    """
+    Claude Code 用 Read 读图片文件时，图片嵌在 tool_result 的 content 里，不在顶层。
+
+    只扫顶层会把这条主路径上的图片整个漏给纯文本模型（已实测：deepseek 收到原始
+    base64，thinking 里在试着自己解码）。
+    """
+    router = _router("digits 417309")
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "read screenshot.png"}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_01", "name": "Read", "input": {}}]},
+        {"role": "user", "content": [ANTHROPIC_TOOL_RESULT, {"type": "text", "text": "what digits?"}]},
+    ]
+
+    result = await _run(_make_guardrail(router=router), messages)
+
+    assert router.acompletion.call_count == 1
+    assert result is not None
+    tool_result = result["messages"][2]["content"][0]
+    assert tool_result["type"] == "tool_result"
+    assert tool_result["content"] == [{"type": "text", "text": "[Image description: digits 417309]"}]
+    assert result["messages"][2]["content"][1] == {"type": "text", "text": "what digits?"}
+    assert extract_image_references(result["messages"]) == ()
+
+
+@pytest.mark.asyncio
+async def test_nested_image_reaches_vision_model_as_full_data_url():
+    router = _router("described")
+    await _run(_make_guardrail(router=router), [{"role": "user", "content": [ANTHROPIC_TOOL_RESULT]}])
+    sent = router.acompletion.call_args.kwargs["messages"][0]["content"]
+    assert sent[1]["image_url"]["url"] == "data:image/png;base64,AAA"
+
+
+@pytest.mark.asyncio
+async def test_tool_use_and_other_messages_survive_nested_replacement():
+    """tool_use 必须原样保留，否则它与 tool_result 的配对断掉，Anthropic 会拒掉整个请求"""
+    messages = [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_01", "name": "Read", "input": {"p": 1}}]},
+        {"role": "user", "content": [ANTHROPIC_TOOL_RESULT]},
+    ]
+
+    result = await _run(_make_guardrail(router=_router("described")), messages)
+
+    assert result is not None
+    assert result["messages"][0] == messages[0]
+    assert result["messages"][1]["content"][0]["tool_use_id"] == "toolu_01"
 
 
 @pytest.mark.asyncio

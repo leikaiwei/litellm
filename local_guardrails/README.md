@@ -86,6 +86,12 @@ guardrail 写在 deployment 的 `litellm_params.guardrails` 上，由
 `extract_images_from_message` 只认 `image_url`，还会剥掉 `data:...;base64,` 前缀（给 Ollama 用的）。
 直接复用会静默漏掉 Claude Code 的全部图片，所以本文件自带覆盖两种形状、保留完整 data URL 的提取逻辑。
 
+**嵌套下钻**（第二个坑，已实测踩到）：Claude Code 用 Read 工具读图片文件时，图片不在顶层
+content 里，而嵌在 `tool_result` 自己的 `content` 数组内。只扫顶层会把这条主路径整个漏掉：
+实测 deepseek 收到了原始 base64，thinking 里在试着自己解码。所以提取与替换都递归下钻，
+且只替换里层的图片块、保留 `tool_result` 外壳 —— 换掉外壳会让前一条 assistant 的 `tool_use`
+失去配对，Anthropic 直接拒掉整个请求。位置用下标路径（如 `(2, (0, 1))`）表示，多图混合时不会串位。
+
 **失败处理**：fail-open。识图失败或返回空时替换成 `[Image could not be processed: ...]`，
 主请求继续、绝不中断，模型也知道此处原本有图。失败结果不入缓存，下次请求会重试。
 
@@ -102,21 +108,39 @@ sha256 缓存描述文本，保证同图产出逐字节相同。
 
 ### 实测验证
 
-本地 proxy + 真实 newapi 后端，同一带图请求：
+本地 proxy + 真实纯文本后端（newapi 上的 deepseek 两个模型）+ 真实视觉模型组，
+识图**准确性**已端到端验证，不再只是机制验证。
 
-- 不挂 guardrail 的对照模型：仍然 400
-- 挂上后 `/v1/chat/completions`：200，DeepSeek 回答"我现在看到的是替代文字，内容是：[Image could not be processed: ...]"
-- 挂上后 `/v1/messages`：guardrail 同样生效，后端答"我看到的是替代文字"
+识图正确性，问只有真看到图才能答对的细节：
 
-`example_config.yaml` 就是这次实测用的配置。
+| 图片 | 场景 | 结果 |
+|---|---|---|
+| 生成的数字图 | 2 模型 x 2 端点 x 流式/非流式，共 14 组合 | 14/14 答出正确数字 |
+| 真实 UI 截图（126KB） | 顶层图与 `tool_result` 嵌套图，两端点，流式/非流式 | 4/4 场景，每次 3/3 细节全中 |
+
+真实截图那组问的是错误弹窗里的错误码、团队名、下拉框取值三项，全部答对，
+说明走的是真识图而不是猜。
+
+安全性与不退化：
+
+- 对照组（同后端不挂 guardrail）带图仍然 400，证明差异确实来自 guardrail
+- 图片泄漏用假后端做确定性取证（抓 litellm 实际发出的字节，不靠读日志）：
+  不挂 guardrail 时 base64 原样到达，挂上后 content 变成两个 text 块、**零 base64**
+- 多图混合（顶层 1 张 + `tool_result` 内 2 张）：三段描述各自贴在正确位置，无串位
+- fail-open：识图组整体不可达时 HTTP 200 主请求不中断，模型 reasoning 里明确说
+  "image could not be processed, we have no information"，**没有编造**
+- `fallbacks=[]` 有效：故意给识图组配上纯文本兜底目标，全程该目标调用计数一次未增长
+- 回归：纯文本单轮 / content 块数组 / 带 system / 多轮 / 流式 / 工具调用 / 工具调用流式，
+  两个端点各 7 项，挂与不挂 guardrail 表现一致，21/21 全通
+- 全程 proxy 日志里的真实异常全部归因到故意制造的两个失败源（对照组带图 400、
+  坏识图组连接拒绝），无法解释的错误为零
 
 ### 待补 / 已知问题
 
-- 端到端识图**准确性**尚未用真实视觉模型验证。上面的实测走的是 fail-open 路径，
-  证明的是改写机制通、两个端点都生效、图片没漏给后端。生产上把 `vision_model` 指向
-  已有的、成员支持视觉的模型组即可，但该组只存在于生产，本地跑不到（凭据在生产 DB 里加密），
-  所以这一步要在生产验证
 - 视觉调用未设 `max_tokens`。若组内命中推理模型，描述那次调用可能在 reasoning 上多花 token，
   真实用量出来后可按需加上限
-- 与本 guardrail 无关的既有 bug：`/v1/messages` 打 OpenAI 形状后端时 litellm 解析响应报
-  `APIError: OpenAIException`（后端其实正常返回了）。纯文本、不挂 guardrail 也复现，属于独立问题
+- 超出 `max_images` 的图片保持原样，会原封不动送给纯文本后端并触发 400。
+  默认不限张数，配了才有这个风险
+- 纯文本后端配 `openai/` 前缀时，`/v1/messages` 会被路由到 Responses API，
+  litellm 解析响应报 `APIError`（后端其实返回了正确内容）。与本 guardrail 无关，
+  配成 `custom_openai` 或 `anthropic` 即正常，两者都已实测通过
