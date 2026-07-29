@@ -32,6 +32,17 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 修复：改用 shape-aware 读取（dict 用 `.get()`，pydantic 模型用 `getattr`），三种 usage 形状均正确；后端确实未返回 usage 时仍保留估算兜底
 - 上游同样未修，且无对应 issue / PR
 
+**Anthropic 适配层参数泄漏与 thinking-only 消息修复** — `llms/anthropic/experimental_pass_through/adapters/transformation.py`、`llms/anthropic/experimental_pass_through/adapters/handler.py`
+- 背景：官方 deepseek 被禁用后 deepseek 全量走 opencode Go（`custom_openai`），`/v1/messages` 必须经 anthropic↔openai 双向适配层，官方原生 anthropic 端点那条路径上的既有补丁全部不参与。以下两个缺陷均以官方 `api.deepseek.com/anthropic` 做对照实测确认：同一请求官方 200、opencode 失败
+- 症状一：请求带 `stop_sequences` / `mcp_servers` / `speed` / `cache_control` / `inference_geo` 任一参数时 500，报 `AsyncCompletions.create() got an unexpected keyword argument`
+- 根因一：适配层 `translatable_anthropic_params()` 是反向白名单，名单外的 Anthropic 顶层参数被 `_copy_untranslated_anthropic_params` 原样拷进 `litellm.acompletion(**kwargs)`，一路漏到 OpenAI SDK。`drop_params: true` 拦不住——它只比对 `supported_openai_params`，这些名字压根不在表里。参数有两个注入点：命名参数经 `request_data` 进适配层，其余经 handler 的 `extra_kwargs` 回注，两处都要堵
+- 修复一：`stop_sequences` 映射成 OpenAI 标准的 `stop`（实测语义生效，输出被正确截断）；无 OpenAI 对应的四个参数收进 `ANTHROPIC_ONLY_PARAMS_WITHOUT_OPENAI_EQUIVALENT`，并复用 handler 既有的 `ANTHROPIC_ONLY_REQUEST_KEYS` 机制堵住第二个注入点，清单保持单一来源
+- 症状二：assistant 历史消息只含 thinking 块时上游 400，报错是 opencode 的通用兜底串 `Error from provider (Console Go): Upstream request failed`
+- 根因二：`strip_empty_text_blocks_from_anthropic_messages` 先摘掉伴随的空 text 块（那是为原生 anthropic 路径加的，见上游 #22930），适配层随后落到 `assistant_content = assistant_message_str` 拿到 `None`，再被 `utils.py` 的 `cleanup_none_field_in_message` 连键一起删掉，产出既无 `content` 又无 `tool_calls` 的非法 OpenAI 消息。唯一变量法钉死了上游规则：只看 `content` 键存不存在，与其值无关、与 `tools` 无关
+- 修复二：无 `content` 且无 `tool_calls` 的 assistant 消息补 `content: ""`。OpenAI 规范只允许带 `tool_calls` 时省略 `content`，故不影响工具调用那条路
+- 上游均未修，无对应 issue / PR
+- 已知遗留（本轮未修）：`top_k` 同样会漏成 500，但 vertex_ai 等 provider 真支持它，而适配层此处拿不到解析后的 provider（`model` 是 model_group 名），无条件丢弃会让 gemini 等后端静默失去该参数，需按 provider 能力决定去留；`stop_reason` 缺 `stop_sequence` 与 `content_filter` 映射；`count_tokens` 漏算 system 与 tools（两条路径都中）；历史轮 thinking 以非标准 `thinking_blocks` 字段发给 `custom_openai`，未转成 `reasoning_content`（fork 里那个转换挂在 `DeepSeekChatConfig` 上，provider 为 `custom_openai` 时拿到的是 `OpenAILikeChatConfig`，补丁不参与），多轮会丢失上一轮推理链
+
 已移除的补丁（保留记录，便于回溯）：
 
 - ~~**Anthropic passthrough 非标准 SSE 帧健壮性**~~ — 我们提交的 PR [#26000](https://github.com/BerriAI/litellm/pull/26000) 已并入上游，本地补丁移除
