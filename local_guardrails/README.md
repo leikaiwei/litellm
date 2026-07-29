@@ -144,3 +144,21 @@ sha256 缓存描述文本，保证同图产出逐字节相同。
 - 纯文本后端配 `openai/` 前缀时，`/v1/messages` 会被路由到 Responses API，
   litellm 解析响应报 `APIError`（后端其实返回了正确内容）。与本 guardrail 无关，
   配成 `custom_openai` 或 `anthropic` 即正常，两者都已实测通过
+
+- **`vision_model` 必须指向一个「每个成员都确认能识图」的组**（生产已踩，2026-07-30）。
+  fail-open 只在调用**抛异常**时触发；若视觉模型返回 HTTP 200 加一句客气的拒绝
+  （实测：讯飞 `xopglm52` 回 "I cannot describe the image..."），那句拒绝会被当成合法描述
+  套进 `description_template` 发给下游，**并按 `cache_ttl_seconds` 缓存**，
+  整个 TTL 内不再重试，且不打任何 warning。下游模型于是如实回答"看不到图片"。
+  `num_retries` 救不了 —— 重试只在异常时触发，200 不算失败。
+
+  没有在代码里加"识别拒绝式回复"的判断：靠文本判断"这是描述还是客套"本质是猜，两个方向都会错
+  （真实截图里完全可能出现 `cannot process image` 字样，本来就在转录报错弹窗；而拒绝的表达
+  无穷多、还跨语言）。真正的约束在配置层 —— 别把图片交给成员能力不受控的负载均衡组。
+  若确实需要代码层兜底，唯一不算猜的方向是要求模型返回
+  `{"can_see_image": bool, "description": str}`，把判断从"猜语气"变成"它自己声明"。
+
+- 判定某个模型能否识图，**不要用手搓的点阵数字图**：字形太糊会让能识图的模型读错数字，
+  从而被误判成不支持视觉（生产选型时据此错杀了 qwen3.7-plus）。用真实截图，
+  问只有真看到图才知道的细节。同理，`supports_vision` 为 `None` 只表示
+  `model_prices_and_context_window.json` 里查无此条目，不代表不支持
