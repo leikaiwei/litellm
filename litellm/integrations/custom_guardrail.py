@@ -35,6 +35,7 @@ from litellm.types.llms.openai import AllMessageValues
 from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
 from litellm.types.utils import (
     CallTypes,
+    CallTypesLiteral,
     GenericGuardrailAPIInputs,
     GuardrailStatus,
     GuardrailTracingDetail,
@@ -70,6 +71,16 @@ from litellm.exceptions import (
 _PRE_CALL_EXECUTED_TOKEN = secrets.token_hex(16)
 
 _GUARDRAIL_BLOCK_STATUS_CODES = frozenset({400, 403, 422})
+
+# 允许跑 deployment 级 pre_call 钩子的 call_type，值是下游 hook 要的字面量。
+# 必须含 anthropic_messages：/v1/messages 原生直通就是这个 call_type，而模型组
+# fallback 只走 router 内部、不重跑 proxy 级钩子，漏掉它等于挂在 deployment
+# litellm_params 上的 guardrail 在整条 fallback 路径上永不执行。
+_DEPLOYMENT_PRE_CALL_TYPES: dict[CallTypes, CallTypesLiteral] = {
+    CallTypes.completion: "completion",
+    CallTypes.acompletion: "acompletion",
+    CallTypes.anthropic_messages: "anthropic_messages",
+}
 
 _guardrail_self_recorded: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "litellm_guardrail_self_recorded", default=False
@@ -666,27 +677,30 @@ class CustomGuardrail(CustomLogger):
             return kwargs
 
         # CHECK IF GUARDRAIL REJECTS THE REQUEST
-        if call_type == CallTypes.completion or call_type == CallTypes.acompletion:
-            target = self._deployment_pre_call_target()
-            if target is not self:
-                kwargs["guardrail_to_apply"] = self
-            result = await target.async_pre_call_hook(
-                user_api_key_dict=UserAPIKeyAuth(
-                    user_id=kwargs.get("user_api_key_user_id"),
-                    team_id=kwargs.get("user_api_key_team_id"),
-                    end_user_id=kwargs.get("user_api_key_end_user_id"),
-                    api_key=kwargs.get("user_api_key_hash"),
-                    request_route=kwargs.get("user_api_key_request_route"),
-                ),
-                cache=dc,
-                data=kwargs,
-                call_type="completion" if call_type == CallTypes.completion else "acompletion",
-            )
+        hook_call_type = _DEPLOYMENT_PRE_CALL_TYPES.get(call_type) if call_type is not None else None
+        if hook_call_type is None:
+            return kwargs
 
-            if result is not None and isinstance(result, dict):
-                result_messages = result.get("messages")
-                if result_messages is not None:  # update for any pii / masking logic
-                    kwargs["messages"] = result_messages
+        target = self._deployment_pre_call_target()
+        if target is not self:
+            kwargs["guardrail_to_apply"] = self
+        result = await target.async_pre_call_hook(
+            user_api_key_dict=UserAPIKeyAuth(
+                user_id=kwargs.get("user_api_key_user_id"),
+                team_id=kwargs.get("user_api_key_team_id"),
+                end_user_id=kwargs.get("user_api_key_end_user_id"),
+                api_key=kwargs.get("user_api_key_hash"),
+                request_route=kwargs.get("user_api_key_request_route"),
+            ),
+            cache=dc,
+            data=kwargs,
+            call_type=hook_call_type,
+        )
+
+        if result is not None and isinstance(result, dict):
+            result_messages = result.get("messages")
+            if result_messages is not None:  # update for any pii / masking logic
+                kwargs["messages"] = result_messages
 
         return kwargs
 

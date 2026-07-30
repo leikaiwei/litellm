@@ -194,6 +194,76 @@ class TestCustomGuardrailDeploymentHook:
 
         assert guardrail.pre_call_count == 1
 
+    @pytest.mark.asyncio
+    async def test_deployment_hook_runs_for_anthropic_messages(self):
+        """A guardrail on a deployment's litellm_params must run when the request
+        arrives over /v1/messages.
+
+        Model-group fallback happens inside the router and does not re-run the
+        proxy-level pre-call loop, so this deployment hook is the only place the
+        guardrail can still fire. Skipping the anthropic_messages call type left
+        it dead for the whole fallback path."""
+        custom_guardrail = CustomGuardrail(guardrail_name="g1", default_on=True)
+        rewritten = [{"role": "user", "content": "[Image description: a red square]"}]
+        custom_guardrail.async_pre_call_hook = AsyncMock(
+            return_value={"messages": rewritten}
+        )
+
+        kwargs = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "iVBORw0KGgo=",
+                            },
+                        }
+                    ],
+                }
+            ],
+            "model": "deepseek-v4-flash",
+            "guardrails": ["g1"],
+        }
+
+        result = await custom_guardrail.async_pre_call_deployment_hook(
+            kwargs=kwargs, call_type=CallTypes.anthropic_messages
+        )
+
+        custom_guardrail.async_pre_call_hook.assert_called_once()
+        assert (
+            custom_guardrail.async_pre_call_hook.call_args[1]["call_type"]
+            == "anthropic_messages"
+        )
+        assert result["messages"] == rewritten
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "call_type",
+        [CallTypes.embedding, CallTypes.aembedding, CallTypes.responses, None],
+    )
+    async def test_deployment_hook_skips_unsupported_call_types(self, call_type):
+        """The gate must stay closed for call types whose payload has no
+        chat-style messages to rewrite; opening it wide would hand guardrails a
+        shape they cannot process."""
+        custom_guardrail = CustomGuardrail(guardrail_name="g1", default_on=True)
+        custom_guardrail.async_pre_call_hook = AsyncMock(
+            return_value={"messages": [{"role": "user", "content": "rewritten"}]}
+        )
+
+        original = [{"role": "user", "content": "hi"}]
+        kwargs = {"messages": original, "model": "gpt-4o", "guardrails": ["g1"]}
+
+        result = await custom_guardrail.async_pre_call_deployment_hook(
+            kwargs=kwargs, call_type=call_type
+        )
+
+        custom_guardrail.async_pre_call_hook.assert_not_called()
+        assert result["messages"] == original
+
 
 class TestCustomGuardrailShouldRunGuardrail:
 

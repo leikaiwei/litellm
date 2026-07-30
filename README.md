@@ -43,6 +43,14 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 上游均未修，无对应 issue / PR
 - 已知遗留（本轮未修）：`top_k` 同样会漏成 500，但 vertex_ai 等 provider 真支持它，而适配层此处拿不到解析后的 provider（`model` 是 model_group 名），无条件丢弃会让 gemini 等后端静默失去该参数，需按 provider 能力决定去留；`stop_reason` 缺 `stop_sequence` 与 `content_filter` 映射；`count_tokens` 漏算 system 与 tools（两条路径都中）；历史轮 thinking 以非标准 `thinking_blocks` 字段发给 `custom_openai`，未转成 `reasoning_content`（fork 里那个转换挂在 `DeepSeekChatConfig` 上，provider 为 `custom_openai` 时拿到的是 `OpenAILikeChatConfig`，补丁不参与），多轮会丢失上一轮推理链
 
+**deployment 级 guardrail 在 `/v1/messages` 上不执行** — `integrations/custom_guardrail.py`
+- 症状：挂在 deployment `litellm_params.guardrails` 上的 guardrail，在模型组 fallback 落到该 deployment 时完全不执行。生产表现为带图请求打 `hoperun`、退到挂了识图 guardrail 的 deepseek 时仍然报错，而直呼同一个 deepseek deployment 一切正常
+- 根因：`async_pre_call_deployment_hook` 的 call_type 门只认 `completion` / `acompletion`，而 `/v1/messages` 原生直通的 call_type 是 `anthropic_messages`（`utils.py` 取被装饰函数名，再由 `CallTypes()` 转成枚举）。proxy 级 `pre_call_hook` 又只按**请求里的组名**取 guardrail 并集，且 fallback 只在 router 内部重试、不重跑 proxy 级钩子。两者叠加，这个 deployment 钩子是 fallback 路径上唯一的机会，却被门挡住
+- 修复：门改为查 `_DEPLOYMENT_PRE_CALL_TYPES` 映射表，加入 `anthropic_messages`，同时把 call_type 到下游字面量的转换收敛到该表（原先是内联三元表达式）。`CallTypesLiteral` 本就含这个值，未放宽到 embedding / responses 等无 messages 可改写的 call_type
+- 实测：本地 proxy 构造真实组级 fallback（A 组指向不可达地址必失败 -> B 组为 newapi deepseek + 识图 guardrail），补丁前后同一请求对照。带图 fallback 补丁前 500（surface 出 A 组的连接错误，与生产 `Error doing the fallback` 形态一致），补丁后 200 且 `input_tokens` 与直呼对照逐一致（125），纯文本 deepseek 答出图片真实颜色即证明描述已注入；嵌在 `tool_result` 里的图同样生效（178 vs 补丁前原样透传的 237）
+- 上游未修，无对应 issue / PR
+- 注意：`vision_model` 指向的组不能挂这个 guardrail。识图那次 `router.acompletion` 的 call_type 是 `acompletion`，天然穿过门，一旦该组自身也挂上就会无限递归，guardrail 里没有递归保护
+
 已移除的补丁（保留记录，便于回溯）：
 
 - ~~**Anthropic passthrough 非标准 SSE 帧健壮性**~~ — 我们提交的 PR [#26000](https://github.com/BerriAI/litellm/pull/26000) 已并入上游，本地补丁移除
