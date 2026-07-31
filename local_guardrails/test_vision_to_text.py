@@ -518,16 +518,65 @@ class TestTrailingTextInjection:
         messages = [{"role": "user", "content": [TOOL_RESULT, {"type": "text", "text": "what now?"}]}]
         assert ensure_trailing_text_after_tool_result(messages) == messages
 
-    def test_blank_text_at_end_still_gets_injection(self):
+    @pytest.mark.parametrize(
+        "blank_block",
+        [
+            pytest.param({"type": "text", "text": ""}, id="empty-string"),
+            pytest.param({"type": "text", "text": "   "}, id="whitespace"),
+            pytest.param({"type": "text", "text": None}, id="none"),
+            pytest.param({"type": "text"}, id="missing-text-key"),
+        ],
+    )
+    def test_blank_text_at_end_still_gets_injection(self, blank_block):
         """
         Claude Code 会回传 {"type": "text", "text": ""}；litellm 摘掉它之后就成了裸
         tool_result 收尾。所以判定必须跳过末尾的空白 text 块，与 litellm 的行为对齐。
+
+        非 str 的 text 也要算作会被摘掉：litellm 的 _is_empty_text_block 判的是
+        `not isinstance(text, str) or not text.strip()`，两边口径必须一致。
         """
-        messages = [{"role": "user", "content": [TOOL_RESULT, {"type": "text", "text": "   "}]}]
+        messages = [{"role": "user", "content": [TOOL_RESULT, blank_block]}]
         assert _trailing(ensure_trailing_text_after_tool_result(messages)) == {
             "type": "text",
             "text": TOOL_RESULT_TRAILING_TEXT,
         }
+
+    def test_injection_is_idempotent(self):
+        """
+        注入完再跑一遍必须是 no-op。这条同时锁住注入内容不能是空白：若换成 ""，
+        第二遍会认为仍是裸 tool_result 收尾而再注入一次。
+        """
+        once = ensure_trailing_text_after_tool_result([{"role": "user", "content": [TOOL_RESULT]}])
+        assert ensure_trailing_text_after_tool_result(once) is once
+
+    def test_message_dropped_by_stripping_does_not_hide_a_bare_tool_result(self):
+        """
+        litellm 摘空块后若整条 content 变空，会把**整条消息**从列表里删掉
+        （common_utils.py:990-993），于是前一条又成了末条。
+
+        只看 messages[-1] 会漏掉这个形状：判定时没有 tool_result 所以不注入，
+        litellm 丢掉末条后请求变回裸 tool_result 收尾，照样 400 且不报错。
+        """
+        messages = [
+            {"role": "user", "content": [TOOL_RESULT]},
+            {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+        ]
+
+        out = ensure_trailing_text_after_tool_result(messages)
+
+        assert out[0]["content"] == [TOOL_RESULT, {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}]
+        assert out[1] == messages[1], "会被 litellm 丢掉的消息不该由本 guardrail 删除"
+
+    def test_message_whose_content_is_already_empty_is_not_treated_as_dropped(self):
+        """
+        litellm 只丢「摘掉空块后才变空」的消息；content 本来就是 [] 的会原样保留
+        （len(filtered) == len(content) 那条分支）。所以它仍是末条，不该往前找。
+        """
+        messages = [
+            {"role": "user", "content": [TOOL_RESULT]},
+            {"role": "assistant", "content": []},
+        ]
+        assert ensure_trailing_text_after_tool_result(messages) == messages
 
     def test_parallel_tool_results_need_only_one_text_block(self):
         """并列多个 tool_result（并行工具调用）只需在末尾补一个"""
@@ -544,6 +593,7 @@ class TestTrailingTextInjection:
             pytest.param([{"role": "user", "content": "plain string"}], id="string-content"),
             pytest.param([{"role": "user", "content": []}], id="empty-content"),
             pytest.param([{"role": "user", "content": [{"type": "text", "text": "hi"}]}], id="text-only"),
+            pytest.param([{"role": "user", "content": [{"type": "text", "text": ""}]}], id="all-messages-dropped"),
             pytest.param(
                 [{"role": "assistant", "content": [{"type": "tool_use", "id": "x", "name": "Bash", "input": {}}]}],
                 id="assistant-tool-use",

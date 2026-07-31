@@ -185,6 +185,15 @@ opencode 服务这轮 -> id 由 opencode 签发 -> 下轮 opencode 认
 用 `.strip()` 判空并摘掉纯空白 text 块 —— 摘完又变回裸 `tool_result` 收尾，等于没修。
 同理，判断「是否裸 tool_result 收尾」时也要**跳过末尾的空白 text 块**：Claude Code 常回传
 `{"type": "text", "text": ""}`，看着有 text 收尾，实际发出去时已被摘掉。
+`text` 非 str（`None` 或缺键）也算会被摘掉，与 litellm 的 `_is_empty_text_block` 逐条对齐。
+
+**「最后一条消息」要按摘空之后算**。这是同一个坑的消息级版本，容易只做一半：那个清理函数在
+content 摘空后**把整条消息从列表里删掉**，不是留个空数组。所以末条消息整条只含空白块时，
+前一条裸 `tool_result` 会重新成为末条 —— 只看 `messages[-1]` 的判定会认为无需注入，
+litellm 丢掉末条后请求变回裸收尾，照样 400 且不报错。判定实现为
+`_dropped_by_empty_text_stripping` + `_last_surviving_message_index`，注入打在真正会存活的
+那条上；会被丢的消息由 litellm 自己丢，本 guardrail 不删。边界要与 litellm 逐字对齐：
+content **本来就是** `[]` 的消息不会被丢（走 `len` 相等那条分支），仍算末条。
 
 **不能挂在图片分支下**。生产上撞这个校验的请求大多不带图，而识图那条路无图时提前返回。
 两个修复各自独立判断，都不需要改写时才返回 `None`。

@@ -220,6 +220,29 @@ def _ends_with_bare_tool_result(content: Sequence[object]) -> bool:
     return isinstance(last, dict) and last.get("type") == "tool_result"
 
 
+def _dropped_by_empty_text_stripping(message: object) -> bool:
+    """
+    litellm 摘空块后若整条 content 变空，会把**整条消息**从列表里删掉，而不是留个空数组
+    （strip_empty_text_blocks_from_anthropic_messages 的 `elif filtered:` 分支）。
+    这种消息不能算末条，否则它会挡住前面那条真正的裸 tool_result 收尾。
+
+    条件必须与 litellm 逐字对齐：content 为空列表时 len 不变、走保留分支，故此处要求非空。
+    """
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    return all(not _survives_empty_text_stripping(block) for block in content)
+
+
+def _last_surviving_message_index(messages: Sequence[AllMessageValues]) -> Optional[int]:
+    return next(
+        (index for index in reversed(range(len(messages))) if not _dropped_by_empty_text_stripping(messages[index])),
+        None,
+    )
+
+
 def ensure_trailing_text_after_tool_result(messages: List[AllMessageValues]) -> List[AllMessageValues]:
     """
     最后一条消息以裸 tool_result 收尾时，在其 content 末尾追加一个非空 text 块。
@@ -236,16 +259,22 @@ def ensure_trailing_text_after_tool_result(messages: List[AllMessageValues]) -> 
     OpenAI 形状（末条 role: "tool"）不处理：那种形状只能另起一条 user 消息，会造成连续两条
     user 消息，未实测过。生产走 /v1/messages，进本 hook 时是 Anthropic 形状。
 
+    "最后一条消息"按 litellm 摘空块之后的样子算：整条会被摘空的消息不算，否则它会挡住
+    前面那条真正的裸 tool_result 收尾（见 _dropped_by_empty_text_stripping）。
+    那些消息由 litellm 自己丢，本函数不删。
+
     无需改动时返回传入的对象本身，调用方可用 `is` 判断有没有变。原 messages 不被修改。
     """
-    if not messages:
+    index = _last_surviving_message_index(messages)
+    if index is None:
         return messages
-    last_message = messages[-1]
+    last_message = messages[index]
     content = last_message.get("content")
     if not isinstance(content, list) or not _ends_with_bare_tool_result(content):
         return messages
     trailing = {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}
-    return [*messages[:-1], cast(AllMessageValues, {**last_message, "content": [*content, trailing]})]
+    patched = cast(AllMessageValues, {**last_message, "content": [*content, trailing]})
+    return [*messages[:index], patched, *messages[index + 1 :]]
 
 
 class VisionToTextGuardrail(CustomGuardrail):
