@@ -20,7 +20,9 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.utils import ModelResponse
 from vision_to_text import (
+    TOOL_RESULT_TRAILING_TEXT,
     VisionToTextGuardrail,
+    ensure_trailing_text_after_tool_result,
     extract_image_references,
     image_url_for_vision_call,
     replace_images_with_text,
@@ -478,6 +480,146 @@ async def test_custom_prompt_and_template_are_used():
     assert result is not None
     assert result["messages"][0]["content"][0]["text"] == "<img>described</img>"
     assert router.acompletion.call_args.kwargs["messages"][0]["content"][0]["text"] == "transcribe only"
+
+
+# ---------------------------------------------------------------------------
+# 尾部 text 块注入：绕开 opencode 的 tool_use id 注册表校验
+#
+# opencode 只认自己签发过的 tool id，而 Claude Code 只回传后端给的 id，所以一次
+# fallback 到别的后端就永久污染会话（单向棘轮），之后每轮必 400。自编 id 无解（存在性
+# 校验），但校验是两段式的：只有请求最后一个 content 块是裸 tool_result 时才触发，
+# 一触发就扫全历史。末尾追加一个非空 text 块，校验根本不启动。
+# 实测判据见 .ops-runbook/findings/2026-08-01-toolid-trailing-text-绕过.md
+# ---------------------------------------------------------------------------
+
+TOOL_RESULT = {"type": "tool_result", "tool_use_id": "call_00_abc", "content": "a.txt"}
+OTHER_TOOL_RESULT = {"type": "tool_result", "tool_use_id": "call_00_def", "content": "b.txt"}
+
+
+def _trailing(messages: List[Dict[str, Any]]) -> Any:
+    return messages[-1]["content"][-1]
+
+
+class TestTrailingTextInjection:
+    def test_bare_tool_result_at_end_gets_a_text_block(self):
+        """裸 tool_result 收尾会触发校验 -> 400。这是生产故障的直接形状"""
+        out = ensure_trailing_text_after_tool_result([{"role": "user", "content": [TOOL_RESULT]}])
+        assert out[-1]["content"] == [TOOL_RESULT, {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}]
+
+    def test_injected_text_is_not_blank_or_litellm_would_strip_it(self):
+        """
+        litellm 的 strip_empty_text_blocks_from_anthropic_messages 用 .strip() 判空，
+        会摘掉纯空白 text 块，摘完又变回裸 tool_result 收尾。所以注入内容必须非空白。
+        """
+        assert TOOL_RESULT_TRAILING_TEXT.strip()
+
+    def test_existing_text_at_end_is_left_alone(self):
+        """已有非空 text 收尾时校验不触发，无需注入；重复注入会污染对话"""
+        messages = [{"role": "user", "content": [TOOL_RESULT, {"type": "text", "text": "what now?"}]}]
+        assert ensure_trailing_text_after_tool_result(messages) == messages
+
+    def test_blank_text_at_end_still_gets_injection(self):
+        """
+        Claude Code 会回传 {"type": "text", "text": ""}；litellm 摘掉它之后就成了裸
+        tool_result 收尾。所以判定必须跳过末尾的空白 text 块，与 litellm 的行为对齐。
+        """
+        messages = [{"role": "user", "content": [TOOL_RESULT, {"type": "text", "text": "   "}]}]
+        assert _trailing(ensure_trailing_text_after_tool_result(messages)) == {
+            "type": "text",
+            "text": TOOL_RESULT_TRAILING_TEXT,
+        }
+
+    def test_parallel_tool_results_need_only_one_text_block(self):
+        """并列多个 tool_result（并行工具调用）只需在末尾补一个"""
+        out = ensure_trailing_text_after_tool_result([{"role": "user", "content": [TOOL_RESULT, OTHER_TOOL_RESULT]}])
+        assert out[-1]["content"] == [
+            TOOL_RESULT,
+            OTHER_TOOL_RESULT,
+            {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT},
+        ]
+
+    @pytest.mark.parametrize(
+        "messages",
+        [
+            pytest.param([{"role": "user", "content": "plain string"}], id="string-content"),
+            pytest.param([{"role": "user", "content": []}], id="empty-content"),
+            pytest.param([{"role": "user", "content": [{"type": "text", "text": "hi"}]}], id="text-only"),
+            pytest.param(
+                [{"role": "assistant", "content": [{"type": "tool_use", "id": "x", "name": "Bash", "input": {}}]}],
+                id="assistant-tool-use",
+            ),
+            pytest.param([], id="no-messages"),
+        ],
+    )
+    def test_no_op_when_last_message_does_not_end_with_tool_result(self, messages):
+        assert ensure_trailing_text_after_tool_result(messages) == messages
+
+    def test_only_the_last_message_is_touched(self):
+        """历史里的裸 tool_result 不用管：校验只由最后一块触发"""
+        messages = [
+            {"role": "user", "content": [TOOL_RESULT]},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": [OTHER_TOOL_RESULT]},
+        ]
+        out = ensure_trailing_text_after_tool_result(messages)
+        assert out[0] == messages[0]
+        assert out[2]["content"] == [OTHER_TOOL_RESULT, {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}]
+
+    def test_input_is_not_mutated(self):
+        messages = [{"role": "user", "content": [TOOL_RESULT]}]
+        ensure_trailing_text_after_tool_result(messages)
+        assert messages[0]["content"] == [TOOL_RESULT]
+
+    def test_openai_shape_is_left_alone(self):
+        """
+        OpenAI 形状（末条是 role:"tool"）只能另起一条 user 消息，会造成连续两条 user，
+        未实测过。生产走 /v1/messages，进 hook 时是 Anthropic 形状，先留 no-op。
+        """
+        messages = [{"role": "tool", "tool_call_id": "call_1", "content": "a.txt"}]
+        assert ensure_trailing_text_after_tool_result(messages) == messages
+
+
+@pytest.mark.asyncio
+async def test_hook_injects_trailing_text_when_request_has_no_images():
+    """
+    最关键的回归：生产失败请求大多不带图。尾块修复若挂在图片分支下，无图时 hook
+    提前 return None，整个修复就是 no-op —— 那正是这个 bug 的形状。
+    """
+    router = _router("unused")
+
+    result = await _run(_make_guardrail(router=router), [{"role": "user", "content": [TOOL_RESULT]}])
+
+    assert result is not None, "无图但需要注入尾块时不能返回 None"
+    assert _trailing(result["messages"]) == {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}
+    router.acompletion.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hook_applies_both_fixes_together():
+    """图片替换动 tool_result 内部 content，尾块注入只在末尾追加，两者互不干扰"""
+    messages = [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "call_00_abc", "name": "Read", "input": {}}]},
+        {"role": "user", "content": [{**TOOL_RESULT, "content": [ANTHROPIC_IMAGE]}]},
+    ]
+
+    result = await _run(_make_guardrail(router=_router("digits 739")), messages)
+
+    assert result is not None
+    tool_result = result["messages"][-1]["content"][0]
+    assert tool_result["type"] == "tool_result"
+    assert tool_result["content"] == [{"type": "text", "text": "[Image description: digits 739]"}]
+    assert _trailing(result["messages"]) == {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}
+
+
+@pytest.mark.asyncio
+async def test_hook_still_returns_none_when_nothing_needs_changing():
+    """无图又无需注入时必须返回 None，不能凭空复制一份 messages 回去"""
+    router = _router("unused")
+    guardrail = _make_guardrail(router=router)
+
+    assert await _run(guardrail, [{"role": "user", "content": "plain"}]) is None
+    assert await _run(guardrail, [{"role": "user", "content": [TOOL_RESULT, {"type": "text", "text": "q"}]}]) is None
+    router.acompletion.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

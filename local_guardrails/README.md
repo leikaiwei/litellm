@@ -10,7 +10,18 @@
 .venv/bin/python -m pytest local_guardrails/ -q
 ```
 
-## vision_to_text — 图片转文本
+## vision_to_text — 请求改写
+
+在请求发给后端之前改写 messages，做两件彼此独立的事：
+
+1. **图片转文本**：把图片交给视觉模型识别，用识别文本替换原图片块，让纯文本模型能处理带截图的请求
+2. **尾部 text 块注入**：裸 `tool_result` 收尾时补一个非空 text 块，绕开 opencode 的 tool id 校验
+
+名字只覆盖第一件事。没拆成两个 guardrail 是因为挂载点完全相同（都是 opencode 这条路上的
+`pre_call`），而生产上新建一个 guardrail 要改 config.yaml 的 `guardrails:` 段、再逐个 PATCH
+deployment 的 `guardrails` 数组；合进已挂载的文件只需替换一个 py 文件加重启。
+
+### 图片转文本
 
 让只支持文本的模型（deepseek）能处理带截图的请求：在请求发给后端之前，把 messages 里的
 图片交给视觉模型识别，用识别文本替换原图片块。
@@ -134,6 +145,55 @@ sha256 缓存描述文本，保证同图产出逐字节相同。
   两个端点各 7 项，挂与不挂 guardrail 表现一致，21/21 全通
 - 全程 proxy 日志里的真实异常全部归因到故意制造的两个失败源（对照组带图 400、
   坏识图组连接拒绝），无法解释的错误为零
+
+### 尾部 text 块注入 — 绕开 opencode 的 tool id 校验
+
+opencode（`opencode.ai/zen/go`）对 `tool_use.id` 做**服务端注册表校验**，只接受它自己签发过的 id。
+而 Claude Code 不自己生成 tool id，只回传后端给的，于是形成**单向棘轮**：
+
+```
+opencode 服务这轮 -> id 由 opencode 签发 -> 下轮 opencode 认
+其它后端服务这轮  -> id 由它签发        -> 下轮 opencode 必拒 -> 又落该后端 -> 再加一个外来 id
+```
+
+**一次 fallback 就永久污染该会话**，之后每轮加深，表现为「上下文进了别的模型就再也回不到 opencode」。
+生产 2026-08-01 凌晨命中：`hoperun` 组唯一活跃成员经 newapi 打 opencode，对被污染会话 100% 返回
+400 `Error from provider (Console Go): Upstream request failed`，全部降级到 qwen。
+
+改写 id 这条路走不通：同前缀同长度的自编 id 也被拒（真 id 只改末 4 字符即 400），
+是存在性校验而非格式校验。
+
+**但校验是两段式的**：只有请求最后一个 content 块是裸 `tool_result` 时才**触发**，
+一旦触发就扫全历史的 id。所以末尾追加一个非空 text 块，校验根本不启动，历史里有多少外来 id
+都无所谓。对合法 id 注入同样无害，因此无条件执行，不必判断 id 来源。
+
+直连 newapi 实测（`.ops-runbook/scripts/toolid_verify.py`，每例重复 3 次，全部一致）：
+
+| 用例 | 结果 |
+|---|---|
+| 真 id + 裸 `tool_result` 收尾（正对照） | 200 |
+| 假 id + 裸 `tool_result` 收尾（故障复现） | **400** |
+| 假 id + 尾部 text `"."`（本修复） | **200** |
+| 真 id + 尾部 text `"."`（注入无害） | 200 |
+| 假 id + 尾部 text `""`（空串） | **400** |
+| 假 id + 另起一条 user 消息收尾 | 200 |
+
+三个实现要点：
+
+**注入内容必须非空白**。litellm 发给后端前会跑
+`strip_empty_text_blocks_from_anthropic_messages`（`llms/anthropic/common_utils.py`），
+用 `.strip()` 判空并摘掉纯空白 text 块 —— 摘完又变回裸 `tool_result` 收尾，等于没修。
+同理，判断「是否裸 tool_result 收尾」时也要**跳过末尾的空白 text 块**：Claude Code 常回传
+`{"type": "text", "text": ""}`，看着有 text 收尾，实际发出去时已被摘掉。
+
+**不能挂在图片分支下**。生产上撞这个校验的请求大多不带图，而识图那条路无图时提前返回。
+两个修复各自独立判断，都不需要改写时才返回 `None`。
+
+**只处理 Anthropic 形状**。末条是 `role: "tool"` 的 OpenAI 形状留 no-op：那种形状只能另起一条
+user 消息，会造成连续两条 user，未实测过。生产走 `/v1/messages`，进 hook 时是 Anthropic 原生形状
+（转换发生在 hook 之后，见 `llms/anthropic/experimental_pass_through/adapters/`）。
+
+副作用：注入的 `"."` 会进入对话被模型看到。实测模型正常作答，但确实是注入内容。
 
 ### 待补 / 已知问题
 
