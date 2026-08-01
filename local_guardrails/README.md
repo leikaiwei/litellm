@@ -178,7 +178,7 @@ opencode 服务这轮 -> id 由 opencode 签发 -> 下轮 opencode 认
 | 假 id + 尾部 text `""`（空串） | **400** |
 | 假 id + 另起一条 user 消息收尾 | 200 |
 
-三个实现要点：
+实现要点：
 
 **注入内容必须非空白**。litellm 发给后端前会跑
 `strip_empty_text_blocks_from_anthropic_messages`（`llms/anthropic/common_utils.py`），
@@ -187,13 +187,31 @@ opencode 服务这轮 -> id 由 opencode 签发 -> 下轮 opencode 认
 `{"type": "text", "text": ""}`，看着有 text 收尾，实际发出去时已被摘掉。
 `text` 非 str（`None` 或缺键）也算会被摘掉，与 litellm 的 `_is_empty_text_block` 逐条对齐。
 
-**「最后一条消息」要按摘空之后算**。这是同一个坑的消息级版本，容易只做一半：那个清理函数在
-content 摘空后**把整条消息从列表里删掉**，不是留个空数组。所以末条消息整条只含空白块时，
-前一条裸 `tool_result` 会重新成为末条 —— 只看 `messages[-1]` 的判定会认为无需注入，
-litellm 丢掉末条后请求变回裸收尾，照样 400 且不报错。判定实现为
-`_dropped_by_empty_text_stripping` + `_last_surviving_message_index`，注入打在真正会存活的
-那条上；会被丢的消息由 litellm 自己丢，本 guardrail 不删。边界要与 litellm 逐字对齐：
+**「最后一条消息」不是 `messages[-1]`**。有两类消息不参与后端校验，注入落在它们身上等于没注入。
+判定实现为 `_counts_as_tail` + `_last_effective_message_index`，注入打在真正会被校验的那条上；
+这两类消息由 litellm 或下游转换器自己处理，本 guardrail 不删不改。
+
+第一类：**会被摘空后整条删掉的消息**。这是空白 text 块那个坑的消息级版本，容易只做一半 ——
+清理函数在 content 摘空后把**整条消息**从列表里删掉，不是留个空数组。所以末条消息整条只含
+空白块时，前一条裸 `tool_result` 会重新成为末条，只看 `messages[-1]` 会认为无需注入，
+litellm 丢掉末条后请求变回裸收尾，照样 400 且不报错。边界要与 litellm 逐字对齐：
 content **本来就是** `[]` 的消息不会被丢（走 `len` 相等那条分支），仍算末条。
+
+第二类：**尾部的 `role: system` 消息**。Anthropic 的 `messages` 只允许 `user` / `assistant`，
+`system` 是顶层字段；但 Claude Code 确实会在末尾发独立的 `role: system` 提醒消息
+（`The task tools haven't been used recently…` / `The TodoWrite tool hasn't been used recently…`），
+litellm 原样透传，下游 anthropic -> openai 转换器把它上提到开头，于是后端看到的收尾又变回
+它前面那条。**这是 08-01 生产 400 的直接根因**：生产 11 条失败请求里注入的 `"."` 一个都没出现，
+因为注入全打在了这条不参与校验的 system 消息上（它 content 是字符串，旧版判定直接提前 return）。
+判定只看 `role`，不看 content 形状 —— 拿 content 形状做判断正是漏掉它的原因。
+只跳过**尾部**的：中间那条 system 后面还有真正的 user 收尾，此时无需注入。
+
+Anthropic 入口实测（生产真实入口）：
+
+| 用例 | 结果 |
+|---|---|
+| 裸 `tool_result` + 末条 `role:system` | **400** ← 生产失败形状 |
+| `tool_result` + text 收尾 + 末条 `role:system` | **200** ← 本修复 |
 
 **不能挂在图片分支下**。生产上撞这个校验的请求大多不带图，而识图那条路无图时提前返回。
 两个修复各自独立判断，都不需要改写时才返回 `None`。

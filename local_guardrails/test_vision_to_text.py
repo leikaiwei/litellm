@@ -578,6 +578,101 @@ class TestTrailingTextInjection:
         ]
         assert ensure_trailing_text_after_tool_result(messages) == messages
 
+    def test_trailing_system_message_does_not_hide_a_bare_tool_result(self):
+        """
+        生产 400 的直接形状。Claude Code 会在末尾发一条独立的 role:system 提醒消息，
+        而 Anthropic 的 messages 只允许 user/assistant，下游转换器把它上提到开头，
+        于是后端看到的收尾又变回裸 tool_result。
+
+        实测（Anthropic 入口）：末条 system + 前一条裸 tool_result -> 400；
+        前一条补上 text 块 -> 200。判据见
+        .ops-runbook/findings/2026-08-01-newapi-400-补丁未覆盖-交接.md
+        """
+        messages = [
+            {"role": "user", "content": [TOOL_RESULT]},
+            {"role": "system", "content": "The task tools haven't been used recently."},
+        ]
+
+        out = ensure_trailing_text_after_tool_result(messages)
+
+        assert out[0]["content"] == [TOOL_RESULT, {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}]
+        assert out[1] == messages[1], "不该改动那条 system 消息本身"
+
+    def test_trailing_system_message_with_list_content_is_also_skipped(self):
+        """
+        role:system 的 content 也可能是块数组。跳过与否只看 role，不看 content 形状 ——
+        08-01 之前那版正是因为拿 content 形状做判断（不是 list 就 return）才漏掉这类。
+        """
+        messages = [
+            {"role": "user", "content": [TOOL_RESULT]},
+            {"role": "system", "content": [{"type": "text", "text": "stay brief"}]},
+        ]
+
+        out = ensure_trailing_text_after_tool_result(messages)
+
+        assert out[0]["content"] == [TOOL_RESULT, {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}]
+
+    def test_consecutive_trailing_system_messages_are_all_skipped(self):
+        """连发多条提醒时要一路往前找，只跳一条不够"""
+        messages = [
+            {"role": "user", "content": [TOOL_RESULT]},
+            {"role": "system", "content": "The task tools haven't been used recently."},
+            {"role": "system", "content": "The TodoWrite tool hasn't been used recently."},
+        ]
+
+        out = ensure_trailing_text_after_tool_result(messages)
+
+        assert out[0]["content"] == [TOOL_RESULT, {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}]
+
+    def test_system_message_in_the_middle_is_not_skipped(self):
+        """
+        只有尾部的 system 不算收尾。中间那条后面还有真正的 user 消息，
+        那条才是后端看到的末条；此时无需注入。跳过规则若不限定尾部就会误注入。
+        """
+        messages = [
+            {"role": "user", "content": [TOOL_RESULT]},
+            {"role": "system", "content": "reminder"},
+            {"role": "user", "content": [{"type": "text", "text": "go on"}]},
+        ]
+        assert ensure_trailing_text_after_tool_result(messages) == messages
+
+    def test_trailing_system_is_no_op_when_tool_result_already_has_text(self):
+        """跳过尾部 system 之后，前一条已有非空 text 收尾，校验不触发，不该重复注入"""
+        messages = [
+            {"role": "user", "content": [TOOL_RESULT, {"type": "text", "text": "what now?"}]},
+            {"role": "system", "content": "reminder"},
+        ]
+        assert ensure_trailing_text_after_tool_result(messages) == messages
+
+    def test_injection_with_trailing_system_is_idempotent(self):
+        """注入完再跑一遍必须 no-op，否则每轮对话都会多堆一个 text 块"""
+        messages = [
+            {"role": "user", "content": [TOOL_RESULT]},
+            {"role": "system", "content": "reminder"},
+        ]
+        once = ensure_trailing_text_after_tool_result(messages)
+        assert ensure_trailing_text_after_tool_result(once) is once
+
+    def test_trailing_system_and_dropped_message_skip_rules_compose(self):
+        """
+        两类跳过规则要能叠加：末尾一条会被 litellm 摘空丢掉的消息 + 一条 system，
+        真正的收尾在它们前面。任一规则单独实现都盖不住这个形状。
+        """
+        messages = [
+            {"role": "user", "content": [TOOL_RESULT]},
+            {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+            {"role": "system", "content": "reminder"},
+        ]
+
+        out = ensure_trailing_text_after_tool_result(messages)
+
+        assert out[0]["content"] == [TOOL_RESULT, {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}]
+
+    def test_only_system_messages_is_a_no_op(self):
+        """全是 system 时没有可注入的目标，不能越界或凭空造消息"""
+        messages = [{"role": "system", "content": "a"}, {"role": "system", "content": "b"}]
+        assert ensure_trailing_text_after_tool_result(messages) == messages
+
     def test_parallel_tool_results_need_only_one_text_block(self):
         """并列多个 tool_result（并行工具调用）只需在末尾补一个"""
         out = ensure_trailing_text_after_tool_result([{"role": "user", "content": [TOOL_RESULT, OTHER_TOOL_RESULT]}])
@@ -641,6 +736,27 @@ async def test_hook_injects_trailing_text_when_request_has_no_images():
 
     assert result is not None, "无图但需要注入尾块时不能返回 None"
     assert _trailing(result["messages"]) == {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}
+    router.acompletion.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hook_injects_when_production_failure_shape_ends_with_system_message():
+    """
+    08-01 生产 400 的完整形状走一遍 hook：裸 tool_result + 末条独立 role:system 提醒。
+    生产 11 条失败请求里注入的文本一个都没出现，因为注入打在了那条 system 上。
+    这条锁住 hook 层不会因此返回 None（返回 None 就等于整个修复没生效）。
+    """
+    router = _router("unused")
+    messages = [
+        {"role": "user", "content": [TOOL_RESULT]},
+        {"role": "system", "content": "The task tools haven't been used recently."},
+    ]
+
+    result = await _run(_make_guardrail(router=router), messages)
+
+    assert result is not None, "生产失败形状必须被改写，返回 None 等于修复没生效"
+    assert result["messages"][0]["content"] == [TOOL_RESULT, {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}]
+    assert result["messages"][1] == messages[1]
     router.acompletion.assert_not_called()
 
 

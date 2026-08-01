@@ -236,9 +236,28 @@ def _dropped_by_empty_text_stripping(message: object) -> bool:
     return all(not _survives_empty_text_stripping(block) for block in content)
 
 
-def _last_surviving_message_index(messages: Sequence[AllMessageValues]) -> Optional[int]:
+def _counts_as_tail(message: object) -> bool:
+    """
+    这条消息算不算后端校验时看到的收尾。两类不算：
+
+    1. 会被 litellm 摘空后整条删掉的（见 _dropped_by_empty_text_stripping）
+    2. role: system —— Anthropic 的 messages 只允许 user / assistant，system 是顶层字段。
+       但 Claude Code 确实会在末尾发独立的 role: system 提醒消息（"The task tools haven't
+       been used recently…"），litellm 原样透传，下游 anthropic -> openai 转换器把它上提到
+       开头，于是后端看到的收尾又变回它前面那条。
+
+    第 2 类是 08-01 生产 400 的直接根因：注入落在一条不参与校验的消息上等于没注入
+    （11 条失败请求里注入的文本一个都没出现）。判定只看 role，不看 content 形状 ——
+    上一版正是因为 content 是字符串就提前 return 才漏掉它。
+    """
+    if isinstance(message, dict) and message.get("role") == "system":
+        return False
+    return not _dropped_by_empty_text_stripping(message)
+
+
+def _last_effective_message_index(messages: Sequence[AllMessageValues]) -> Optional[int]:
     return next(
-        (index for index in reversed(range(len(messages))) if not _dropped_by_empty_text_stripping(messages[index])),
+        (index for index in reversed(range(len(messages))) if _counts_as_tail(messages[index])),
         None,
     )
 
@@ -259,13 +278,13 @@ def ensure_trailing_text_after_tool_result(messages: List[AllMessageValues]) -> 
     OpenAI 形状（末条 role: "tool"）不处理：那种形状只能另起一条 user 消息，会造成连续两条
     user 消息，未实测过。生产走 /v1/messages，进本 hook 时是 Anthropic 形状。
 
-    "最后一条消息"按 litellm 摘空块之后的样子算：整条会被摘空的消息不算，否则它会挡住
-    前面那条真正的裸 tool_result 收尾（见 _dropped_by_empty_text_stripping）。
-    那些消息由 litellm 自己丢，本函数不删。
+    "最后一条消息"按后端实际看到的收尾算，不是 messages[-1]：会被 litellm 摘空丢掉的消息、
+    以及尾部的 role: system 消息都不算（见 _counts_as_tail）。注入落在这两类上等于没注入。
+    它们该由 litellm 或下游转换器自己处理，本函数不删不改。
 
     无需改动时返回传入的对象本身，调用方可用 `is` 判断有没有变。原 messages 不被修改。
     """
-    index = _last_surviving_message_index(messages)
+    index = _last_effective_message_index(messages)
     if index is None:
         return messages
     last_message = messages[index]
