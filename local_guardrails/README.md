@@ -249,3 +249,94 @@ user 消息，会造成连续两条 user，未实测过。生产走 `/v1/message
   从而被误判成不支持视觉（生产选型时据此错杀了 qwen3.7-plus）。用真实截图，
   问只有真看到图才知道的细节。同理，`supports_vision` 为 `None` 只表示
   `model_prices_and_context_window.json` 里查无此条目，不代表不支持
+
+## kiro_session_affinity — 会话亲和 header
+
+给发往 kiro-gateway 的请求打一个跨轮次稳定的 `x-kiro-session`，让 kiro 侧 nginx 的
+`hash $http_x_kiro_session consistent` 把同一个对话线程钉在同一个上游账号上。
+
+### 为什么需要
+
+kiro 上游按账号隔离前缀缓存，同一会话落到不同账号要重新 prefill，每轮多付 3~6 秒。
+选路由 kiro 侧 nginx 完成，litellm 这边只负责把 key 稳定带上：本 guardrail 只写 header，
+不选路、不改 messages、不阻断请求。
+
+kiro 那个 model group 必须继续只有一个 deployment 指向 nginx，注册成多个会让两层路由打架。
+
+### 配置
+
+按文件挂载（不是挂目录），所以新增文件要改 compose：
+
+```yaml
+volumes:
+  - ./kiro_session_affinity.py:/app/kiro_session_affinity.py:ro
+```
+
+```yaml
+guardrails:
+  - guardrail_name: "kiro-session-affinity"
+    litellm_params:
+      guardrail: kiro_session_affinity.KiroSessionAffinityGuardrail
+      mode: "pre_call"
+      default_on: false          # 必须 false，否则变成全局常开
+```
+
+再给每个 kiro deployment 的 `litellm_params.guardrails` 加上 `"kiro-session-affinity"`。
+
+### 设计要点
+
+**值 = `sha256(litellm_session_id)` 前 16 位 hex。** 不透出 session_id 原值：它源自
+`metadata.user_id`，含用户身份信息，而这个 header 会进 nginx access log。
+
+**刻意只掺 session_id，不掺 system prompt。** 掺 system 的动机是把共享同一 session id 的
+并行 subagent 分到不同账号，但 Claude Code 的 system 是数组，前若干 KB 是所有会话共享的公共
+前缀，按前缀截取大概率区分度为 0；整体哈希又会被 system 里逐轮变化的内容带得每轮漂移，
+那比不做更糟（每轮冷 prefill）。稳定性优先于区分度。
+
+**解不出会话 id 时不写 header**，而不是退化成随机值 —— 随机值每轮都是冷 prefill，
+且缺失能在 nginx 侧的覆盖率里直接看出来。
+
+**必须原地写 `data["headers"]`，不能只靠返回值。** deployment 级钩子
+（`custom_guardrail.py` 的 `async_pre_call_deployment_hook`）只把返回值里的 `messages`
+拷回 kwargs，其余键一概丢弃；而模型组 fallback 只走 router 内部、不重跑 proxy 级钩子，
+deployment 级是 fallback 路径上唯一的机会。改成 `return {**data, ...}` 会让 header
+在 fallback 上静默丢失。
+
+**合并而非覆盖已有 headers。** 本钩子跑在 `add_litellm_data_to_request` 之后，直接赋值会
+清掉它注入的 `anthropic-beta` / `anthropic-version`（见上文 DeepSeek Anthropic 兼容链路）。
+
+**没走 `forward_client_headers_to_llm_api` 纯配置方案。** 那条会转发所有 `x-` 开头的头
+（`litellm_pre_call_utils.py` 的 `_get_forwardable_headers` 只排除 `x-stainless`），
+把调用方的 `x-api-key` 一起送上去；而 messages 路径的认证注入是
+`if "x-api-key" not in headers`（`messages/transformation.py:244`），于是真 key 不注入，
+上游拿到一个不认识的 key。
+
+### 实测验证
+
+本地 proxy 加假后端抓上游实收字节（`litellm_params.guardrails` 挂载 vs 未挂载对照）：
+
+| 用例 | 上游实收 `x-kiro-session` |
+|---|---|
+| 挂载，session A 第 1 轮 | `609a4b6453120e27` |
+| 挂载，session A 第 2 轮 | `609a4b6453120e27`（跨轮次一致） |
+| 挂载，session B | `2af9371cca8b4329`（不同会话不同值） |
+| 挂载，session id 走 header 来源 | 与 body 来源同值 |
+| **未挂载，session A** | **缺失**（只对挂了的 deployment 生效） |
+| 挂载，无 session id | 缺失（不退化成随机值） |
+| **fallback 落到挂载组** | `609a4b6453120e27`（deployment 级钩子补上） |
+
+最后一行是关键：fallback 路径上 proxy 级钩子不重跑，header 由 deployment 级钩子写入。
+
+`anthropic-version` 与 `x-kiro-session` 在上游同时收到，即证明是合并不是覆盖。
+用一个编造的 `anthropic-beta` 值测不出这条 —— 它会被 provider config 的 beta 过滤
+（`should_filter_anthropic_beta_headers` 默认 True）当成不支持的 beta 丢掉，
+未挂载的对照组同样缺失，与本 guardrail 无关。
+
+### 挂给其他模型
+
+只写一个自定义 header，不改 body。已确认 `headers` 不参与缓存 key
+（`ModelParamHelper._get_all_llm_api_params()` 里没有 `headers` / `extra_headers`），
+所以不会打散缓存。对不认识这个 header 的上游是多一个被忽略的头。
+
+未实测：bedrock / vertex 这类要对请求头做 SigV4 之类签名的 provider，多一个头是否影响签名。
+当前 6 个 kiro deployment 全是 anthropic provider，不涉及；将来挂到 bedrock 前先验这一条。
