@@ -332,6 +332,34 @@ deployment 级是 fallback 路径上唯一的机会。改成 `return {**data, ..
 （`should_filter_anthropic_beta_headers` 默认 True）当成不支持的 beta 丢掉，
 未挂载的对照组同样缺失，与本 guardrail 无关。
 
+### 覆盖面：只有能解出会话 id 的客户端才拿到 header
+
+生产实测约 **81%**（2026-08-02，498 个请求）。分界完全按客户端格式走：
+
+| 入口 | call_type | header |
+|---|---|---|
+| `/v1/messages` | `anthropic_messages` | 有 |
+| `/chat/completions` | `acompletion` | **无** |
+
+litellm 认会话 id 只有两条路（`proxy/litellm_pre_call_utils.py`）：header 路径
+`get_chain_id_from_headers()`（:430），或 body 路径从 `metadata.user_id` 里的
+`..._session_<uuid>` 抠（:456）。Claude Code 靠后者；OpenAI 格式的请求两条都不命中，
+于是本 guardrail 静默跳过。
+
+给这类客户端补上不用改代码，让它每轮发一个稳定的头即可，litellm 会自动认出来：
+
+```
+头名  匹配 ^x-.+-session-id$      （大小写不敏感，:47）
+值    匹配 ^[a-zA-Z0-9_\-]{8,}$   （:51）
+```
+
+即 `x-openclaw-session-id: <该对话固定的 id>`，或显式的 `x-litellm-session-id`（优先级更高）。
+硬要求仍是同一对话所有轮次完全一致，别掺时间戳或消息条数。
+
+**验证覆盖率别看 `applied_guardrails`**，那个字段是无条件记录的（`proxy/utils.py:1226`），
+静默 no-op 时同样会出现本 guardrail 的名字；`SpendLogs.session_id` 也会 fallback 到自动生成的
+trace id（`litellm_logging.py:5110`），永不为空。真判据是同一 `session_id` 有没有跨轮复用。
+
 ### 挂给其他模型
 
 只写一个自定义 header，不改 body。已确认 `headers` 不参与缓存 key
