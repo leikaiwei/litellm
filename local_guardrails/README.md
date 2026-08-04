@@ -368,3 +368,120 @@ trace id（`litellm_logging.py:5110`），永不为空。真判据是同一 `ses
 
 未实测：bedrock / vertex 这类要对请求头做 SigV4 之类签名的 provider，多一个头是否影响签名。
 当前 6 个 kiro deployment 全是 anthropic provider，不涉及；将来挂到 bedrock 前先验这一条。
+
+## thinking_switch — 思考开关归一化
+
+把客户端的思考开关意图归一化成下游能区分的形状。修复 Claude Code 里关掉思考、上游
+deepseek 仍然思考。
+
+### 为什么需要
+
+`deepseek-v4-flash` 在成本表里没有 `supports_adaptive_thinking`，于是原生 Anthropic 直通
+路径上 `AnthropicMessagesConfig._translate_adaptive_effort_for_non_adaptive_model` 判它是
+非 adaptive 模型，走降级分支。那个分支的闸门是：
+
+```python
+if effort is None and not adaptive_thinking:
+    return
+```
+
+**`output_config.effort` 非空就足以进去**，随后无条件把 `thinking` 覆盖成
+`{"type": "enabled", "budget_tokens": N}`（effort -> budget：low=1024 / medium=2048 /
+high=4096 / xhigh=8192 / max=16384，再按 `max_tokens` 截断）。
+
+而 Claude Code 关闭思考只是**不发 `thinking` 字段**，`output_config.effort` 照发 —— effort
+是独立的强度档，关掉思考后仍停留在上次的值。于是两态出站字节级相同，下游无从区分。生产
+实测（08-05 会话 `d7ad84b9`，两态 effort 都是 high，故出站都是 `enabled/4096`）：
+
+| 客户端操作 | 实际发出 | litellm 出站 |
+|---|---|---|
+| 关闭思考 | 无 `thinking`，`effort: high` | `enabled/4096` |
+| 开启思考 | `{"type":"adaptive"}`，`effort: high` | `enabled/4096` |
+
+同一个闸门还导致：客户端**明确**发 `{"type":"disabled"}`，只要 effort 还在，也会被改写成
+enabled。所以只补 disabled 是不够的，必须同时摘掉 effort。
+
+### 配置
+
+按文件挂载（不是挂目录），所以新增文件要改 compose：
+
+```yaml
+volumes:
+  - ./thinking_switch.py:/app/thinking_switch.py:ro
+```
+
+```yaml
+guardrails:
+  - guardrail_name: "thinking-switch"
+    litellm_params:
+      guardrail: thinking_switch.ThinkingSwitchGuardrail
+      mode: "pre_call"
+      default_on: false          # 必须 false，否则变成全局常开
+```
+
+再给每个 hoperun deployment 的 `litellm_params.guardrails` 加上 `"thinking-switch"`。
+**`guardrails` 是整列表覆盖语义**，写成 `["thinking-switch"]` 会把 `vision-to-text`
+挤掉，必须写全：`["vision-to-text", "thinking-switch"]`。
+
+### 归一化规则
+
+```
+thinking.type ∈ {enabled, adaptive}  ->  一个字都不碰
+其余（缺失 / disabled / 未知值）      ->  thinking = {"type": "disabled"}
+                                         并摘掉 output_config.effort
+```
+
+### 设计要点
+
+**白名单而非黑名单。** 未知取值按不思考处理，与下游 newapi 侧规则的保守默认一致。
+
+**开态一个字都不碰，是为了不误伤另一个客户端。** hoperun 上还有一路请求发
+`{"type":"enabled","budget_tokens":7168}`（指纹：不带 `anthropic-beta` 头、68/71 个工具、
+`max_tokens=8192`、单轮），它的 thinking 本来就完好穿过 litellm —— 闸门对它早退，因为它
+既不带 `output_config` 也不是 adaptive。误伤它等于把好的也弄坏。
+
+**只摘 `effort`，不删整个 `output_config`。** 生产里 `output_config` 还承载 `format`
+（结构化输出的 json_schema，24 小时内 97 条），删掉会静默破坏结构化输出。实测保留 format
+不影响闸门判定。
+
+**必须原地写 `data`，不能只靠返回值。** deployment 级钩子只把返回值里的 `messages` 拷回
+kwargs，其余键一概丢弃；而模型组 fallback 只走 router 内部、不重跑 proxy 级钩子，
+deployment 级是那条路上唯一的机会。与 `kiro_session_affinity` 同一个坑。
+
+### 与 vision_to_text 的关系
+
+两者都挂在 hoperun 上，互不干扰：识图动 `messages`，本 guardrail 只动 `thinking` /
+`output_config.effort`。
+
+但有个连带效应：`vision_to_text` 的尾部 text 块注入（那个 `.`）是为了绕开外来 tool id
+被拒，而那个 400 的真因是**思考模式要求回传 `reasoning_content`**。思考关掉后，关态那些
+请求的注入变成白打。**不要因此删掉注入** —— 开态仍然需要它。
+
+### 实测验证
+
+单元 + e2e 共 18 个测试（`test_thinking_switch.py`）。突变检查：不摘 effort / 整块删
+output_config / 返回新 dict 而非原地改 / 白名单漏掉 enabled，四个突变各杀掉至少 2 个测试。
+
+端到端起假后端抓出站字节（`.ops-runbook/scripts/thinking_switch_e2e.py`，拓扑复刻生产：
+provider=anthropic + drop_params=True + deployment 挂 guardrails）：
+
+| 入站 | 对照组（不挂） | 实验组（挂） |
+|---|---|---|
+| 关：无 thinking + effort=high | `enabled/4096` | **`disabled`** |
+| 开：adaptive + effort=high | `enabled/4096` | `enabled/4096` |
+| 显式 disabled + effort=high | `enabled/4096` | **`disabled`** |
+| 另一客户端 `enabled/7168` | 原样 | 原样 |
+
+对照组两态相同（复现缺陷），实验组可区分。
+
+判据坑：关态与开态**必须用同一个 effort**。第一版脚手架给关态 high、开态 xhigh，对照组
+出站 4096 vs 8192 看起来"可区分"，误判成缺陷不存在 —— 那是不同 effort 导致的，不是开关。
+
+### 下游契约
+
+newapi 侧规则认 `enabled` / `adaptive` 为要思考，其余补 `{"type":"disabled"}`。归一化后
+关态出站 `disabled`（命中它的触发分支）、开态 `enabled`（命中跳过分支），两侧都落在正确侧，
+newapi 那边不用改。
+
+前提是 newapi **转换时别再丢 `thinking`** —— 它当前在 anthropic -> openai 转换时把该字段
+整个丢掉，不修的话 litellm 这侧改了也传不过去。
