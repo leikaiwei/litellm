@@ -1,15 +1,12 @@
 """
-在请求发给后端之前改写 messages，做两件彼此独立的事：
+在请求发给后端之前，把图片交给视觉模型识别，用识别文本替换原图片块。
 
-1. 把图片交给视觉模型识别，用识别文本替换原图片块。deepseek 等模型只支持文本，但
-   Claude Code 用户会贴截图；挂上本 guardrail 后带图请求不再报 400，也不会被后端
-   静默丢成 [Unsupported Image]。
+deepseek 等模型只支持文本，但 Claude Code 用户会贴截图；挂上本 guardrail 后带图请求
+不再报 400，也不会被后端静默丢成 [Unsupported Image]。
 
-2. 裸 tool_result 收尾时在末尾追加一个非空 text 块，绕开 opencode 的 tool_use id
-   注册表校验（见 ensure_trailing_text_after_tool_result）。
-
-名字只覆盖第一件事。没拆成两个 guardrail 是因为挂载点完全相同，而生产上新建一个
-guardrail 要改 config.yaml 再逐个 PATCH deployment；合进已挂载的文件只需替换本文件。
+曾经还兼管"裸 tool_result 收尾时补一个 text 块"，那件事与识图完全独立，已拆到
+tool_result_trailing_text.py。当初合在一起只是因为生产上新增一个 guardrail 要改
+docker compose 重建容器，不是设计判断。
 
 这是 litellm 的外部自定义 guardrail，不修改 litellm 源码。把本文件放在 config.yaml
 同目录，然后：
@@ -53,11 +50,6 @@ if TYPE_CHECKING:
     from litellm.proxy._types import UserAPIKeyAuth
     from litellm.router import Router
     from litellm.types.utils import CallTypesLiteral
-
-# 追加在裸 tool_result 之后的文本。必须非空白：litellm 的
-# strip_empty_text_blocks_from_anthropic_messages 用 .strip() 判空并摘掉纯空白块，
-# 摘完又变回裸 tool_result 收尾，等于没修。实测空串与单空格均无效
-TOOL_RESULT_TRAILING_TEXT = "."
 
 DEFAULT_VISION_PROMPT = (
     "Describe this image in detail. Transcribe any text, code, numbers or error "
@@ -202,100 +194,6 @@ def replace_images_with_text(
     ]
 
 
-def _survives_empty_text_stripping(block: object) -> bool:
-    """
-    litellm 发给后端前会摘掉纯空白 text 块（strip_empty_text_blocks_from_anthropic_messages），
-    所以"是否裸 tool_result 收尾"必须按摘完之后的样子判断。否则会被 Claude Code 常带的
-    {"type": "text", "text": ""} 骗过去：看着有 text 收尾就跳过注入，实际发出去时它已被摘掉，
-    请求照样 400。
-    """
-    if not isinstance(block, dict) or block.get("type") != "text":
-        return True
-    text = block.get("text")
-    return isinstance(text, str) and bool(text.strip())
-
-
-def _ends_with_bare_tool_result(content: Sequence[object]) -> bool:
-    last = next((block for block in reversed(content) if _survives_empty_text_stripping(block)), None)
-    return isinstance(last, dict) and last.get("type") == "tool_result"
-
-
-def _dropped_by_empty_text_stripping(message: object) -> bool:
-    """
-    litellm 摘空块后若整条 content 变空，会把**整条消息**从列表里删掉，而不是留个空数组
-    （strip_empty_text_blocks_from_anthropic_messages 的 `elif filtered:` 分支）。
-    这种消息不能算末条，否则它会挡住前面那条真正的裸 tool_result 收尾。
-
-    条件必须与 litellm 逐字对齐：content 为空列表时 len 不变、走保留分支，故此处要求非空。
-    """
-    if not isinstance(message, dict):
-        return False
-    content = message.get("content")
-    if not isinstance(content, list) or not content:
-        return False
-    return all(not _survives_empty_text_stripping(block) for block in content)
-
-
-def _counts_as_tail(message: object) -> bool:
-    """
-    这条消息算不算后端校验时看到的收尾。两类不算：
-
-    1. 会被 litellm 摘空后整条删掉的（见 _dropped_by_empty_text_stripping）
-    2. role: system —— Anthropic 的 messages 只允许 user / assistant，system 是顶层字段。
-       但 Claude Code 确实会在末尾发独立的 role: system 提醒消息（"The task tools haven't
-       been used recently…"），litellm 原样透传，下游 anthropic -> openai 转换器把它上提到
-       开头，于是后端看到的收尾又变回它前面那条。
-
-    第 2 类是 08-01 生产 400 的直接根因：注入落在一条不参与校验的消息上等于没注入
-    （11 条失败请求里注入的文本一个都没出现）。判定只看 role，不看 content 形状 ——
-    上一版正是因为 content 是字符串就提前 return 才漏掉它。
-    """
-    if isinstance(message, dict) and message.get("role") == "system":
-        return False
-    return not _dropped_by_empty_text_stripping(message)
-
-
-def _last_effective_message_index(messages: Sequence[AllMessageValues]) -> Optional[int]:
-    return next(
-        (index for index in reversed(range(len(messages))) if _counts_as_tail(messages[index])),
-        None,
-    )
-
-
-def ensure_trailing_text_after_tool_result(messages: List[AllMessageValues]) -> List[AllMessageValues]:
-    """
-    最后一条消息以裸 tool_result 收尾时，在其 content 末尾追加一个非空 text 块。
-
-    opencode 对 tool_use id 做服务端注册表校验，只认自己签发过的 id；而 Claude Code 不自己
-    生成 id，只回传后端给的。于是一次 fallback 到别的后端就永久污染该会话，之后每轮必 400
-    （单向棘轮）。改写 id 无解：同前缀同长度的自编 id 也被拒（真 id 只改末 4 字符即 400），
-    是存在性校验而非格式校验。
-
-    但校验是两段式的：只有请求最后一个 content 块是裸 tool_result 时才**触发**，一旦触发就
-    扫全历史的 id。所以末尾追加一个非空 text 块，校验根本不启动，历史里有多少外来 id 都无所谓。
-    对合法 id 注入同样无害，因此无条件执行，不必判断 id 来源。
-
-    OpenAI 形状（末条 role: "tool"）不处理：那种形状只能另起一条 user 消息，会造成连续两条
-    user 消息，未实测过。生产走 /v1/messages，进本 hook 时是 Anthropic 形状。
-
-    "最后一条消息"按后端实际看到的收尾算，不是 messages[-1]：会被 litellm 摘空丢掉的消息、
-    以及尾部的 role: system 消息都不算（见 _counts_as_tail）。注入落在这两类上等于没注入。
-    它们该由 litellm 或下游转换器自己处理，本函数不删不改。
-
-    无需改动时返回传入的对象本身，调用方可用 `is` 判断有没有变。原 messages 不被修改。
-    """
-    index = _last_effective_message_index(messages)
-    if index is None:
-        return messages
-    last_message = messages[index]
-    content = last_message.get("content")
-    if not isinstance(content, list) or not _ends_with_bare_tool_result(content):
-        return messages
-    trailing = {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}
-    patched = cast(AllMessageValues, {**last_message, "content": [*content, trailing]})
-    return [*messages[:index], patched, *messages[index + 1 :]]
-
-
 class VisionToTextGuardrail(CustomGuardrail):
     def __init__(
         self,
@@ -345,9 +243,7 @@ class VisionToTextGuardrail(CustomGuardrail):
             return None
         messages = cast(List[AllMessageValues], raw_messages)
 
-        # 两个修复彼此独立，各自判断：识图换掉图片块，尾块只在末尾追加，互不干扰。
-        # 尾块修复不能挂在图片分支下 —— 生产上撞 tool id 校验的请求大多不带图
-        patched = ensure_trailing_text_after_tool_result(await self._replace_images_in(messages, cache=cache))
+        patched = await self._replace_images_in(messages, cache=cache)
         if patched is messages:
             return None
         return {**data, "messages": patched}

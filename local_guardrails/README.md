@@ -10,21 +10,14 @@
 .venv/bin/python -m pytest local_guardrails/ -q
 ```
 
-## vision_to_text — 请求改写
-
-在请求发给后端之前改写 messages，做两件彼此独立的事：
-
-1. **图片转文本**：把图片交给视觉模型识别，用识别文本替换原图片块，让纯文本模型能处理带截图的请求
-2. **尾部 text 块注入**：裸 `tool_result` 收尾时补一个非空 text 块，绕开 opencode 的 tool id 校验
-
-名字只覆盖第一件事。没拆成两个 guardrail 是因为挂载点完全相同（都是 opencode 这条路上的
-`pre_call`），而生产上新建一个 guardrail 要改 config.yaml 的 `guardrails:` 段、再逐个 PATCH
-deployment 的 `guardrails` 数组；合进已挂载的文件只需替换一个 py 文件加重启。
-
-### 图片转文本
+## vision_to_text — 图片转文本
 
 让只支持文本的模型（deepseek）能处理带截图的请求：在请求发给后端之前，把 messages 里的
 图片交给视觉模型识别，用识别文本替换原图片块。
+
+> 2026-08-05 前本文件还兼管"裸 `tool_result` 收尾时补一个 text 块"，那件事与识图完全独立，
+> 已拆到 `tool_result_trailing_text.py`。当初合在一起只是因为生产按文件挂载、新增一个 .py
+> 要改 compose 重建容器，不是设计判断。
 
 ### 为什么需要
 
@@ -146,82 +139,6 @@ sha256 缓存描述文本，保证同图产出逐字节相同。
 - 全程 proxy 日志里的真实异常全部归因到故意制造的两个失败源（对照组带图 400、
   坏识图组连接拒绝），无法解释的错误为零
 
-### 尾部 text 块注入 — 绕开 opencode 的 tool id 校验
-
-opencode（`opencode.ai/zen/go`）对 `tool_use.id` 做**服务端注册表校验**，只接受它自己签发过的 id。
-而 Claude Code 不自己生成 tool id，只回传后端给的，于是形成**单向棘轮**：
-
-```
-opencode 服务这轮 -> id 由 opencode 签发 -> 下轮 opencode 认
-其它后端服务这轮  -> id 由它签发        -> 下轮 opencode 必拒 -> 又落该后端 -> 再加一个外来 id
-```
-
-**一次 fallback 就永久污染该会话**，之后每轮加深，表现为「上下文进了别的模型就再也回不到 opencode」。
-生产 2026-08-01 凌晨命中：`hoperun` 组唯一活跃成员经 newapi 打 opencode，对被污染会话 100% 返回
-400 `Error from provider (Console Go): Upstream request failed`，全部降级到 qwen。
-
-改写 id 这条路走不通：同前缀同长度的自编 id 也被拒（真 id 只改末 4 字符即 400），
-是存在性校验而非格式校验。
-
-**但校验是两段式的**：只有请求最后一个 content 块是裸 `tool_result` 时才**触发**，
-一旦触发就扫全历史的 id。所以末尾追加一个非空 text 块，校验根本不启动，历史里有多少外来 id
-都无所谓。对合法 id 注入同样无害，因此无条件执行，不必判断 id 来源。
-
-直连 newapi 实测（`.ops-runbook/scripts/toolid_verify.py`，每例重复 3 次，全部一致）：
-
-| 用例 | 结果 |
-|---|---|
-| 真 id + 裸 `tool_result` 收尾（正对照） | 200 |
-| 假 id + 裸 `tool_result` 收尾（故障复现） | **400** |
-| 假 id + 尾部 text `"."`（本修复） | **200** |
-| 真 id + 尾部 text `"."`（注入无害） | 200 |
-| 假 id + 尾部 text `""`（空串） | **400** |
-| 假 id + 另起一条 user 消息收尾 | 200 |
-
-实现要点：
-
-**注入内容必须非空白**。litellm 发给后端前会跑
-`strip_empty_text_blocks_from_anthropic_messages`（`llms/anthropic/common_utils.py`），
-用 `.strip()` 判空并摘掉纯空白 text 块 —— 摘完又变回裸 `tool_result` 收尾，等于没修。
-同理，判断「是否裸 tool_result 收尾」时也要**跳过末尾的空白 text 块**：Claude Code 常回传
-`{"type": "text", "text": ""}`，看着有 text 收尾，实际发出去时已被摘掉。
-`text` 非 str（`None` 或缺键）也算会被摘掉，与 litellm 的 `_is_empty_text_block` 逐条对齐。
-
-**「最后一条消息」不是 `messages[-1]`**。有两类消息不参与后端校验，注入落在它们身上等于没注入。
-判定实现为 `_counts_as_tail` + `_last_effective_message_index`，注入打在真正会被校验的那条上；
-这两类消息由 litellm 或下游转换器自己处理，本 guardrail 不删不改。
-
-第一类：**会被摘空后整条删掉的消息**。这是空白 text 块那个坑的消息级版本，容易只做一半 ——
-清理函数在 content 摘空后把**整条消息**从列表里删掉，不是留个空数组。所以末条消息整条只含
-空白块时，前一条裸 `tool_result` 会重新成为末条，只看 `messages[-1]` 会认为无需注入，
-litellm 丢掉末条后请求变回裸收尾，照样 400 且不报错。边界要与 litellm 逐字对齐：
-content **本来就是** `[]` 的消息不会被丢（走 `len` 相等那条分支），仍算末条。
-
-第二类：**尾部的 `role: system` 消息**。Anthropic 的 `messages` 只允许 `user` / `assistant`，
-`system` 是顶层字段；但 Claude Code 确实会在末尾发独立的 `role: system` 提醒消息
-（`The task tools haven't been used recently…` / `The TodoWrite tool hasn't been used recently…`），
-litellm 原样透传，下游 anthropic -> openai 转换器把它上提到开头，于是后端看到的收尾又变回
-它前面那条。**这是 08-01 生产 400 的直接根因**：生产 11 条失败请求里注入的 `"."` 一个都没出现，
-因为注入全打在了这条不参与校验的 system 消息上（它 content 是字符串，旧版判定直接提前 return）。
-判定只看 `role`，不看 content 形状 —— 拿 content 形状做判断正是漏掉它的原因。
-只跳过**尾部**的：中间那条 system 后面还有真正的 user 收尾，此时无需注入。
-
-Anthropic 入口实测（生产真实入口）：
-
-| 用例 | 结果 |
-|---|---|
-| 裸 `tool_result` + 末条 `role:system` | **400** ← 生产失败形状 |
-| `tool_result` + text 收尾 + 末条 `role:system` | **200** ← 本修复 |
-
-**不能挂在图片分支下**。生产上撞这个校验的请求大多不带图，而识图那条路无图时提前返回。
-两个修复各自独立判断，都不需要改写时才返回 `None`。
-
-**只处理 Anthropic 形状**。末条是 `role: "tool"` 的 OpenAI 形状留 no-op：那种形状只能另起一条
-user 消息，会造成连续两条 user，未实测过。生产走 `/v1/messages`，进 hook 时是 Anthropic 原生形状
-（转换发生在 hook 之后，见 `llms/anthropic/experimental_pass_through/adapters/`）。
-
-副作用：注入的 `"."` 会进入对话被模型看到。实测模型正常作答，但确实是注入内容。
-
 ### 待补 / 已知问题
 
 - 视觉调用未设 `max_tokens`。若组内命中推理模型，描述那次调用可能在 reasoning 上多花 token，
@@ -249,6 +166,228 @@ user 消息，会造成连续两条 user，未实测过。生产走 `/v1/message
   从而被误判成不支持视觉（生产选型时据此错杀了 qwen3.7-plus）。用真实截图，
   问只有真看到图才知道的细节。同理，`supports_vision` 为 `None` 只表示
   `model_prices_and_context_window.json` 里查无此条目，不代表不支持
+
+## tool_result_trailing_text — 尾部 text 块注入
+
+会话被 fallback 污染过、且请求以裸 `tool_result` 收尾时，在末尾追加一个非空 text 块。
+
+### 为什么需要
+
+deepseek 思考模式要求带 `tool_calls` 的 assistant 消息回传 `reasoning_content`。opencode
+用它签发的 tool id 作**缓存键**存这份 reasoning：自己签的 id 查得到就自动补上，外来 id
+查不到就裸奔给 deepseek，被拒并报
+
+```
+[invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API
+```
+
+这句与 `litellm/llms/deepseek/chat/transformation.py:87` 的 docstring 逐字一致。
+
+> **订正**：此前本文件与两份 findings 记的是"opencode 对 `tool_use.id` 做服务端注册表存在性
+> 校验"，**那个结论是错的**，据它推导出的方案（改写 id、伪造同形 id）全部无效。
+> tool id 不是安全校验对象，只是个缓存键 —— 决定性证据是**假 id + 手工补
+> `assistant.reasoning_content`（哪怕只是单空格）就 200**。
+> 另一处订正：早前记"末块必须是非空 text"不准确，text 块放在 `tool_result` 前面
+> （`tool_result` 仍是最后一块）同样 200，所以闸门并非严格看"最后一个块"。
+
+于是形成**单向棘轮**：Claude Code 每轮重发完整历史，qwen 签的 id 一旦进历史就永久留着。
+生产两天实测 qwen 只签发 6 次，而后续携带这些 id 的请求有 3435 次，比例 1:572。按会话看更直白，
+三个会话在首次 fallback 之后 100% 的请求都带着外来 id。**fallback 罕见，但影响永久且单向。**
+
+### 注入条件是两个的合取
+
+```
+最后一条消息以裸 tool_result 收尾
+  AND
+整个历史里存在外来 tool id
+```
+
+早前版本只判第一个条件、无条件注入，理由写的是"对合法 id 注入同样无害"。这个理由不成立：
+
+注入物**模型看得见、用户看不见**（注入在 litellm 侧、客户端发出之后）。原来注的是一个 `.`，
+模型于是把它当成用户发来的谜题并反问"你输入一个点是想表达什么"。铁证在 `SpendLogs.response`
+的 `reasoning_content` 里，是模型自己的原话：
+
+```
+"The user sent \".\" which is just a period. This likely means they're still watching"
+"The user has sent just a period. This is likely a nudge to continue."
+```
+
+命中率按请求算：`hoperun` 4.26%（12125 中 517）、`deepseek-v4-flash` 4.43%、
+`deepseek-v4-pro` 1.28%；挂 `kiro-session-affinity` 的几个组是 0–0.05%。分界干净落在
+"有没有挂这个注入"上。涉及 20+ 用户，一个会话几十上百请求，所以体感是"频繁"。
+
+而同期实测 **72.9% 的注入是白打**（`messages[-1].content[-1].type == 'tool_result'` 为分母，
+即注入的真实触发条件）：
+
+| model_group | 总请求 | 注入实际触发 | 其中含外来 id | 白注入 |
+|---|---|---|---|---|
+| hoperun | 15041 | 8732 | 2510 | 71.3% |
+| deepseek-v4-pro | 1216 | 313 | 32 | 89.8% |
+| deepseek-v4-flash | 731 | 335 | 0 | **100%** |
+| 合计 | 16988 | 9380 | 2542 | **72.9%** |
+
+加上第二个条件后，日常 deepseek 多轮（全 `call_` 前缀）一次都不注入。
+
+**不要因此整个删掉注入**：thinking 开关已修好并上生产（`thinking_switch.py`，commit
+`b1d45ff442`），思考现在能真开，也就是 400 能真回来。条件注入在两种状态下都安全：
+关态几乎不触发，开态自动接管，不用再改代码。
+
+**也不要把"思考是否开启"加进条件**。看着能更省，但思考的最终状态由 `thinking_switch`
+归一化后再叠加 newapi 那条规则决定，guardrail 侧看到的不是最终值，把两个 guardrail 的逻辑
+耦起来很脆。按外来 id 判就够，关态多注入几次无害。
+
+### 怎么判"外来"
+
+**allowlist 而非 blocklist**：只认 `call_` 前缀是自己的，其余一律视为外来。这样失败方向偏向
+多注入（无害）而不是漏注入（400）。同理，工具块的 id 缺失或不是字符串时也算外来。
+
+生产两天在请求侧实测到的 id 家族：
+
+| 家族 | 出现次数 | 不同 id 数 | 判定 |
+|---|---|---|---|
+| `call_`（deepseek 经 opencode 签发） | 2005338 | 18457 | 自己人 |
+| `toolu_`（qwen3.7-plus） | 481110 | 3359 | 外来 |
+| `tc_` | 20298 | 373 | 外来 |
+| `call-<uuid>`（**连字符**） | 10788 | 54 | 外来 |
+| `toolu_bdrk_`（kiro 的 claude） | 5322 | 511 | 外来 |
+| `chatcmpl-tool-` | 2482 | 15 | 外来 |
+| `<工具名>_xxx`（`Read_g33kfzc4vw7`） | 1532 | 8 | 外来 |
+
+`call-<uuid>` 是个陷阱：它与自己人只差一个字符，前缀判断写成"`call` 开头"就会把这一万次
+误判成自己人而漏注入。所以 `OWN_TOOL_ID_PREFIX` 必须精确匹配到下划线。
+
+**已接受的漏网**：`call_` 前缀的 id 若来自**另一个 opencode 账号**，同样不在该账号的
+reasoning 缓存里，但按前缀会被判成"自己的"而不注入，于是 400。会话亲和能压低概率，消不掉。
+漏网后果是回到修复前的 400，不产生新问题。
+
+### 必须扫全历史
+
+后端那条要求是两段式的：**触发**看最后一块是不是裸 `tool_result`（不是就根本不校验，历史
+多脏都无所谓）；**一旦触发就扫全历史**，任何一个外来 id 都 400。
+
+所以第二个条件不能只看末条。被污染会话里最后那个 `tool_result` 往往是 deepseek 自己签的
+干净 id，脏 id 躺在前面几十轮里，照样 400。`tool_use`（assistant 侧）与 `tool_result`
+（user 侧）两侧的 id 都要扫 —— 后端查缓存用的正是 assistant 侧的 id（实测 assistant 假 /
+tool_result 真 -> 400，反过来报的是另一个错）。
+
+代码里先判尾块再扫历史：尾块判定只看一条消息，历史扫描是全量，而生产上约半数请求不以裸
+`tool_result` 收尾，这些直接短路掉。
+
+### 注入内容
+
+`Continue.`，三条约束叠出来的：
+
+1. **非空白**。litellm 发给后端前会跑 `strip_empty_text_blocks_from_anthropic_messages`
+   （`llms/anthropic/common_utils.py`），用 `.strip()` 判空并摘掉纯空白 text 块 —— 摘完又变回
+   裸 `tool_result` 收尾，等于没修。空串、单空格、NBSP 实测均无效
+2. **对模型讲得通**。注入点恰是"工具刚返回、模型要决定下一步"这一刻，所以 `Continue.` 是真话；
+   而 `.` 是个谜题，模型只能猜，于是有了生产上那些反问
+3. **英文**。Claude Code 系统提示是英文，注入中文有诱发模型切换回复语言的风险
+
+**要记的代价**：如果那一刻正确行为是**停下**（任务已完成），`Continue.` 可能推着模型多做
+一步。`.` 没这个风险但有困惑风险。条件注入把频率降下来后这个代价可接受，但要观察。
+
+已排除的候选：不可见字符（ZWSP、WORD JOINER、BOM、HANGUL FILLER、SOFT HYPHEN）在 HTTP 层
+可行（活过两道关，假 id 400 -> 200），但**"模型看不见它"是未验证假设** —— 模型看 token 不看
+像素，很可能说"用户发了个空消息"。
+
+### 判定"最后一条消息"不是 `messages[-1]`
+
+有两类消息不参与后端校验，注入落在它们身上等于没注入。判定实现为 `_counts_as_tail` +
+`_last_effective_message_index`；这两类消息由 litellm 或下游转换器自己处理，本 guardrail
+不删不改。
+
+第一类：**会被摘空后整条删掉的消息**。这是空白 text 块那个坑的消息级版本，易只做一半 ——
+清理函数在 content 摘空后把**整条消息**从列表里删掉，不是留个空数组。所以末条消息整条只含
+空白块时，前一条裸 `tool_result` 会重新成为末条，只看 `messages[-1]` 会认为无需注入，
+litellm 丢掉末条后请求变回裸收尾，照样 400 且不报错。边界要与 litellm 逐字对齐：
+content **本来就是** `[]` 的消息不会被丢（走 `len` 相等那条分支），仍算末条。
+
+第二类：**尾部的 `role: system` 消息**。Anthropic 的 `messages` 只允许 `user` / `assistant`，
+`system` 是顶层字段；但 Claude Code 确实会在末尾发独立的 `role: system` 提醒消息
+（`The task tools haven't been used recently…`），litellm 原样透传，下游 anthropic -> openai
+转换器把它上提到开头，于是后端看到的收尾又变回它前面那条。**这是 08-01 生产 400 的直接根因**：
+生产 11 条失败请求里注入的文本一个都没出现，因为注入全打在了这条不参与校验的 system 消息上
+（它 content 是字符串，旧版判定直接提前 return）。判定只看 `role`，不看 content 形状。
+只跳过**尾部**的：中间那条 system 后面还有真正的 user 收尾，此时无需注入。
+
+**只处理 Anthropic 形状**。末条是 `role: "tool"` 的 OpenAI 形状留 no-op：那种形状只能另起一条
+user 消息，会造成连续两条 user，未实测过。生产走 `/v1/messages`，进 hook 时是 Anthropic 原生形状
+（转换发生在 hook 之后，见 `llms/anthropic/experimental_pass_through/adapters/`）。
+
+### 配置
+
+按文件挂载（不是挂目录），所以新增文件要改 compose 再 `docker compose up -d litellm` 重建容器：
+
+```yaml
+volumes:
+  - ./tool_result_trailing_text.py:/app/tool_result_trailing_text.py:ro
+```
+
+```yaml
+guardrails:
+  - guardrail_name: "tool-result-trailing-text"
+    litellm_params:
+      guardrail: tool_result_trailing_text.ToolResultTrailingTextGuardrail
+      mode: "pre_call"
+      default_on: false        # 必须 false，否则变成全局常开
+```
+
+然后给需要的 deployment 挂上（与 `vision-to-text` 并列，两者互不干扰）：
+
+```yaml
+      guardrails: ["vision-to-text", "tool-result-trailing-text"]
+```
+
+多个 guardrail 在同一请求里是**串行**执行的（`proxy/utils.py:1418` 那个循环，
+`data = result` 逐个接力），所以两个都改 `messages` 也不会互相覆盖。
+`asyncio.gather` 那条并发路径只对显式 `run_in_parallel: true` 的 guardrail 生效，
+而且并发分支会**丢弃**它们返回的改写（设计上只用于阻断）。
+
+### 实测验证
+
+直连 newapi（`.ops-runbook/scripts/toolid_verify.py`，每例重复 3 次，全部一致）：
+
+| 用例 | 结果 |
+|---|---|
+| 真 id + 裸 `tool_result` 收尾（正对照） | 200 |
+| 假 id + 裸 `tool_result` 收尾（故障复现） | **400** |
+| 假 id + 尾部 text 块（本修复） | **200** |
+| 真 id + 尾部 text 块（注入无害） | 200 |
+| 假 id + 尾部 text `""`（空串） | **400** |
+| 假 id + 补 `assistant.reasoning_content`（含单空格） | **200** ← 坐实"只是缓存键" |
+| 假 id + 另起一条 user 消息收尾 | 200 |
+
+Anthropic 入口（生产真实入口）：
+
+| 用例 | 结果 |
+|---|---|
+| 裸 `tool_result` + 末条 `role:system` | **400** ← 生产失败形状 |
+| `tool_result` + text 收尾 + 末条 `role:system` | **200** ← 本修复 |
+
+单元测试 62 项（`test_tool_result_trailing_text.py`）。变异测试 8/8 全杀：
+
+| 变异 | 被杀测试数 |
+|---|---|
+| 前缀去掉下划线（`call_` -> `call`） | 2 |
+| 删掉外来 id 条件（退回无条件注入） | 6 |
+| 注入内容退回 `.` | 1 |
+| 历史扫描只看末条 | 30 |
+| id 缺失算自己人 | 4 |
+| 只认 `tool_result` 侧的 id | 28 |
+| 尾部 system 不跳过 | 5 |
+| 不跳过空白 text 块 | 6 |
+
+测试里每个断言"不注入"的用例都显式让**另一个**条件成立（`_polluted()` 辅助函数），
+否则干净会话里无论尾块什么形状都不注入，那种用例删掉尾块判断也照样通过 —— 等于空断言。
+
+### 待验
+
+- **`Continue.` 的行为影响未实测**，特别是"任务已完成时被推着多做一步"这个代价
+- 不可见字符"模型看不见"这条无法用小样本证明。两版行为测试的 `dot` 对照组都是 0/5 提及，
+  与生产铁证矛盾，自检判定脚手架无效 —— 生产是 76k–500k token 长会话加 Claude Code 系统提示，
+  本地两百 token 复现不出。要验只能拿生产真实长会话 payload 回放
 
 ## kiro_session_affinity — 会话亲和 header
 
@@ -448,14 +587,16 @@ thinking.type ∈ {enabled, adaptive}  ->  一个字都不碰
 kwargs，其余键一概丢弃；而模型组 fallback 只走 router 内部、不重跑 proxy 级钩子，
 deployment 级是那条路上唯一的机会。与 `kiro_session_affinity` 同一个坑。
 
-### 与 vision_to_text 的关系
+### 与另外两个 guardrail 的关系
 
-两者都挂在 hoperun 上，互不干扰：识图动 `messages`，本 guardrail 只动 `thinking` /
-`output_config.effort`。
+三者都挂在 hoperun 上，互不干扰：识图动 `messages` 里的图片块，`tool_result_trailing_text`
+只在 `messages` 末尾追加，本 guardrail 只动 `thinking` / `output_config.effort`。
 
-但有个连带效应：`vision_to_text` 的尾部 text 块注入（那个 `.`）是为了绕开外来 tool id
-被拒，而那个 400 的真因是**思考模式要求回传 `reasoning_content`**。思考关掉后，关态那些
-请求的注入变成白打。**不要因此删掉注入** —— 开态仍然需要它。
+但与 `tool_result_trailing_text` 有个连带效应：那个注入是为了绕开外来 tool id 被拒，而
+那个 400 的真因是**思考模式要求回传 `reasoning_content`**。所以思考关着时注入是白打、
+开着时必需。**不要因此删掉注入**，也**不要把思考状态加进注入条件** —— 最终状态由本
+guardrail 归一化后再叠加 newapi 那条规则决定，那边看到的不是最终值，耦起来很脆。
+它按外来 id 判就够了。
 
 ### 实测验证
 

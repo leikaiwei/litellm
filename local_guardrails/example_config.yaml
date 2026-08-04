@@ -10,7 +10,7 @@ model_list:
       custom_llm_provider: custom_openai
       api_base: os.environ/TEXT_MODEL_API_BASE
       api_key: os.environ/TEXT_MODEL_API_KEY
-      guardrails: ["vision-to-text"]
+      guardrails: ["vision-to-text", "tool-result-trailing-text"]
 
   # 对照：同一后端不挂 guardrail，带图仍会失败
   - model_name: deepseek-no-guardrail
@@ -42,6 +42,14 @@ guardrails:
       default_on: false
       vision_model: vision-describer
       vision_timeout: 120
+
+  # 只在会话被 fallback 污染过（历史里有非 call_ 前缀的 tool id）且裸 tool_result 收尾时
+  # 才追加一个 text 块。干净的 deepseek 多轮一个字都不改
+  - guardrail_name: "tool-result-trailing-text"
+    litellm_params:
+      guardrail: tool_result_trailing_text.ToolResultTrailingTextGuardrail
+      mode: "pre_call"
+      default_on: false
 
 litellm_settings:
   drop_params: true
