@@ -33,7 +33,7 @@ id 查得到就自动补上，外来 id 查不到就裸奔给 deepseek，被拒�
           default_on: false                           # 必须 false，否则变成全局常开
 """
 
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Sequence, cast
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, cast
 
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.types.guardrails import GuardrailEventHooks
@@ -54,15 +54,21 @@ if TYPE_CHECKING:
 # 3. 必须是英文：Claude Code 系统提示是英文，注入中文有诱发模型切换回复语言的风险
 TOOL_RESULT_TRAILING_TEXT = "Continue."
 
-# deepseek（经 opencode）自己签发的 tool id 前缀。除此之外一律视为外来 —— allowlist 而非
-# blocklist，因为失败方向必须偏向多注入（无害）而不是漏注入（400）。
+# 注入是无条件的（只要闸门会触发就注入），不按 tool id 来源收窄。曾试过按签发前缀做
+# allowlist（只认 call_ 是"自己的"），已否决，原因是那个判断不可能做对：
 #
-# 必须精确匹配到下划线：生产上还有 call-<uuid> 这一族（连字符，两天 10788 次），与自己人
-# 只差一个字符，写成 "call" 开头就会把它误判成自己人而漏注入。
-OWN_TOOL_ID_PREFIX = "call_"
-
-# 工具块按 type 用不同的键存 id
-_TOOL_ID_KEYS = {"tool_use": "id", "tool_result": "tool_use_id"}
+# 前缀最多能证明"这个 id 由 deepseek 经 opencode 签发"，**证明不了"由同一个 opencode
+# 账号签发"**。reasoning 缓存可能是按账号隔离的，而 newapi 有约 10 个 opencode 渠道、
+# 各自一把 key，litellm 不知道这次请求被投给了哪一个 —— id 里也不编码账号。所以
+# "同前缀"不等于"查得到缓存"。
+#
+# 两个方向的代价完全不对称：漏注入 -> 400 -> 该会话此后每轮都打不进 deepseek，只能
+# fallback 到 qwen（单向棘轮，用户明确不接受）；多注入 -> 模型多看见一句 Continue.，
+# 有噪音、可恢复。所以宁可多注入。
+#
+# 另外，那个"跨账号漏洞"从未被观测到过 —— 原来就是无条件注入，闸门没机会触发，所以
+# 干净会话到底会不会 400 无数据。开启收窄等于拿会话赌一个未验证的假设。
+# 要验的话见 README 的"待验"一节，验明是全局缓存之后再谈收窄。
 
 
 def _survives_empty_text_stripping(block: object) -> bool:
@@ -125,69 +131,20 @@ def _last_effective_message_index(messages: Sequence[AllMessageValues]) -> Optio
     )
 
 
-def _is_foreign_tool_id(block: object) -> bool:
-    """
-    这个 content 块是否携带外来 tool id。非工具块一律 False。
-
-    assistant 的 tool_use 与 user 的 tool_result 都算，tool_use 侧尤其不能漏：后端查
-    reasoning 缓存用的是 assistant 侧的 id（实测 assistant 假 / tool_result 真 -> 400，
-    反过来报的是另一个错）。
-
-    id 缺失或不是字符串时算外来。allowlist 的规则是"每个工具块都要证明自己是 deepseek
-    签的"，证不了就按外来处理，失败方向偏向多注入（无害）而不是漏注入（400）。
-    """
-    if not isinstance(block, dict):
-        return False
-    block_type = block.get("type")
-    id_key = _TOOL_ID_KEYS.get(block_type) if isinstance(block_type, str) else None
-    if id_key is None:
-        return False
-    tool_id = block.get(id_key)
-    return not (isinstance(tool_id, str) and tool_id.startswith(OWN_TOOL_ID_PREFIX))
-
-
-def _content_blocks(messages: Sequence[AllMessageValues]) -> Iterator[object]:
-    """
-    产出所有消息的顶层 content 块。
-
-    只扫顶层：Anthropic 形状下工具块只出现在顶层，tool_result 自己的 content 里只有
-    text / image 块（图片确实会嵌在那里，那是 vision_to_text 处理的形状）。
-    """
-    for message in messages:
-        content = message.get("content")
-        if isinstance(content, list):
-            yield from content
-
-
-def _has_foreign_tool_id(messages: Sequence[AllMessageValues]) -> bool:
-    """
-    历史里是否存在非 deepseek 签发的 tool id。必须扫**全历史**，不能只看末条。
-
-    Claude Code 每轮重发完整历史，所以一次 fallback 签出的 id 会永久留在会话里
-    （单向棘轮：两天内 qwen 只签发 6 次，之后携带这些 id 的请求有 3435 次）。被污染会话
-    的末条 tool_result 往往是 deepseek 自己签的干净 id，脏 id 躺在前面几十轮里，照样 400。
-
-    生产上会被判成外来的族（两天实测）：toolu_（qwen 签的，48 万次）、tc_、call-<uuid>、
-    toolu_bdrk_（kiro 的 claude）、chatcmpl-tool-、裸 uuid、<工具名>_xxx。
-    """
-    return any(_is_foreign_tool_id(block) for block in _content_blocks(messages))
-
-
 def ensure_trailing_text_after_tool_result(messages: List[AllMessageValues]) -> List[AllMessageValues]:
     """
-    历史里带着外来 tool id、且最后一条消息以裸 tool_result 收尾时，在其 content 末尾追加一个
-    非空 text 块。
+    最后一条消息以裸 tool_result 收尾时，在其 content 末尾追加一个非空 text 块。
 
     改写 id 这条路走不通：问题不在 id 长什么样，而在它查不到 reasoning 缓存。但那条要求是
     两段式的 —— 只有请求最后一个 content 块是裸 tool_result 时才**触发**，一旦触发就扫全
     历史的 id。所以末尾追加一个非空 text 块，要求根本不启动，历史里有多少外来 id 都无所谓。
 
-    两个条件都要满足才注入。早前版本无条件注入（理由是"对合法 id 注入同样无害"），实测 72.9%
-    是白打，而注入物模型看得见、用户看不见，于是模型把它当成用户发来的消息并反问 —— 生产
-    20+ 用户命中。干净会话（日常 deepseek 多轮，全 call_ 前缀）现在一次都不注入。
+    无条件执行，不判 id 来源（原因见 TOOL_RESULT_TRAILING_TEXT 上方那段注释：前缀证明不了
+    同账号，而漏注入的代价是会话被永久钉在 fallback 上）。注入本身的代价靠文案化解 ——
+    Continue. 在"工具刚返回"这个位置是真话，模型不会像对 "." 那样反问。
 
-    不加"思考是否开启"这第三个条件：思考的最终状态由 thinking_switch 归一化后再叠加 newapi
-    的规则决定，guardrail 侧看到的不是最终值，把两个 guardrail 耦起来很脆。关态多注入几次无害。
+    也不加"思考是否开启"这个条件：思考的最终状态由 thinking_switch 归一化后再叠加 newapi
+    的规则决定，guardrail 侧看到的不是最终值，把两个 guardrail 耦起来很脆。关态多注入无害。
 
     OpenAI 形状（末条 role: "tool"）不处理：那种形状只能另起一条 user 消息，会造成连续两条
     user 消息，未实测过。生产走 /v1/messages，进本 hook 时是 Anthropic 形状。
@@ -203,11 +160,7 @@ def ensure_trailing_text_after_tool_result(messages: List[AllMessageValues]) -> 
         return messages
     last_message = messages[index]
     content = last_message.get("content")
-    # 先判尾块再扫历史：尾块判定只看一条消息，历史扫描是全量。生产上约半数请求不以裸
-    # tool_result 收尾，这些请求直接短路掉，不必为它们遍历几十轮历史
     if not isinstance(content, list) or not _ends_with_bare_tool_result(content):
-        return messages
-    if not _has_foreign_tool_id(messages):
         return messages
     trailing = {"type": "text", "text": TOOL_RESULT_TRAILING_TEXT}
     patched = cast(AllMessageValues, {**last_message, "content": [*content, trailing]})

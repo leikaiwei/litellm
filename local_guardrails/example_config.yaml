@@ -43,8 +43,8 @@ guardrails:
       vision_model: vision-describer
       vision_timeout: 120
 
-  # 只在会话被 fallback 污染过（历史里有非 call_ 前缀的 tool id）且裸 tool_result 收尾时
-  # 才追加一个 text 块。干净的 deepseek 多轮一个字都不改
+  # 裸 tool_result 收尾时追加一个 text 块。不判 tool id 来源：前缀证明不了同一个 opencode
+  # 账号，而漏注入会让会话被永久钉在 fallback 上（详见 README）
   - guardrail_name: "tool-result-trailing-text"
     litellm_params:
       guardrail: tool_result_trailing_text.ToolResultTrailingTextGuardrail
