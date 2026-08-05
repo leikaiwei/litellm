@@ -173,26 +173,52 @@ sha256 缓存描述文本，保证同图产出逐字节相同。
 
 ### 为什么需要
 
-deepseek 思考模式要求带 `tool_calls` 的 assistant 消息回传 `reasoning_content`。opencode
-用它签发的 tool id 作**缓存键**存这份 reasoning：自己签的 id 查得到就自动补上，外来 id
-查不到就裸奔给 deepseek，被拒并报
+deepseek 官方契约：带 `tool_calls` 的 assistant 消息**必须**回传 `reasoning_content`
+（assistant 的顶层字段），否则
 
 ```
 [invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API
 ```
 
-这句与 `litellm/llms/deepseek/chat/transformation.py:87` 的 docstring 逐字一致。
+`invalid_request_error` 属于 **deepseek 官方**而非中间网关，所以这是官方契约而非某层自创的校验。
+官方文档（api-docs.deepseek.com/guides/thinking_mode）：无 tool call 的多轮不需回传、传了也忽略；
+**发生过 tool call 的多轮必须回传**。
 
-> **订正**：此前本文件与两份 findings 记的是"opencode 对 `tool_use.id` 做服务端注册表存在性
-> 校验"，**那个结论是错的**，据它推导出的方案（改写 id、伪造同形 id）全部无效。
-> tool id 不是安全校验对象，只是个缓存键 —— 决定性证据是**假 id + 手工补
-> `assistant.reasoning_content`（哪怕只是单空格）就 200**。
-> 另一处订正：早前记"末块必须是非空 text"不准确，text 块放在 `tool_result` 前面
-> （`tool_result` 仍是最后一块）同样 200，所以闸门并非严格看"最后一个块"。
+> **根因订正（2026-08-05，第二次）**：真因是 **new-api 在 Anthropic->OpenAI 请求转换时
+> 静默丢弃了 assistant 的 thinking 块** —— `to_oai_chat_req.go` 的
+> `ClaudeMessagesRequestToOpenAIChat` 那个 switch 只有 text/image/tool_use/tool_result
+> 四个 case，没有 `case "thinking"`。响应方向做了 `thinking -> reasoning_content` 映射，
+> 请求方向没做，是个不对称 bug。
+>
+> **本文件此前两版根因都已作废**：`tool_use.id` 既不是"注册表校验对象"，也不是决定性的
+> "缓存键"。tool id 相关的现象（`_ET_` 前缀的 id 不报错）只是"走了 opencode 侧缓存兜底
+> 那条路"的外在表现，不是原因 —— 决定性反例是**自己签发的新鲜 id 同样 400**。
+>
+> 完整证据链（五轮真上游实验 + 三方源码）见
+> `.ops-runbook/findings/2026-08-05-根因确证-newapi丢弃thinking块.md`。
 
-于是形成**单向棘轮**：Claude Code 每轮重发完整历史，qwen 签的 id 一旦进历史就永久留着。
-生产两天实测 qwen 只签发 6 次，而后续携带这些 id 的请求有 3435 次，比例 1:572。按会话看更直白，
-三个会话在首次 fallback 之后 100% 的请求都带着外来 id。**fallback 罕见，但影响永久且单向。**
+生产抽样 2777 条带 tool_use 的 assistant 消息，分成三个群体：
+
+| 有 thinking 块 | id 带 `_ET_` | 数量 | 结果 |
+|---|---|---|---|
+| 是 | 否 | 2147（77%） | 客户端回传了 reasoning，被 new-api 丢弃 -> **400** |
+| 否 | 是 | 593（21%） | opencode 按 id 缓存 reasoning 兜底 -> 200 |
+| 否 | 否 | **37（1.3%）** | 两条路都没有 -> 400 |
+| 是 | 是 | **0** | 从不共存 |
+
+前两组**完全互斥**。**数据一直都在请求里（thinking 块出现 3007 次），只是路上被扔了。**
+
+### 本 guardrail 的定位：临时兜底，不是正解
+
+正解是让 new-api 补上那个 `case "thinking"`（纯透传客户端已有数据，可直接修好 77%）。
+本 guardrail 走的是另一条路：**让那条校验根本不触发**（末块不再是裸 `tool_result`），
+代价是往用户对话里塞了一句模型看得见的 `Continue.`。
+
+**new-api 修好并验证后，应当删掉本 guardrail。** 在那之前它是唯一的保护（实测 8/8 有效）。
+
+顺带记一个对兜底方案有用的实测：`reasoning_content` 的**内容完全不被校验** ——
+真实文本 / 单空格 / 空串都 200（官方文档对内容约束"未提及"，这里填补了那个空白）。
+所以群体 3 那 1.3% 也不必注入用户可见的文本，在 new-api 侧填个占位值即可。
 
 ### 注入条件：只判尾块，不判 tool id 来源
 
@@ -356,7 +382,7 @@ guardrails:
 | 假 id + 尾部 text 块（本修复） | **200** |
 | 真 id + 尾部 text 块（注入无害） | 200 |
 | 假 id + 尾部 text `""`（空串） | **400** |
-| 假 id + 补 `assistant.reasoning_content`（含单空格） | **200** ← 坐实"只是缓存键" |
+| 假 id + 补 `assistant.reasoning_content`（含单空格） | **200** ← 契约要的就是这个字段 |
 | 假 id + 另起一条 user 消息收尾 | 200 |
 
 Anthropic 入口（生产真实入口）：
