@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
+from litellm.proxy.types_utils.utils import get_instance_fn
 
 from local_guardrails.local_content_policy import (
     PUBLIC_REJECTION_MESSAGE,
@@ -349,6 +350,14 @@ def insult_matcher() -> LocalPolicyMatcher:
 @pytest.fixture(scope="module")
 def financial_matcher() -> LocalPolicyMatcher:
     return LocalPolicyMatcher.from_file(str(POLICY_DIR / "content_policy_02.yaml"))
+
+
+def test_litellm_dynamic_file_loader_can_import_guardrail() -> None:
+    guardrail_class = get_instance_fn(
+        "local_content_policy.LocalContentPolicyGuardrail",
+        config_file_path=str(POLICY_DIR / "example_config.yaml"),
+    )
+    assert guardrail_class.__name__ == "LocalContentPolicyGuardrail"
 
 
 @pytest.mark.parametrize("text", INSULT_BLOCK)

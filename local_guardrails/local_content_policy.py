@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import re
 import unicodedata
@@ -378,7 +376,7 @@ class LocalPolicyMatcher:
         )
 
     @classmethod
-    def from_file(cls, policy_file: str) -> LocalPolicyMatcher:
+    def from_file(cls, policy_file: str) -> "LocalPolicyMatcher":
         with Path(policy_file).open("r", encoding="utf-8") as handle:
             raw: object = yaml.safe_load(handle)
         return cls(PolicyConfig.model_validate(raw))
