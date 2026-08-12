@@ -508,21 +508,35 @@ async def test_current_user_multiblock_abuse_is_scanned() -> None:
         await guardrail.apply_guardrail(inputs, {}, "request")
 
 
+@pytest.mark.parametrize(
+    ("guardrail_name", "policy_name", "blocked_text"),
+    (
+        ("zh-abusive-language-filter", "content_policy_01.yaml", "我草你妈的"),
+        (
+            "zh-financial-trading-filter",
+            "content_policy_02.yaml",
+            "实盘自动交易机器人",
+        ),
+    ),
+)
 @pytest.mark.asyncio
-async def test_only_latest_text_block_is_scanned_after_a_rejection() -> None:
+async def test_only_latest_text_block_is_scanned_after_a_rejection(
+    guardrail_name: str,
+    policy_name: str,
+    blocked_text: str,
+) -> None:
     guardrail = LocalContentPolicyGuardrail(
-        guardrail_name="zh-abusive-language-filter",
+        guardrail_name=guardrail_name,
         event_hook="pre_call",
         default_on=True,
-        policy_file=str(POLICY_DIR / "content_policy_01.yaml"),
+        policy_file=str(POLICY_DIR / policy_name),
     )
     accumulated = {
         "structured_messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "你麻痹呀\n"},
-                    {"type": "text", "text": "我草你妈的\n"},
+                    {"type": "text", "text": f"{blocked_text}\n"},
                     {"type": "text", "text": "你好"},
                 ],
             }
@@ -536,7 +550,7 @@ async def test_only_latest_text_block_is_scanned_after_a_rejection() -> None:
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "你好\n"},
-                    {"type": "text", "text": "我草你妈的"},
+                    {"type": "text", "text": blocked_text},
                 ],
             }
         ]
@@ -545,22 +559,37 @@ async def test_only_latest_text_block_is_scanned_after_a_rejection() -> None:
         await guardrail.apply_guardrail(latest_abuse, {}, "request")
 
 
+@pytest.mark.parametrize(
+    ("guardrail_name", "policy_name", "blocked_text"),
+    (
+        ("zh-abusive-language-filter", "content_policy_01.yaml", "我草你妈的"),
+        (
+            "zh-financial-trading-filter",
+            "content_policy_02.yaml",
+            "实盘自动交易机器人",
+        ),
+    ),
+)
 @pytest.mark.asyncio
-async def test_raw_request_role_boundary_takes_precedence() -> None:
+async def test_raw_request_role_boundary_takes_precedence(
+    guardrail_name: str,
+    policy_name: str,
+    blocked_text: str,
+) -> None:
     guardrail = LocalContentPolicyGuardrail(
-        guardrail_name="zh-abusive-language-filter",
+        guardrail_name=guardrail_name,
         event_hook="pre_call",
         default_on=True,
-        policy_file=str(POLICY_DIR / "content_policy_01.yaml"),
+        policy_file=str(POLICY_DIR / policy_name),
     )
     translated_inputs = {
         "structured_messages": [
-            {"role": "user", "content": "我草你妈的"},
+            {"role": "user", "content": blocked_text},
         ]
     }
     raw_request = {
         "messages": [
-            {"role": "user", "content": "我草你妈的"},
+            {"role": "user", "content": blocked_text},
             {"role": "system", "content": "内部提示"},
         ]
     }
@@ -607,6 +636,49 @@ async def test_block_response_is_sanitized_and_internal_log_is_detailed() -> Non
         "matched_pattern": None,
         "severity": "high",
         "request_id": "req-sanitize",
+    }
+
+
+@pytest.mark.asyncio
+async def test_financial_block_response_is_sanitized_and_logged() -> None:
+    guardrail = LocalContentPolicyGuardrail(
+        guardrail_name="zh-financial-trading-filter",
+        event_hook="pre_call",
+        default_on=True,
+        policy_file=str(POLICY_DIR / "content_policy_02.yaml"),
+    )
+    with patch("local_guardrails.local_content_policy.verbose_proxy_logger.warning") as warning:
+        with pytest.raises(HTTPException) as exc_info:
+            await guardrail.apply_guardrail(
+                {"texts": ["实盘自动交易机器人"]},
+                {"litellm_call_id": "req-finance-sanitize"},
+                "request",
+            )
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == PUBLIC_REJECTION_MESSAGE
+    assert exc_info.value.type == "invalid_request_error"
+    public = json.dumps(exc_info.value.detail, ensure_ascii=False)
+    for forbidden in (
+        "zh-financial-trading-filter",
+        "financial",
+        "trading",
+        "自动交易",
+        "category",
+        "keyword",
+        "severity",
+        "pattern",
+        "rule_id",
+    ):
+        assert forbidden not in public
+    log_payload = json.loads(warning.call_args.args[1])
+    assert log_payload == {
+        "guardrail_internal_type": "zh_financial_trading",
+        "rule_id": "finance.always.explicit_execution",
+        "category": "automated_trading",
+        "matched_keyword": "实盘自动交易机器人",
+        "matched_pattern": None,
+        "severity": "high",
+        "request_id": "req-finance-sanitize",
     }
 
 
