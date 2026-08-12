@@ -469,19 +469,18 @@ async def test_user_text_blocks_are_scanned_without_crossing_turns() -> None:
     }
     assert await guardrail.apply_guardrail(split_inputs, {}, "request") is split_inputs
 
-    block_inputs = {
+    accumulated_inputs = {
         "structured_messages": [
             {
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": "M1_Scalper.mq5"},
-                    {"type": "text", "text": "请优化实盘"},
+                    {"type": "text", "text": "正常问题"},
                 ],
             }
         ]
     }
-    with pytest.raises(HTTPException):
-        await guardrail.apply_guardrail(block_inputs, {}, "request")
+    assert await guardrail.apply_guardrail(accumulated_inputs, {}, "request") is accumulated_inputs
 
 
 @pytest.mark.asyncio
@@ -507,6 +506,65 @@ async def test_current_user_multiblock_abuse_is_scanned() -> None:
     }
     with pytest.raises(HTTPException):
         await guardrail.apply_guardrail(inputs, {}, "request")
+
+
+@pytest.mark.asyncio
+async def test_only_latest_text_block_is_scanned_after_a_rejection() -> None:
+    guardrail = LocalContentPolicyGuardrail(
+        guardrail_name="zh-abusive-language-filter",
+        event_hook="pre_call",
+        default_on=True,
+        policy_file=str(POLICY_DIR / "content_policy_01.yaml"),
+    )
+    accumulated = {
+        "structured_messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "你麻痹呀\n"},
+                    {"type": "text", "text": "我草你妈的\n"},
+                    {"type": "text", "text": "你好"},
+                ],
+            }
+        ]
+    }
+    assert await guardrail.apply_guardrail(accumulated, {}, "request") is accumulated
+
+    latest_abuse = {
+        "structured_messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "你好\n"},
+                    {"type": "text", "text": "我草你妈的"},
+                ],
+            }
+        ]
+    }
+    with pytest.raises(HTTPException):
+        await guardrail.apply_guardrail(latest_abuse, {}, "request")
+
+
+@pytest.mark.asyncio
+async def test_raw_request_role_boundary_takes_precedence() -> None:
+    guardrail = LocalContentPolicyGuardrail(
+        guardrail_name="zh-abusive-language-filter",
+        event_hook="pre_call",
+        default_on=True,
+        policy_file=str(POLICY_DIR / "content_policy_01.yaml"),
+    )
+    translated_inputs = {
+        "structured_messages": [
+            {"role": "user", "content": "我草你妈的"},
+        ]
+    }
+    raw_request = {
+        "messages": [
+            {"role": "user", "content": "我草你妈的"},
+            {"role": "system", "content": "内部提示"},
+        ]
+    }
+    assert await guardrail.apply_guardrail(translated_inputs, raw_request, "request") is translated_inputs
 
 
 @pytest.mark.asyncio

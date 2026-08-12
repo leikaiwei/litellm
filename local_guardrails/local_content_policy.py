@@ -242,31 +242,48 @@ def _find_term_set_matches_by_clause(
     return {clause_index: tuple(matches) for clause_index, matches in grouped.items()}
 
 
-def _extract_text_parts(content: object) -> tuple[str, ...]:
+def _extract_latest_text(content: object) -> str | None:
     if isinstance(content, str):
-        return (content,) if content else ()
+        return content or None
     if not isinstance(content, list):
-        return ()
-    return tuple(
-        text
-        for part in content
-        if isinstance(part, dict)
-        and part.get("type") in _TEXT_PART_TYPES
-        and isinstance((text := part.get("text")), str)
+        return None
+    if not content:
+        return None
+    latest_part = content[-1]
+    if (
+        isinstance(latest_part, dict)
+        and latest_part.get("type") in _TEXT_PART_TYPES
+        and isinstance((text := latest_part.get("text")), str)
         and text
-    )
+    ):
+        return text
+    return None
 
 
-def _iter_user_text(inputs: GenericGuardrailAPIInputs) -> tuple[str, ...]:
-    structured_messages = inputs.get("structured_messages")
-    if isinstance(structured_messages, list):
-        if not structured_messages:
-            return ()
-        current_message = structured_messages[-1]
-        if not isinstance(current_message, dict) or str(current_message.get("role") or "").lower() != "user":
-            return ()
-        parts = _extract_text_parts(current_message.get("content"))
-        return ("\n".join(parts),) if parts else ()
+def _latest_user_text(messages: object) -> tuple[str, ...] | None:
+    if not isinstance(messages, list):
+        return None
+    if not messages:
+        return ()
+    current_message = messages[-1]
+    if not isinstance(current_message, dict) or str(current_message.get("role") or "").lower() != "user":
+        return ()
+    text = _extract_latest_text(current_message.get("content"))
+    return (text,) if text else ()
+
+
+def _iter_user_text(
+    inputs: GenericGuardrailAPIInputs,
+    request_data: Mapping[str, object] | None = None,
+) -> tuple[str, ...]:
+    # 优先使用未经过 LiteLLM 角色转换的原始消息，避免尾部 system/tool 被转换时丢失。
+    if request_data is not None:
+        raw_text = _latest_user_text(request_data.get("messages"))
+        if raw_text is not None:
+            return raw_text
+    structured_text = _latest_user_text(inputs.get("structured_messages"))
+    if structured_text is not None:
+        return structured_text
     texts = inputs.get("texts")
     if not isinstance(texts, list) or not texts:
         return ()
@@ -482,7 +499,7 @@ class LocalContentPolicyGuardrail(CustomGuardrail):
     ) -> GenericGuardrailAPIInputs:
         if input_type != "request":
             return inputs
-        for text in _iter_user_text(inputs):
+        for text in _iter_user_text(inputs, request_data):
             detection = self.matcher.detect(text)
             if detection is None:
                 continue

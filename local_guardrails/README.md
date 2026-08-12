@@ -28,12 +28,12 @@
 
 ### 判定边界
 
-- 每次只扫描 `structured_messages` 请求末尾 `role=user` 消息的全部文本块，忽略更早的用户
-  历史以及 system、assistant、tool 和 tool result；请求末尾不是 user 时不回看历史。没有
-  structured messages 的简单入口只检查 `texts` 最后一项。LiteLLM 不读取会话库，客户端重传的
-  历史不会被重复审核。
-- 当前消息内的多个文本块会合并判定，但不会跨轮组合。这样旧消息即使曾被误判，也不会让后续
-  正常对话持续失败，同时把每次检测开销固定在当前输入规模。
+- 每次优先查看原始请求末尾消息；只有它是 `role=user` 时，才扫描其中最后一个文本块。忽略更早
+  的用户历史以及 system、assistant、tool 和 tool result；请求末尾不是 user 时不回看历史。
+  没有原始 messages 的入口按同样边界读取 `structured_messages`，再退回 `texts` 最后一项。
+- Claude Code 在 HTTP 400 后可能把下一次输入继续追加到同一个 `user.content` 数组；因此不能把
+  数组内全部文本块合并检测，否则用户随后输入“你好”也会被前一块的旧辱骂反复拦截。只取最后
+  一个文本块既符合“只审核最新用户输入”，也把每次检测开销固定在本次新增文本规模。
 - 文本先做 Unicode NFKC、`casefold()`，并删除所有 Unicode `Cf` 格式字符；不全局删除空格
   或标点。
 - 中文词不使用 `\b`。ASCII 短码使用包含下划线的词边界，避免把 `nmsl_helper` 当成辱骂。
