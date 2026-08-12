@@ -179,6 +179,12 @@ FINANCIAL_BLOCK = (
     "MQL5实现分批平仓",
     "Fix M1TradeExecutor to place orders",
     "MetaTrader build a profitable strategy",
+    "C:\\work\\logs\\请优化 Alpha_Scalper.mq5，为什么胜率不高。单量也不高。也没有利润。",
+    "分析最新日志：/var/log/ea/ 请优化 Breakout_EA.mq5，为什么一直没有开单。",
+    "修改这个EA的策略顺序[Dashboard]_MT5.mq5，参考图片重新解析，第4次下注赢后继续执行。",
+    "Current state: working. User's most recent ask: 完善 RiskControl.mq4，新增时间开关和盈利亏损停止功能。",
+    "The coordinator sent a message: 有一个 Important 需要你修 MA_Cross_EA.mq5，强平后的 PositionClose 顺序不对。",
+    "把EA名字写在每个订单的备注上。",
 )
 
 FINANCIAL_ALLOW = (
@@ -318,6 +324,20 @@ FINANCIAL_ALLOW = (
     "Tell me where to buy stock images.",
     "Should I buy a Bitcoin book?",
     "Tell me where to buy Ethereum stickers.",
+    "请翻译“优化 Alpha_Scalper.mq5 的胜率和利润”",
+    "论坛标题：优化 Breakout_EA.mq5 为什么不开单",
+    "请修改 foo.mq5 文件扩展名，并在文档中解释利润字段",
+    "安全审计报告引用：需要你修 foo.mq5 的下单漏洞",
+    "不要优化 Alpha_Scalper.mq5 的胜率",
+    "无需修改 foo.mq5 的下单逻辑",
+    "测试规则能否拦截“优化 foo.mq5 提高胜率”",
+    "审计 foo.mq5，文档引用优化，指标定义胜率",
+    "新闻报道某团队优化 demo.mq5 胜率",
+    "把EA名字写在每个电商订单的备注上",
+    "把EA这个缩写写在每个订单备注中",
+    "请把EA名字写在订单备注，作为测试用例",
+    "修改EA App的订单备注功能",
+    "企业架构EA的订单备注字段怎么设计",
 )
 
 
@@ -503,6 +523,16 @@ def test_conditionals_respect_hard_sentence_boundaries(
 ) -> None:
     assert financial_matcher.detect(".mq5。请优化实盘") is None
     assert financial_matcher.detect(".mq5；请优化实盘") is not None
+
+
+def test_ea_three_anchor_rule_handles_long_current_message(
+    financial_matcher: LocalPolicyMatcher,
+) -> None:
+    wrapper = "Current state: working. Tool calls so far. " * 55
+    current = wrapper + "User's most recent ask: 请优化 Alpha_Scalper.mq5。胜率和利润都很低。"
+    detection = financial_matcher.detect(current)
+    assert detection is not None
+    assert detection.rule_id == "finance.regex.ea_file_trade_edit"
 
 
 def test_long_input_runtime_is_bounded(
