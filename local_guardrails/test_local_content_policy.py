@@ -62,6 +62,15 @@ INSULT_BLOCK = (
     "去死",
     "狗日的",
     "cao ni ma",
+    "草你妈的\n你麻痹",
+    "干死你",
+    "我日你妈",
+    "日你麻痹",
+    "草你妈的\n草你麻痹的",
+    "我在测试, 你个傻逼",
+    "我在测试, 你个傻逼 大傻逼 日你妈的比",
+    "我在测试, 你个傻逼 大傻逼 日你妈的比 狗日的 草你吗的",
+    "我在测试, 你个傻逼 大傻逼 日你妈的比 狗日的 草你妈的",
 )
 
 INSULT_ALLOW = (
@@ -118,6 +127,16 @@ INSULT_ALLOW = (
     "SB",
     "MMP",
     "CNM",
+    "请翻译：‘我日你妈’",
+    "测试字符串‘草你妈的’应当命中",
+    "客户投诉原文写着‘我日你妈’",
+    "医生说他脑子进水是民间误传",
+    "他是智障服务项目的负责人",
+    "她是智障人士的监护人",
+    "日你妈妈记得按时吃药",
+    "你麻痹大意了",
+    "“傻逼”",
+    "把‘傻逼’翻译成英文",
 )
 
 FINANCIAL_BLOCK = (
@@ -383,7 +402,7 @@ def test_financial_allow_cases(financial_matcher: LocalPolicyMatcher, text: str)
 @pytest.mark.asyncio
 async def test_only_current_user_message_is_scanned() -> None:
     guardrail = LocalContentPolicyGuardrail(
-        guardrail_name="content-policy-02",
+        guardrail_name="zh-financial-trading-filter",
         event_hook="pre_call",
         default_on=True,
         policy_file=str(POLICY_DIR / "content_policy_02.yaml"),
@@ -435,7 +454,7 @@ async def test_only_current_user_message_is_scanned() -> None:
 @pytest.mark.asyncio
 async def test_user_text_blocks_are_scanned_without_crossing_turns() -> None:
     guardrail = LocalContentPolicyGuardrail(
-        guardrail_name="content-policy-02",
+        guardrail_name="zh-financial-trading-filter",
         event_hook="pre_call",
         default_on=True,
         policy_file=str(POLICY_DIR / "content_policy_02.yaml"),
@@ -466,9 +485,34 @@ async def test_user_text_blocks_are_scanned_without_crossing_turns() -> None:
 
 
 @pytest.mark.asyncio
+async def test_current_user_multiblock_abuse_is_scanned() -> None:
+    guardrail = LocalContentPolicyGuardrail(
+        guardrail_name="zh-abusive-language-filter",
+        event_hook="pre_call",
+        default_on=True,
+        policy_file=str(POLICY_DIR / "content_policy_01.yaml"),
+    )
+    inputs = {
+        "structured_messages": [
+            {"role": "user", "content": "之前的正常问题"},
+            {"role": "assistant", "content": "正常回答"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "草你妈的"},
+                    {"type": "text", "text": "你麻痹"},
+                ],
+            },
+        ]
+    }
+    with pytest.raises(HTTPException):
+        await guardrail.apply_guardrail(inputs, {}, "request")
+
+
+@pytest.mark.asyncio
 async def test_block_response_is_sanitized_and_internal_log_is_detailed() -> None:
     guardrail = LocalContentPolicyGuardrail(
-        guardrail_name="content-policy-01",
+        guardrail_name="zh-abusive-language-filter",
         event_hook="pre_call",
         default_on=True,
         policy_file=str(POLICY_DIR / "content_policy_01.yaml"),
@@ -484,7 +528,17 @@ async def test_block_response_is_sanitized_and_internal_log_is_detailed() -> Non
     assert exc_info.value.detail == PUBLIC_REJECTION_MESSAGE
     assert exc_info.value.type == "invalid_request_error"
     public = json.dumps(exc_info.value.detail, ensure_ascii=False)
-    for forbidden in ("insult", "傻逼", "category", "keyword", "severity", "pattern", "rule_id"):
+    for forbidden in (
+        "zh-abusive-language-filter",
+        "zh-financial-trading-filter",
+        "insult",
+        "傻逼",
+        "category",
+        "keyword",
+        "severity",
+        "pattern",
+        "rule_id",
+    ):
         assert forbidden not in public
     log_payload = json.loads(warning.call_args.args[1])
     assert log_payload == {
@@ -503,6 +557,11 @@ async def test_block_response_is_sanitized_and_internal_log_is_detailed() -> Non
     (
         ("content_policy_01.yaml", "傻逼", "abuse.keyword.standalone"),
         ("content_policy_01.yaml", "傻X", "abuse.regex.shabi_variant"),
+        (
+            "content_policy_01.yaml",
+            "我在测试, 你个傻逼 大傻逼 日你妈的比",
+            "abuse.regex.explicit_attack_in_message",
+        ),
         ("content_policy_02.yaml", ".mq5；请优化实盘", "finance.conditional.ea_artifact_work"),
         ("content_policy_02.yaml", "请帮我分析K线预测明天涨还是跌", "finance.regex.chart_forecast_request"),
         ("content_policy_02.yaml", "实盘自动交易机器人", "finance.always.explicit_execution"),

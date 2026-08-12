@@ -16,10 +16,11 @@
 
 | LiteLLM 注册名 | 内部用途 | 默认状态 |
 |---|---|---|
-| `content-policy-01` | 中文辱骂与人身攻击 | 开启 |
-| `content-policy-02` | 可执行金融交易决策与自动交易开发 | 开启 |
+| `zh-abusive-language-filter` | 中文辱骂与人身攻击 | 开启 |
+| `zh-financial-trading-filter` | 可执行金融交易决策与自动交易开发 | 开启 |
 
-注册名刻意保持中性，业务含义只记录在内部文档。实现没有继承
+注册名直接表达管理员侧用途，便于配置、日志和运维识别；公开拦截响应仍由自定义异常统一脱敏，
+不会带出注册名。实现没有继承
 `ContentFilterGuardrail`：当前 LiteLLM 的原生实现会把 category、keyword、pattern、severity
 等字段放进 `HTTPException.detail`，代理层又会把 dict detail 原样带进下游响应；其中文 keyword
 还使用 `\b`、conditional 只按英文标点切句，无法可靠处理连续中文。独立实现只依赖稳定的
@@ -37,8 +38,9 @@
   或标点。
 - 中文词不使用 `\b`。ASCII 短码使用包含下划线的词边界，避免把 `nmsl_helper` 当成辱骂。
 - 简单绕写只允许最多 3 个白名单分隔符，不使用无界 `.*` 或无界 separator。
-- Precision 优先于 Recall。keyword 只对完整短句生效；辱骂 regex 必须是整句粗口、明确指向
-  人的攻击或明确代发命令，不做全 prompt 子串扫描。
+- Precision 优先于 Recall。keyword 只对完整短句生效；辱骂 regex 主要匹配整句粗口、明确指向
+  人的攻击或明确代发命令。另对不超过 2000 字的当前消息识别有限的高置信组合辱骂片段，
+  并对翻译、引用、测试语料、医学和残障等明确正常语境让行。
 - 金融规则只拦截完整短句的高置信执行短语、带明确请求语气的交易决策/开发 regex，以及同一条
   当前消息中同时出现强 `.mq4`、`.mq5`、`.mqh` 文件特征、明确修改指令和交易执行/业绩目标的
   三锚点请求。不会因为“金融对象 + 动作词”简单共现就拦截。
@@ -86,14 +88,14 @@ volumes:
 
 ```yaml
 guardrails:
-  - guardrail_name: "content-policy-01"
+  - guardrail_name: "zh-abusive-language-filter"
     litellm_params:
       guardrail: local_content_policy.LocalContentPolicyGuardrail
       mode: "pre_call"
       default_on: true
       policy_file: /app/content_policy_01.yaml
 
-  - guardrail_name: "content-policy-02"
+  - guardrail_name: "zh-financial-trading-filter"
     litellm_params:
       guardrail: local_content_policy.LocalContentPolicyGuardrail
       mode: "pre_call"

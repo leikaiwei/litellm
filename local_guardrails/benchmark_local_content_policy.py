@@ -109,8 +109,8 @@ def main() -> None:
 
     modes = (
         ("off", ()),
-        ("content-policy-01", (policy_01,)),
-        ("content-policy-02", (policy_02,)),
+        ("zh-abusive-language-filter", (policy_01,)),
+        ("zh-financial-trading-filter", (policy_02,)),
         ("both", (policy_01, policy_02)),
     )
     results = [
