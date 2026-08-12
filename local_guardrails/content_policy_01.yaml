@@ -1,0 +1,84 @@
+guardrail_internal_type: zh_abusive_language
+
+allow_patterns: []
+
+keyword_rules:
+  - rule_id: abuse.keyword.standalone
+    category: abusive_language
+    severity: high
+    separator_insensitive: true
+    keywords:
+      - 傻逼
+      - 傻比
+      - 傻批
+      - 沙比
+      - 煞笔
+      - 脑残
+      - 智障
+      - 弱智
+      - 白痴
+      - 王八蛋
+      - 狗东西
+      - 狗杂种
+      - 狗娘养的
+      - 畜生
+      - 废物
+      - 杂种
+      - 贱人
+      - 贱货
+      - 蠢货
+      - 蠢猪
+      - 垃圾玩意
+      - 吃屎
+      - 草泥马
+      - 操你妈
+      - 狗日的
+      - 妈卖批
+      - 有娘生没娘养
+      - 死全家
+      - 全家死光
+      - 断子绝孙
+      - nmsl
+      - wcnm
+      - shabi
+
+regex_rules:
+  - rule_id: abuse.regex.shabi_variant
+    category: abusive_language
+    severity: high
+    pattern: '^傻[\s*._\-·•~～/]{0,3}(?:x|b)(?:[了啊吧呢呀吗嘛哦呗]*[!！?？。.,，~～]*)$'
+  - rule_id: abuse.regex.profanity_variant
+    category: abusive_language
+    severity: high
+    pattern: '^(?:操|艹|草)[\s*._\-·•~～/]{0,3}(?:你|尼)[\s*._\-·•~～/]{0,3}妈(?:的)?(?:[了啊吧呢呀吗嘛哦呗]*[!！?？。.,，~～]*)$'
+  - rule_id: abuse.regex.romanized_profanity
+    category: abusive_language
+    severity: high
+    pattern: '^(?:w[\s*._\-]{0,2})?c[\s*._\-]{0,2}a[\s*._\-]{0,2}o[\s*._\-]{0,3}n[\s*._\-]{0,2}i[\s*._\-]{0,3}m[\s*._\-]{0,2}a(?:[!！?？。.,，~～]*)$'
+  - rule_id: abuse.regex.directed_attack
+    category: personal_attack
+    severity: high
+    pattern: '^(?:你|你们|他|她|他们|她们|这人|那人|这个人|那个人|这个家伙|那个家伙|这家伙|那家伙|客服|这个客服|作者|开发者|老板|同事)[\s，,；;]*(?:(?:他妈的?|真他妈|就是(?:个|一个)?|简直(?:就是|是)?(?:个)?|真是(?:个)?|真的是(?:个)?|完全是(?:个)?|可真是(?:个)?|都是|是(?:个|一个)?|这个|是不是|真|真的|太|真的太|怎么这么|怎么那么|个|一群)[\s，,；;]*){0,2}(?:傻[\s*._\-·•~～/]{0,3}(?:逼|比|批|笔|x|b)|王八蛋|狗东西|狗杂种|狗娘养的|废物|垃圾|垃圾玩意|有病|无能|恶心|可笑|脑残|智障|弱智|白痴|畜生|杂种|蠢货|蠢猪|猪脑子|窝囊废|臭不要脸|不要脸|脑子进水|脑子有坑|脑袋进水|没脑子|笨蛋|二货|废柴|蠢)(?:的东西)?(?:[了啊吧呢呀吗嘛哦呗]*[!！?？。.,，~～]*)(?:(?:滚|滚开|滚蛋)[!！?？。.,，~～]*)?$'
+  - rule_id: abuse.regex.intensified_attack
+    category: personal_attack
+    severity: high
+    pattern: '^(?:(?:真他妈|他妈的?|真是(?:个)?|简直(?:是|就是)?(?:个)?|就是(?:个)?|一个|个)[\s，,]*)+(?:傻[\s*._\-·•~～/]{0,3}(?:逼|比|批|笔|x|b)|王八蛋|狗东西|废物|垃圾玩意|有病|无能|恶心|脑残|智障|弱智|白痴|畜生|杂种|蠢货|蠢猪|猪脑子|窝囊废|不要脸|脑子进水|没脑子|笨蛋|二货|废柴|蠢)(?:[了啊吧呢呀吗嘛哦呗]*[!！?？。.,，~～]*)$'
+  - rule_id: abuse.regex.hostile_command
+    category: personal_attack
+    severity: high
+    pattern: '^(?:(?:你|你们|你们都|他们|他们都|她们|她们都|都|全都|给我|都给我|给老子)[\s，,]*(?:他妈的?)?[\s，,]*)?(?:滚|滚出去|滚开|滚蛋|闭嘴|吃屎去吧|去死|去死吧|滚远点|滚远一点)(?:吧|去|啊|呀|你|了|哦|[!！?？。.,，~～])*$|^你怎么不去死(?:[!！?？。.,，~～]*)$'
+  - rule_id: abuse.regex.parent_profanity
+    category: abusive_language
+    severity: high
+    pattern: '^(?:去|滚)[\s*._\-·•~～/]{0,3}你[\s*._\-·•~～/]{0,3}妈(?:的|逼)?(?:[了啊吧呢呀吗嘛哦呗]*[!！?？。.,，~～]*)$'
+  - rule_id: abuse.regex.directed_contempt
+    category: personal_attack
+    severity: high
+    pattern: '^(?:你|你们|他|她|他们|她们|这家伙|那家伙|客服|作者|开发者)[\s，,]*(?:(?:真是|简直|就是|居然)[\s，,]*)?(?:算(?:个)?什么东西|连猪都不如|像猪一样|蠢得像猪|欠揍|活该去死|全家不得好死|脑子被驴踢了)(?:[了啊吧呢呀吗嘛哦呗]*[!！?？。.,，~～]*)$'
+  - rule_id: abuse.regex.delivery_command
+    category: personal_attack
+    severity: high
+    pattern: '^(?:(?:不要解释[，,\s]*)?(?:直接|请直接|替我|帮我)?(?:回复|发送|转告|告诉)(?:给)?(?:他|她|对方|客户)[：:\s]*[“"''‘「『]?(?:滚|滚蛋|去死|傻[逼比批]|你是傻[逼比批]|操你妈|狗东西|王八蛋)[”"''’」』]?|(?:请)?(?:把|将)[“"''‘「『](?:滚|滚蛋|去死|傻[逼比批]|你是傻[逼比批]|操你妈|狗东西|王八蛋)[”"''’」』](?:原样)?(?:发|发送|回复|转告|告诉)(?:给)?(?:他|她|对方|客户))(?:[。！？!?])?$'
+
+term_sets: {}
+conditional_rules: []

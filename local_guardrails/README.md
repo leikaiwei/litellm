@@ -10,6 +10,113 @@
 .venv/bin/python -m pytest local_guardrails/ -q
 ```
 
+## local_content_policy — 中文内容策略
+
+这两个 guardrail 都是纯本地 `pre_call` 检测，不调用 LLM 或外部 API：
+
+| LiteLLM 注册名 | 内部用途 | 默认状态 |
+|---|---|---|
+| `content-policy-01` | 中文辱骂与人身攻击 | 开启 |
+| `content-policy-02` | 可执行金融交易决策与自动交易开发 | 开启 |
+
+注册名刻意保持中性，业务含义只记录在内部文档。实现没有继承
+`ContentFilterGuardrail`：当前 LiteLLM 的原生实现会把 category、keyword、pattern、severity
+等字段放进 `HTTPException.detail`，代理层又会把 dict detail 原样带进下游响应；其中文 keyword
+还使用 `\b`、conditional 只按英文标点切句，无法可靠处理连续中文。独立实现只依赖稳定的
+`CustomGuardrail.apply_guardrail` 接口，升级风险更低，也不需要修改 LiteLLM 核心源码。
+
+### 判定边界
+
+- 每次只扫描 `structured_messages` 请求末尾 `role=user` 消息的全部文本块，忽略更早的用户
+  历史以及 system、assistant、tool 和 tool result；请求末尾不是 user 时不回看历史。没有
+  structured messages 的简单入口只检查 `texts` 最后一项。LiteLLM 不读取会话库，客户端重传的
+  历史不会被重复审核。
+- 当前消息内的多个文本块会合并判定，但不会跨轮组合。这样旧消息即使曾被误判，也不会让后续
+  正常对话持续失败，同时把每次检测开销固定在当前输入规模。
+- 文本先做 Unicode NFKC、`casefold()`，并删除所有 Unicode `Cf` 格式字符；不全局删除空格
+  或标点。
+- 中文词不使用 `\b`。ASCII 短码使用包含下划线的词边界，避免把 `nmsl_helper` 当成辱骂。
+- 简单绕写只允许最多 3 个白名单分隔符，不使用无界 `.*` 或无界 separator。
+- Precision 优先于 Recall。keyword 只对完整短句生效；辱骂 regex 必须是整句粗口、明确指向
+  人的攻击或明确代发命令，不做全 prompt 子串扫描。
+- 金融规则只拦截完整短句的高置信执行短语、带明确请求语气的交易决策/开发 regex，以及
+  `.mq4`、`.mq5` 等文件特征与明确修改目标的有限距离组合。不会因为“金融对象 + 动作词”简单
+  共现就拦截。
+- `EA`、订单、日志、回测、突破、自动下单等歧义词不会单独触发；教育解释、财报摘要、
+  新闻论文、反诈否定、接口文档、Electronic Arts、电商订单、基金会和黄金首饰等边界有
+  明确回归样本。刻意拆成多轮或措辞含糊的请求可能漏过，这是为了避免影响日常交流而接受的取舍。
+
+辱骂词候选参考了
+[`houbb/sensitive-word-data`](https://github.com/houbb/sensitive-word-data) 固定提交
+`fe6fc2921836217b8c90619db81b24af8b22d80f`。没有导入全量词典，也没有按上游 tags 自动抽取：
+上游没有“辱骂”标签，标签不能表达本策略语义。当前完整短句词表中有 21 个上游 exact-match
+候选，另有 3 个上游候选只在带方向的 anchored regex 中使用；其余缩写、变体与上下文规则为
+本地人工补充。这只是经修改的词汇子集，没有复用上游 DFA，也不引用上游性能数字。第三方归属
+与 Apache-2.0 许可见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+
+### 错误与审计日志
+
+命中后抛出新的 HTTP 400，公开 detail 永远只有：
+
+```text
+Request rejected by content policy.
+```
+
+异常不携带 category、keyword、matched phrase、regex、severity、description、文件名、内部
+rule ID 或具体检测逻辑。代理现有 OpenAI-compatible 错误封装保持不变，不伪装 HTTP 200，
+也不返回 assistant 自然语言回复。
+
+管理员日志保留单行 JSON：`guardrail_internal_type`、`rule_id`、`category`、
+`matched_keyword`、`matched_pattern`、`severity`、`request_id`。regex 日志记录稳定规则名，
+`matched_keyword` 留空；keyword 和 conditional 只记录规范化命中词，不复制完整 prompt 或原始
+regex 源码。
+
+### 生产配置
+
+把三个运行文件只读挂载到容器：
+
+```yaml
+volumes:
+  - ./local_content_policy.py:/app/local_content_policy.py:ro
+  - ./content_policy_01.yaml:/app/content_policy_01.yaml:ro
+  - ./content_policy_02.yaml:/app/content_policy_02.yaml:ro
+```
+
+然后注册两个全局 guardrail：
+
+```yaml
+guardrails:
+  - guardrail_name: "content-policy-01"
+    litellm_params:
+      guardrail: local_content_policy.LocalContentPolicyGuardrail
+      mode: "pre_call"
+      default_on: true
+      policy_file: /app/content_policy_01.yaml
+
+  - guardrail_name: "content-policy-02"
+    litellm_params:
+      guardrail: local_content_policy.LocalContentPolicyGuardrail
+      mode: "pre_call"
+      default_on: true
+      policy_file: /app/content_policy_02.yaml
+```
+
+两项互相独立。临时停用某一项时，只把对应项的 `default_on` 改为 `false` 并重建 LiteLLM
+容器；恢复时改回 `true`。管理员为 key/team 配置的 `disable_global_guardrails` 或
+`opted_out_global_guardrails` 仍会按 LiteLLM 原有语义生效。
+
+### 验证与性能
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest local_guardrails/test_local_content_policy.py -q
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python local_guardrails/benchmark_local_content_policy.py
+```
+
+测试覆盖 BLOCK/ALLOW、keyword/regex/conditional/always-block、Unicode 绕写、有限 gap、当前
+用户消息选择、角色过滤、公开错误脱敏、内部日志和长输入。benchmark 分别输出关闭、只开 01、
+只开 02、同时开启时的短/长输入 P50/P95/P99、顺序吞吐、并发吞吐和进程 CPU。它是 matcher
+微基准，不包含网络、模型推理或完整代理开销。
+
 ## vision_to_text — 图片转文本
 
 让只支持文本的模型（deepseek）能处理带截图的请求：在请求发给后端之前，把 messages 里的

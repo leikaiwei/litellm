@@ -51,6 +51,21 @@ guardrails:
       mode: "pre_call"
       default_on: false
 
+  # 两个中性名称分别对应中文辱骂与金融交易策略，详细边界见 README
+  - guardrail_name: "content-policy-01"
+    litellm_params:
+      guardrail: local_content_policy.LocalContentPolicyGuardrail
+      mode: "pre_call"
+      default_on: true
+      policy_file: /app/content_policy_01.yaml
+
+  - guardrail_name: "content-policy-02"
+    litellm_params:
+      guardrail: local_content_policy.LocalContentPolicyGuardrail
+      mode: "pre_call"
+      default_on: true
+      policy_file: /app/content_policy_02.yaml
+
 litellm_settings:
   drop_params: true
 
