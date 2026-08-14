@@ -6,6 +6,7 @@ vision_to_text guardrail 的回归测试。
 测试与被测文件同目录，不放 tests/test_litellm/，避免在 upstream 跟踪的路径下留改动。
 """
 
+import asyncio
 import os
 import sys
 from typing import Any, Dict, List, Optional
@@ -403,7 +404,11 @@ async def test_different_images_get_their_own_descriptions():
 
 
 @pytest.mark.asyncio
-async def test_max_images_leaves_excess_untouched():
+async def test_max_images_describes_the_most_recent_not_the_oldest():
+    """
+    用户当轮刚贴的截图排在最后。取最早 N 张会把它漏掉，等于识图对当前提问无效。
+    2026-08-14 生产事故前的实现取的正是最早 N 张。
+    """
     router = _router("described")
 
     result = await _run(
@@ -412,9 +417,54 @@ async def test_max_images_leaves_excess_untouched():
     )
 
     assert router.acompletion.call_count == 1
+    assert router.acompletion.call_args.kwargs["messages"][0]["content"][1]["image_url"]["url"] == (
+        "data:image/png;base64,ZZZ"
+    )
     assert result is not None
-    assert result["messages"][0]["content"][0]["type"] == "text"
-    assert result["messages"][0]["content"][1] == OTHER_IMAGE
+    assert result["messages"][0]["content"][1] == {"type": "text", "text": "[Image description: described]"}
+
+
+@pytest.mark.asyncio
+async def test_images_over_max_become_placeholders_not_raw_images():
+    """
+    超限的历史图片必须换成占位文本。原样留下就等于把真图透传给纯文本后端，
+    那正是这个 guardrail 要消灭的 400。
+    """
+    result = await _run(
+        _make_guardrail(router=_router("described"), max_images=1),
+        [{"role": "user", "content": [OPENAI_IMAGE, OTHER_IMAGE]}],
+    )
+
+    assert result is not None
+    omitted = result["messages"][0]["content"][0]
+    assert omitted["type"] == "text"
+    assert "Image omitted" in omitted["text"]
+    assert extract_image_references(result["messages"]) == ()
+
+
+@pytest.mark.asyncio
+async def test_max_images_has_a_default_so_long_sessions_cannot_scale_without_bound():
+    """
+    生产事故的放大源：不限张数时，长会话每轮把全部历史截图重识别一遍，
+    识图量随会话轮数线性涨。默认值是唯一挡住这条路的东西。
+    """
+    guardrail = _make_guardrail(router=_router("described"))
+
+    assert guardrail.max_images is not None and guardrail.max_images <= 8
+
+
+@pytest.mark.asyncio
+async def test_max_images_none_still_describes_everything_when_explicitly_opted_in():
+    router = _router(*[f"d{i}" for i in range(6)])
+
+    result = await _run(
+        _make_guardrail(router=router, max_images=None),
+        [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"u{i}"}} for i in range(6)]}],
+    )
+
+    assert router.acompletion.call_count == 6
+    assert result is not None
+    assert extract_image_references(result["messages"]) == ()
 
 
 @pytest.mark.asyncio
@@ -478,6 +528,176 @@ async def test_custom_prompt_and_template_are_used():
     assert result is not None
     assert result["messages"][0]["content"][0]["text"] == "<img>described</img>"
     assert router.acompletion.call_args.kwargs["messages"][0]["content"][0]["text"] == "transcribe only"
+
+
+# ---------------------------------------------------------------------------
+# 调用放大防护
+#
+# 2026-08-14 生产事故：视觉模型在数小时内被调用 5.5 万次，峰值 618 RPM。
+# 下面每个测试对应一条独立的放大路径，都能在事故版代码上失败。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cache_survives_more_images_than_the_proxy_cache_can_hold():
+    """
+    事故根因之一：识图缓存曾复用 proxy 传进来的 DualCache，那是 user_api_key_cache，
+    内存层硬上限 200 条。累积图片数一旦超过 200，命中率不是下降而是直接归零 ——
+    每张图每轮都重新识别一次。
+
+    这里用 250 张图跑两轮：第二轮必须一次识图都不发。
+    """
+    count = 250
+    router = AsyncMock()
+    router.acompletion.side_effect = [_vision_response(f"d{i}") for i in range(count)]
+    guardrail = _make_guardrail(router=router, max_images=None)
+    messages = [
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"u{i}"}} for i in range(count)]}
+    ]
+
+    await _run(guardrail, messages, cache=DualCache())
+    calls_after_first_turn = router.acompletion.call_count
+    second = await _run(guardrail, messages, cache=DualCache())
+
+    assert calls_after_first_turn == count
+    assert router.acompletion.call_count == count, "第二轮应全部命中缓存，一次识图都不该发"
+    assert second is not None
+
+
+@pytest.mark.asyncio
+async def test_vision_cache_does_not_evict_the_proxy_auth_cache():
+    """
+    识图键 TTL 3600 远长于认证键的 60，而 InMemoryCache 按到期时间驱逐。
+    共用一个 cache 时，识图流量会把 key/team/user 认证条目挤干，
+    迫使每个请求回 DB 查鉴权。识图必须完全不碰传入的 cache。
+    """
+    shared = DualCache()
+    for i in range(50):
+        await shared.async_set_cache(key=f"auth_key_{i}", value={"user": i}, ttl=60)
+
+    router = AsyncMock()
+    router.acompletion.side_effect = [_vision_response(f"d{i}") for i in range(400)]
+    await _run(
+        _make_guardrail(router=router, max_images=None),
+        [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"u{i}"}} for i in range(400)]}],
+        cache=shared,
+    )
+
+    survivors = [i for i in range(50) if await shared.async_get_cache(key=f"auth_key_{i}") is not None]
+    assert len(survivors) == 50, f"识图流量驱逐了 {50 - len(survivors)} 个认证缓存条目"
+
+
+@pytest.mark.asyncio
+async def test_same_image_arriving_concurrently_is_described_once():
+    """
+    缓存只在第一次返回后才写入。在那之前，同一张图的 N 个并发请求全是 miss，
+    于是发 N 次识图调用。长会话逐轮重发同批图片时这个倍数直接乘进放大链条。
+    """
+    calls = 0
+
+    async def slow_vision(**_kwargs):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.05)
+        return _vision_response("described")
+
+    router = AsyncMock()
+    router.acompletion = slow_vision
+    guardrail = _make_guardrail(router=router)
+    messages = [{"role": "user", "content": [OPENAI_IMAGE]}]
+
+    results = await asyncio.gather(*(_run(guardrail, messages, cache=DualCache()) for _ in range(10)))
+
+    assert calls == 1, f"同一张图的 10 个并发请求发了 {calls} 次识图调用"
+    assert all(r is not None for r in results)
+    assert {r["messages"][0]["content"][0]["text"] for r in results} == {"[Image description: described]"}
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_on_the_leading_request_does_not_fail_the_waiters():
+    """
+    in-flight 去重让多个请求共享一次识图调用。领头那个请求的客户端断连（CancelledError）
+    绝不能顺着共享 future 传给其他请求 —— 它们各自的连接还活着，应该 fail-open。
+    """
+
+    async def slow_vision(**_kwargs):
+        await asyncio.sleep(5)
+        raise AssertionError("unreachable")
+
+    router = AsyncMock()
+    router.acompletion = slow_vision
+    guardrail = _make_guardrail(router=router)
+    messages = [{"role": "user", "content": [OPENAI_IMAGE]}]
+
+    leading = asyncio.create_task(_run(guardrail, messages, cache=DualCache()))
+    await asyncio.sleep(0.02)
+    waiter = asyncio.create_task(_run(guardrail, messages, cache=DualCache()))
+    await asyncio.sleep(0.02)
+    leading.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await leading
+    result = await asyncio.wait_for(waiter, timeout=2)
+
+    assert result is not None
+    assert result["messages"][0]["content"][0]["text"].startswith("[Image could not")
+    assert guardrail._in_flight == {}, "in-flight 条目泄漏会让这张图永久命中一个已死的 future"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_vision_calls_are_capped():
+    """
+    asyncio.gather 不限并发：一次请求 N 张图就是 N 个同时在飞的识图调用，
+    会瞬间打穿视觉模型的 RPM 配额并触发限流雪崩。
+    """
+    in_flight = 0
+    peak = 0
+
+    async def counting_vision(**_kwargs):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.02)
+        in_flight -= 1
+        return _vision_response("described")
+
+    router = AsyncMock()
+    router.acompletion = counting_vision
+    images = [{"type": "image_url", "image_url": {"url": f"u{i}"}} for i in range(40)]
+
+    await _run(
+        _make_guardrail(router=router, max_images=None),
+        [{"role": "user", "content": images}],
+    )
+
+    assert peak <= 8, f"峰值并发识图 {peak} 个，未受限流保护"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_vision_model_is_not_retried_for_every_image_every_turn():
+    """
+    视觉模型被打限流后，失败结果不入缓存，于是每轮都对全部图片重试一遍 ——
+    限流越严重、重试越多，形成正反馈。in-flight 去重至少要把同一轮内
+    同一张图的重复尝试压掉。
+    """
+    calls = 0
+
+    async def failing_vision(**_kwargs):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        raise RuntimeError("rate limited")
+
+    router = AsyncMock()
+    router.acompletion = failing_vision
+    guardrail = _make_guardrail(router=router)
+    messages = [{"role": "user", "content": [OPENAI_IMAGE]}]
+
+    results = await asyncio.gather(*(_run(guardrail, messages, cache=DualCache()) for _ in range(10)))
+
+    assert calls == 1, f"同一张图的 10 个并发请求在失败路径上发了 {calls} 次识图调用"
+    assert all(r is not None for r in results)
+    assert all(r["messages"][0]["content"][0]["text"].startswith("[Image could not") for r in results)
 
 
 # ---------------------------------------------------------------------------

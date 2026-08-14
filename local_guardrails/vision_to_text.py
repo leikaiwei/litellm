@@ -31,6 +31,11 @@ docker compose 重建容器，不是设计判断。
           mode: "pre_call"
           default_on: false                  # 必须 false，否则变成全局常开
           vision_model: vision-describer
+          max_images: 4                      # 只识别最近 N 张，默认 4
+
+调用放大防护（2026-08-14 生产事故后加固，视觉模型曾被打到 618 RPM）：只识别最近
+max_images 张图、自带独立缓存、同图并发去重、并发上限。四条机制的来由见
+README.md 的"调用放大防护"一节，改动前务必先读 —— 其中两条反直觉。
 """
 
 import asyncio
@@ -40,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Mapping, Optional, 
 
 import litellm
 from litellm._logging import verbose_proxy_logger
+from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.llms.openai import AllMessageValues
@@ -57,10 +63,22 @@ DEFAULT_VISION_PROMPT = (
 )
 DEFAULT_DESCRIPTION_TEMPLATE = "[Image description: {description}]"
 DEFAULT_FAILURE_TEMPLATE = "[Image could not be processed: {error}]"
+DEFAULT_HISTORY_TEMPLATE = "[Image omitted: only the most recent {max_images} image(s) are described]"
 DEFAULT_CACHE_TTL_SECONDS = 3600
 # 视觉模型常指向负载均衡组，组内成员可能限流或临时不可用。组内重试能换到别的成员，
 # 所以默认给 2 次；跨组 fallback 另行禁掉（见 _call_vision_model）
 DEFAULT_VISION_NUM_RETRIES = 2
+# 每请求最多识别几张图。必须有默认值：Claude Code 的长会话会把历史截图一路带下去，
+# 不限张数时单次请求的识图量随会话轮数线性涨，生产已因此把视觉模型打到 618 RPM
+DEFAULT_MAX_IMAGES = 4
+# 同时在飞的识图调用上限。asyncio.gather 不限并发，一次请求 N 张图就是 N 个并发请求，
+# 会瞬间打穿视觉模型的 RPM 配额并触发限流雪崩
+DEFAULT_MAX_CONCURRENCY = 4
+# 识图缓存独占的容量。不能共用 proxy 传进来的 DualCache：那个 cache 是 user_api_key_cache，
+# 内存层硬上限 200 条且与 key/team/user 认证条目混住。识图键 TTL 3600 远长于认证键的 60，
+# evict_cache 按到期时间驱逐，于是识图键既会挤掉认证条目、又会在图片数超 200 时
+# 自我抖动到 0% 命中（两者均已用可执行脚本复现）
+DEFAULT_CACHE_MAX_ENTRIES = 2048
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,10 +222,13 @@ class VisionToTextGuardrail(CustomGuardrail):
         vision_prompt: Optional[str] = None,
         description_template: Optional[str] = None,
         failure_template: Optional[str] = None,
-        max_images: Optional[int] = None,
+        history_template: Optional[str] = None,
+        max_images: Optional[int] = DEFAULT_MAX_IMAGES,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
         vision_timeout: Optional[float] = None,
         vision_num_retries: int = DEFAULT_VISION_NUM_RETRIES,
         cache_ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS,
+        cache_max_entries: int = DEFAULT_CACHE_MAX_ENTRIES,
         llm_router: Optional["Router"] = None,
         **kwargs: Any,
     ) -> None:
@@ -217,12 +238,18 @@ class VisionToTextGuardrail(CustomGuardrail):
         self.vision_prompt = vision_prompt or DEFAULT_VISION_PROMPT
         self.description_template = description_template or DEFAULT_DESCRIPTION_TEMPLATE
         self.failure_template = failure_template or DEFAULT_FAILURE_TEMPLATE
+        self.history_template = history_template or DEFAULT_HISTORY_TEMPLATE
         self.max_images = max_images
         self.vision_timeout = vision_timeout
         # 组内重试可绕开负载均衡组里不支持图片的成员；跨组 fallback 一律禁掉（见 _call_vision_model）
         self.vision_num_retries = vision_num_retries
         self.cache_ttl_seconds = cache_ttl_seconds
         self._llm_router = llm_router
+        # 识图缓存独立于 proxy 的 user_api_key_cache，理由见 DEFAULT_CACHE_MAX_ENTRIES
+        self._cache = InMemoryCache(max_size_in_memory=cache_max_entries, default_ttl=cache_ttl_seconds)
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+        # 同一张图的并发识图只发一次请求，其余等这一次的结果（in-flight 去重）
+        self._in_flight: Dict[str, "asyncio.Future[Optional[str]]"] = {}
         # 外部 guardrail 不会被注入 llm_router，其余 litellm_params 由 **kwargs 吸收
         super().__init__(
             guardrail_name=guardrail_name,
@@ -238,12 +265,14 @@ class VisionToTextGuardrail(CustomGuardrail):
         data: dict,
         call_type: "CallTypesLiteral",
     ) -> Optional[dict]:
+        # cache 是 litellm 的钩子签名要求，但识图刻意不用它：它是 proxy 的
+        # user_api_key_cache，内存层只有 200 条且与认证条目混住（见 DEFAULT_CACHE_MAX_ENTRIES）
         raw_messages = data.get("messages")
         if not isinstance(raw_messages, list) or not raw_messages:
             return None
         messages = cast(List[AllMessageValues], raw_messages)
 
-        patched = await self._replace_images_in(messages, cache=cache)
+        patched = await self._replace_images_in(messages)
         if patched is messages:
             return None
         return {**data, "messages": patched}
@@ -251,51 +280,85 @@ class VisionToTextGuardrail(CustomGuardrail):
     async def _replace_images_in(
         self,
         messages: List[AllMessageValues],
-        cache: "DualCache",
     ) -> List[AllMessageValues]:
         """把图片块换成识别文本；无图时原样返回传入对象，供调用方判断有没有变"""
         references = extract_image_references(messages)
         if not references:
             return messages
 
-        # 超出上限的图片保持原样，避免一次请求打爆视觉模型配额
-        selected = references if self.max_images is None else references[: self.max_images]
-        if len(selected) < len(references):
-            verbose_proxy_logger.warning(
-                "vision_to_text: %d image(s) exceed max_images=%s and were left untouched",
-                len(references) - len(selected),
+        # 取最近 N 张而非最早 N 张：用户当轮刚贴的截图排在最后，正是模型要看的那些。
+        # 超限的历史图片换成占位文本而不原样留下；留下等于把原图透传给纯文本后端，
+        # 那正是这个 guardrail 要消灭的 400
+        selected = references if self.max_images is None else references[-self.max_images :]
+        skipped = references[: len(references) - len(selected)]
+        if skipped:
+            verbose_proxy_logger.info(
+                "vision_to_text: describing the %d most recent image(s), %d older image(s) replaced with a placeholder "
+                "(max_images=%s)",
+                len(selected),
+                len(skipped),
                 self.max_images,
             )
 
-        replacements = await self._describe_images(selected, cache=cache)
-        return replace_images_with_text(messages, replacements)
+        described = await self._describe_images(selected)
+        placeholder = self.history_template.format(max_images=self.max_images)
+        omitted = {(reference.message_index, reference.path): placeholder for reference in skipped}
+        return replace_images_with_text(messages, {**omitted, **described})
 
     async def _describe_images(
         self,
         references: Sequence[ImageReference],
-        cache: "DualCache",
     ) -> Dict[Tuple[int, Tuple[int, ...]], str]:
         # 同一请求内重复出现的图片只识别一次
         unique_urls = tuple(dict.fromkeys(reference.image_url for reference in references))
-        texts = await asyncio.gather(*(self._text_for_image(url, cache=cache) for url in unique_urls))
+        texts = await asyncio.gather(*(self._text_for_image(url) for url in unique_urls))
         by_url = dict(zip(unique_urls, texts))
         return {(reference.message_index, reference.path): by_url[reference.image_url] for reference in references}
 
-    async def _text_for_image(self, image_url: str, cache: "DualCache") -> str:
+    async def _text_for_image(self, image_url: str) -> str:
         cache_key = self._cache_key(image_url)
-        cached = await cache.async_get_cache(key=cache_key)
+        cached = self._cache.get_cache(key=cache_key)
         # 命中缓存保证同图产出逐字节相同的文本，否则每轮改写都会打断 prompt caching
         if isinstance(cached, str) and cached:
             return cached
 
-        description = await self._call_vision_model(image_url)
+        description = await self._describe_once(cache_key, image_url)
         if description is None:
             # 失败结果不入缓存，下次请求会重试
             return self.failure_template.format(error="vision model returned no description")
 
         text = self.description_template.format(description=description)
-        await cache.async_set_cache(key=cache_key, value=text, ttl=self.cache_ttl_seconds)
+        self._cache.set_cache(key=cache_key, value=text, ttl=self.cache_ttl_seconds)
         return text
+
+    async def _describe_once(self, cache_key: str, image_url: str) -> Optional[str]:
+        """
+        同一张图并发到达时只真打一次视觉模型，其余请求等同一个 future。
+
+        没有这层去重时，同一张图的 N 个并发请求就是 N 次识图调用：缓存只在第一次
+        返回后才写入，在那之前所有请求都是 miss。长会话逐轮重发同批图片时，
+        这个倍数直接乘在放大链条上。
+        """
+        in_flight = self._in_flight.get(cache_key)
+        if in_flight is not None:
+            # shield 让本请求被取消时不会连带取消正在跑的那次识图（别人还在等它）
+            return await asyncio.shield(in_flight)
+
+        future: "asyncio.Future[Optional[str]]" = asyncio.get_running_loop().create_future()
+        self._in_flight[cache_key] = future
+        try:
+            async with self._semaphore:
+                description = await self._call_vision_model(image_url)
+        except BaseException:
+            # 领头请求被取消（客户端断连）不能连累等待者：它们各自的请求还活着。
+            # 给它们 None 走 fail-open 占位文本，而不是把 CancelledError 抛进去
+            future.set_result(None)
+            raise
+        else:
+            future.set_result(description)
+            return description
+        finally:
+            self._in_flight.pop(cache_key, None)
 
     def _cache_key(self, image_url: str) -> str:
         fingerprint = hashlib.sha256(

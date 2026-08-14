@@ -173,10 +173,41 @@ guardrails:
       vision_model: vision-describer
 ```
 
-可选参数：`vision_prompt`、`description_template`、`failure_template`、`max_images`、
-`vision_timeout`、`vision_num_retries`（默认 2）、`cache_ttl_seconds`。
+可选参数：`vision_prompt`、`description_template`、`failure_template`、`history_template`、
+`max_images`（默认 4）、`max_concurrency`（默认 4）、`vision_timeout`、
+`vision_num_retries`（默认 2）、`cache_ttl_seconds`（默认 3600）、
+`cache_max_entries`（默认 2048）。
 
 `vision_model` 可以直接指向一个负载均衡组（组里成员支持视觉即可），不必是单个部署。
+
+### 调用放大防护（2026-08-14 生产事故后加固）
+
+视觉模型曾在数小时内被调用约 5.5 万次、峰值 618 RPM，起因是一个持续累积的超长会话。
+四条独立的放大路径，每条都有对应回归测试：
+
+| 机制 | 事故时行为 | 现在 |
+|---|---|---|
+| 历史图片重复识别 | `max_images` 默认 `None`，每轮把全部历史截图重识别一遍，识图量随会话轮数线性涨 | 默认只识别**最近 4 张**，更早的换成占位文本 |
+| 缓存容量 | 复用 proxy 传入的 `DualCache`（即 `user_api_key_cache`），内存层硬上限 200 条 | 自带 `InMemoryCache`，默认 2048 条，与 proxy 缓存完全隔离 |
+| 并发去重 | 同一张图的 N 个并发请求 = N 次识图调用（缓存要等第一次返回才写入） | in-flight 去重，同图并发只真打一次 |
+| 并发上限 | `asyncio.gather` 不限并发，一次请求 N 张图就是 N 个同时在飞的调用 | semaphore 限 4 |
+
+两个反直觉的点，改前请先读：
+
+- **缓存不能共用传入的 `cache` 参数**。它是 `user_api_key_cache`，内存层 200 条上限，
+  且与 key / team / user 认证条目混住。识图键 TTL 3600 远长于认证键的 60，而
+  `InMemoryCache.evict_cache` 按到期时间驱逐 —— 于是识图流量会把认证条目挤干（实测
+  50 个认证键在 300 个识图键写入后**全部**被驱逐，迫使每请求回 DB 鉴权），
+  同时图片数一旦超 200，识图缓存自身命中率**不是下降而是归零**（250 张图 x 40 轮 =
+  10400 次调用，命中率 0.0%）。这两件事都能用可执行脚本复现。
+- **`max_images` 必须取最近 N 张，不是最早 N 张**。用户当轮刚贴的截图排在 messages 最后；
+  取最早 N 张会把它漏掉，识图对当前提问完全无效。事故版实现取的正是最早 N 张。
+  另外超限的图片必须换成占位文本而不是原样留下 —— 留下就等于把真图透传给纯文本后端，
+  那正是这个 guardrail 要消灭的 400。
+
+还有一条**未修的正反馈**：视觉模型被打限流后失败结果不入缓存（这是有意的，为了下次能重试），
+于是每轮都对全部图片重试一遍，限流越严重重试越多。`max_images` 默认值把它的规模压住了，
+但根治需要熔断器。当前判断是不值得为此引入状态机。
 
 ### 只对指定模型生效
 
