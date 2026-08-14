@@ -443,14 +443,53 @@ async def test_images_over_max_become_placeholders_not_raw_images():
 
 
 @pytest.mark.asyncio
-async def test_max_images_has_a_default_so_long_sessions_cannot_scale_without_bound():
+async def test_max_images_is_bounded_by_default_but_leaves_room_for_real_conversations():
     """
-    生产事故的放大源：不限张数时，长会话每轮把全部历史截图重识别一遍，
-    识图量随会话轮数线性涨。默认值是唯一挡住这条路的东西。
+    上界：不限张数时单次请求能塞进几百张图，必须有硬闸门。
+
+    下界同样重要 —— 这个值调小并不省钱（缓存生效后一个会话的识图次数只等于唯一图片数，
+    与轮数和这个值无关），只会让用户早先贴的截图退化成占位文本。曾经设成 4，
+    每轮贴 1 张图的对话从第 5 轮起最早的图就看不见了。
     """
     guardrail = _make_guardrail(router=_router("described"))
 
-    assert guardrail.max_images is not None and guardrail.max_images <= 8
+    assert guardrail.max_images is not None, "不限张数会让单次请求无上界"
+    assert guardrail.max_images >= 16, "太小会让正常多轮对话的历史截图退化成占位文本"
+
+
+@pytest.mark.asyncio
+async def test_a_dozen_turns_with_one_image_each_keeps_every_image_visible():
+    """
+    最常见的真实用法：连续对话十几轮，每轮贴 1 张截图。Claude Code 每轮重发完整历史，
+    所以第 N 轮的请求里含着前 N-1 轮的图。
+
+    两个都必须成立：
+    - 成本：识图调用数 == 轮数（每张图只识别一次，缓存命中）
+    - 功能：没有任何一张图退化成占位文本，用户回头问早先的截图时模型还看得见
+    """
+    turns = 14
+    calls = 0
+
+    async def counting_vision(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return _vision_response(f"desc{calls}")
+
+    router = AsyncMock()
+    router.acompletion = counting_vision
+    guardrail = _make_guardrail(router=router)
+
+    messages: List[Dict[str, Any]] = []
+    for turn in range(1, turns + 1):
+        messages = messages + [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"img{turn}"}}]}]
+        result = await _run(guardrail, messages, cache=DualCache())
+
+        assert result is not None
+        texts = [message["content"][0]["text"] for message in result["messages"]]
+        assert not any(text.startswith("[Image omitted") for text in texts), (
+            f"第 {turn} 轮有图片退化成占位文本，用户看不到自己早先贴的截图了"
+        )
+        assert calls == turn, f"第 {turn} 轮累计识图 {calls} 次，应为 {turn} 次（历史图片必须命中缓存）"
 
 
 @pytest.mark.asyncio
