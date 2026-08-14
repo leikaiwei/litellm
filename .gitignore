@@ -1,6 +1,7 @@
 CLAUDE.local.md
 .python-version
 .venv
+.venv-typecheck
 .venv_policy_test
 .env
 .claude
@@ -142,3 +143,4 @@ crash.*.log
 .coverage
 
 ui/litellm-dashboard/out/
+litellm.log
