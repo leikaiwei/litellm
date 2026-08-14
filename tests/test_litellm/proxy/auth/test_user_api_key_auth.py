@@ -4473,6 +4473,67 @@ async def test_centralized_common_checks_absent_team_refused_despite_db_unavaila
 
 
 @pytest.mark.asyncio
+async def test_centralized_common_checks_ui_session_team_survives_absent_team_row():
+    """The Admin UI session team_id is a reserved sentinel that never has a DB row:
+    ``/team/new`` refuses to create it. So "the row is provably absent" is its
+    steady state, not the deleted-team signal the absent-versus-unreadable
+    distinction was built to catch. Without the sentinel exemption every request
+    carrying a UI session key is refused at the one gate all routes pass through,
+    which takes the whole dashboard down while the API keeps serving.
+
+    Asserts the reconstructed team object reaches ``common_checks`` rather than
+    merely that no exception escaped: returning ``None`` would also pass a
+    raises-check while silently dropping the token's own team fields.
+    """
+    from fastapi import Request
+    from starlette.datastructures import URL
+
+    import litellm.proxy.proxy_server as _proxy_server_mod
+    from litellm.constants import UI_SESSION_TOKEN_TEAM_ID
+    from litellm.proxy.auth.user_api_key_auth import TeamNotFoundError
+
+    token = UserAPIKeyAuth(
+        api_key="sk-ui-session",
+        team_id=UI_SESSION_TOKEN_TEAM_ID,
+        models=[],
+        team_models=[],
+    )
+    request = Request(scope={"type": "http"})
+    request._url = URL(url="/v1/chat/completions")
+    request._body = json.dumps({"model": "gpt-4.1"}).encode()
+
+    attrs = _proxy_attrs_for_centralized_checks(user_custom_auth=None)
+    # No opt-out in play: the exemption must hold on a perfectly healthy database.
+    attrs["general_settings"] = {}
+    originals = {a: getattr(_proxy_server_mod, a, None) for a in attrs}
+    try:
+        for k, v in attrs.items():
+            setattr(_proxy_server_mod, k, v)
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_object",
+                new_callable=AsyncMock,
+                side_effect=TeamNotFoundError(team_id=UI_SESSION_TOKEN_TEAM_ID),
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.common_checks",
+                new_callable=AsyncMock,
+            ) as mock_checks,
+        ):
+            await _run_centralized_common_checks(
+                user_api_key_auth_obj=token,
+                request=request,
+                request_data={"model": "gpt-4.1"},
+                route="/v1/chat/completions",
+            )
+        mock_checks.assert_awaited_once()
+        assert mock_checks.call_args.kwargs["team_object"].team_id == UI_SESSION_TOKEN_TEAM_ID
+    finally:
+        for k, v in originals.items():
+            setattr(_proxy_server_mod, k, v)
+
+
+@pytest.mark.asyncio
 async def test_centralized_common_checks_unreadable_team_keeps_db_unavailable_optout():
     """The counterpart: an unreadable team leaves the grant unknown rather than
     answered, so an operator who has accepted degraded authorization during a

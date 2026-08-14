@@ -26,6 +26,7 @@ from litellm.constants import (
     GLOBAL_PROXY_SPEND_CACHE_KEY,
     LITELLM_PROXY_BUDGET_NAME,
     LITELLM_PROXY_MASTER_KEY_ALIAS,
+    UI_SESSION_TOKEN_TEAM_ID,
 )
 from litellm.integrations.otel.model.config import is_otel_v2_enabled
 from litellm.integrations.otel.runtime import phase_span, seed_request_identity
@@ -2178,6 +2179,12 @@ def _token_can_vouch_for_team(valid_token: UserAPIKeyAuth, lookup_error: BaseExc
     back out, and is only consulted here because the failure is known by this
     point to be a degraded read.
     """
+    # UI 会话用的 team_id 是保留 sentinel，设计上永远没有 DB 行（/team/new 显式拒绝
+    # 创建它），所以"查库查不到"对它是常态而非"团队已被删除"。不豁免就会让每个带
+    # UI 会话 key 的请求都栽在下面那个 TeamNotFoundError 上，整个 Admin UI 打不开。
+    # 只对这一个 sentinel 放行，真实团队的判定不受影响。
+    if valid_token.team_id == UI_SESSION_TOKEN_TEAM_ID:
+        return True
     if isinstance(lookup_error, TeamNotFoundError):
         return False
     if valid_token.team_models:

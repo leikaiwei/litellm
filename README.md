@@ -51,6 +51,13 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 上游未修，无对应 issue / PR
 - 注意：`vision_model` 指向的组不能挂这个 guardrail。识图那次 `router.acompletion` 的 call_type 是 `acompletion`，天然穿过门，一旦该组自身也挂上就会无限递归，guardrail 里没有递归保护
 
+**UI 会话 team sentinel 被当成已删除团队** — `proxy/auth/user_api_key_auth.py`
+- 症状：升级到 1.98.0 后 Admin UI 能登录、能看到页面框架，但所有数据加载不出来，右上角报 `Team doesn't exist in db. Team=litellm-dashboard. Create team via /team/new call.`（404 auth_error）。API 的模型调用完全不受影响，只有 UI 挂
+- 根因：上游 PR [#36837](https://github.com/BerriAI/litellm/pull/36837) 修了一个真实漏洞（team 被删后残留 key 上 `team_models=[]` 会被模型校验读成"无限制"，等于删团队反而放大权限），手段是新增 `TeamNotFoundError` 精确区分"确实不存在"与"读不到"，前者不再允许 token 自带字段兜底。但 `litellm-dashboard`（`UI_SESSION_TOKEN_TEAM_ID`）是设计上永远没有 DB 行的保留 sentinel —— `/team/new` 显式拒绝创建它。于是"查库查不到"对它是常态，却被新逻辑等同于"团队已被删除"。崩在 `_run_centralized_common_checks`，那是所有路由都要过的唯一鉴权关口，所以整站 UI 一起挂
+- 修复：`_token_can_vouch_for_team` 对该 sentinel 直接放行，等价于把这条路径精确退回 1.95.0 的旧行为。只对这一个 id 生效，真实团队的判定不变，不重新引入上游要堵的漏洞（UI 会话 key 的模型访问本就不该被"团队"概念约束）
+- 选型：也可以在 DB 里插一行 `litellm-dashboard` team，但那会让 `user_api_key_auth.py` 的 "UPDATE TEAM VALUES BASED ON CACHED TEAM OBJECT" 段把挂在该 sentinel 下的全部 key 统一按这一行的字段约束（budget / guardrail / object_permission / 组织归属），影响面无法评估，且违反 `/team/new` 设的保留字不变量
+- 上游状态：通用鉴权路径未修、无对应 issue。同类豁免上游已在 `/search_tools/list`（PR [#36061](https://github.com/BerriAI/litellm/pull/36061)，已合并）和 `/search`（PR [#36063](https://github.com/BerriAI/litellm/pull/36063)，open）做过，但都局限在各自业务代码里，没有下沉到 `_run_centralized_common_checks`。这个 bug 对所有自建 litellm 都会犯，值得提 PR 上游
+
 已移除的补丁（保留记录，便于回溯）：
 
 - ~~**Anthropic passthrough 非标准 SSE 帧健壮性**~~ — 我们提交的 PR [#26000](https://github.com/BerriAI/litellm/pull/26000) 已并入上游，本地补丁移除
