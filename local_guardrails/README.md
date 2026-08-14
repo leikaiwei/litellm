@@ -174,7 +174,7 @@ guardrails:
 ```
 
 可选参数：`vision_prompt`、`description_template`、`failure_template`、`history_template`、
-`max_images`（默认 4）、`max_concurrency`（默认 4）、`vision_timeout`、
+`max_images`（默认 32）、`max_concurrency`（默认 4）、`vision_timeout`、
 `vision_num_retries`（默认 2）、`cache_ttl_seconds`（默认 3600）、
 `cache_max_entries`（默认 2048）。
 
@@ -211,8 +211,9 @@ guardrails:
   那正是这个 guardrail 要消灭的 400。
 
 还有一条**未修的正反馈**：视觉模型被打限流后失败结果不入缓存（这是有意的，为了下次能重试），
-于是每轮都对全部图片重试一遍，限流越严重重试越多。`max_images` 默认值把它的规模压住了，
-但根治需要熔断器。当前判断是不值得为此引入状态机。
+于是每轮都对全部图片重试一遍，限流越严重重试越多。真正压住它规模的是 `max_concurrency`
+（同时在飞的调用限 4）和 in-flight 去重，不是 `max_images` —— 后者已放宽到 32。
+根治需要熔断器，当前判断是不值得为此引入状态机。
 
 ### 只对指定模型生效
 
