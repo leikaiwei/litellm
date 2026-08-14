@@ -12,11 +12,11 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 修复 Anthropic thinking_blocks 到 DeepSeek reasoning_content 的转换
 - 修复 Anthropic 兼容端点 fallback（如 qwen/claude 回退到 deepseek）时，历史里外来 thinking 块导致 DeepSeek 400 的问题；命中该 400 时自动修复 assistant 历史（redacted_thinking 转占位 thinking 块、给含 tool_use 却无 thinking 块的消息注入占位块）并重试，直连场景不受影响
 
-**Anthropic 流式适配器空 choices 防护** — `llms/anthropic/experimental_pass_through/adapters/streaming_iterator.py`、`llms/anthropic/experimental_pass_through/adapters/transformation.py`、`responses/litellm_completion_transformation/streaming_iterator.py`
+**Anthropic 流式适配器空 choices 防护** — `llms/anthropic/experimental_pass_through/adapters/transformation.py`、`responses/litellm_completion_transformation/streaming_iterator.py`
 - 症状：Claude Code 等 `/v1/messages` 客户端流式调用 OpenAI 形状后端（如 `custom_openai`）时，内容能完整收到，但请求被记为错误且 tokens=0，日志里是 `IndexError: list index out of range`
 - 根因：OpenAI 兼容后端会在流末尾发出 `choices: []` 的空帧，而适配器多处裸取 `choices[0]`。空帧有两种来源：OpenAI 规范里 `include_usage` 的 usage-only 尾帧（适配器对流式请求强制开启该选项），以及厂商私有帧（实测 opencode Go 发的是 `x-opencode-type: inference-cost` 成本帧，`usage` 为 null，真实 usage 挂在前一个 `finish_reason` 帧上）。崩溃发生在响应头已发出之后，所以状态码仍是 200，只是缺了 `message_delta` 和 `message_stop`
 - 修复：空 choices 的 chunk 不丢弃，加判空守卫后继续走已有的 usage 合并路径，usage 仍能进 `message_delta`。同类问题在 Responses API 桥接层一并修掉（Azure 前导 `prompt_filter_results` 空帧也走这条路）
-- 对应上游 open PR [#34455](https://github.com/BerriAI/litellm/pull/34455)，改法与其一致；上游合并后本地补丁可移除
+- 上游进展（1.98.0 同步时核对）：`adapters/streaming_iterator.py` 那一处上游已自行修复（PR [#35314](https://github.com/BerriAI/litellm/pull/35314)，走 `_handle_choiceless_chunk` 在裸取前统一跳过空帧，比逐点判空更彻底），该文件已改回上游实现。我们最初跟踪的 PR [#34455](https://github.com/BerriAI/litellm/pull/34455) 未被合并。上游那次只改了这一个文件，`transformation.py` 的 `finish_reason` 裸取与 Responses 桥接层的三处裸取上游仍未防护，故这两个文件的补丁继续保留
 
 **OpenRouter OpenAI 系列模型兼容性修复** — `llms/openrouter/chat/transformation.py`
 - 修复 Claude Code `Agent` tool schema 中 Anthropic `type:"custom"` 透传导致 OpenRouter 下游 OpenAI/Azure 模型 API 400 的问题
