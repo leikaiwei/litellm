@@ -10,7 +10,7 @@ model_list:
       custom_llm_provider: custom_openai
       api_base: os.environ/TEXT_MODEL_API_BASE
       api_key: os.environ/TEXT_MODEL_API_KEY
-      guardrails: ["vision-to-text", "tool-result-trailing-text"]
+      guardrails: ["vision-to-text"]
 
   # 对照：同一后端不挂 guardrail，带图仍会失败
   - model_name: deepseek-no-guardrail
@@ -42,14 +42,6 @@ guardrails:
       default_on: false
       vision_model: vision-describer
       vision_timeout: 120
-
-  # 裸 tool_result 收尾时追加一个 text 块。不判 tool id 来源：前缀证明不了同一个 opencode
-  # 账号，而漏注入会让会话被永久钉在 fallback 上（详见 README）
-  - guardrail_name: "tool-result-trailing-text"
-    litellm_params:
-      guardrail: tool_result_trailing_text.ToolResultTrailingTextGuardrail
-      mode: "pre_call"
-      default_on: false
 
   # 管理名称直接表达用途；下游拦截响应仍由 guardrail 统一脱敏，详细边界见 README
   - guardrail_name: "zh-abusive-language-filter"

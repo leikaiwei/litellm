@@ -4,10 +4,6 @@
 deepseek 等模型只支持文本，但 Claude Code 用户会贴截图；挂上本 guardrail 后带图请求
 不再报 400，也不会被后端静默丢成 [Unsupported Image]。
 
-曾经还兼管"裸 tool_result 收尾时补一个 text 块"，那件事与识图完全独立，已拆到
-tool_result_trailing_text.py。当初合在一起只是因为生产上新增一个 guardrail 要改
-docker compose 重建容器，不是设计判断。
-
 这是 litellm 的外部自定义 guardrail，不修改 litellm 源码。把本文件放在 config.yaml
 同目录，然后：
 
