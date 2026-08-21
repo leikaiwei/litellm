@@ -58,6 +58,13 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 选型：也可以在 DB 里插一行 `litellm-dashboard` team，但那会让 `user_api_key_auth.py` 的 "UPDATE TEAM VALUES BASED ON CACHED TEAM OBJECT" 段把挂在该 sentinel 下的全部 key 统一按这一行的字段约束（budget / guardrail / object_permission / 组织归属），影响面无法评估，且违反 `/team/new` 设的保留字不变量
 - 上游状态：通用鉴权路径未修、无对应 issue。同类豁免上游已在 `/search_tools/list`（PR [#36061](https://github.com/BerriAI/litellm/pull/36061)，已合并）和 `/search`（PR [#36063](https://github.com/BerriAI/litellm/pull/36063)，open）做过，但都局限在各自业务代码里，没有下沉到 `_run_centralized_common_checks`。这个 bug 对所有自建 litellm 都会犯，值得提 PR 上游
 
+**空回复不写响应缓存** — `caching/caching_handler.py`
+- 症状：客户端调用后长时间无输出，之后自动重试全部瞬时返回同样的空回复，会话彻底卡死，只能手动发一句"继续"才恢复
+- 根因：上游偶发静默拒答，回 HTTP 200 加空 `content` 加 `finish_reason: stop`，litellm 判为 success（`attempted_retries: 0`、`error_information: null`，故 `num_retries` 与模型组 fallback 全部绕过）。这个空回复随后被写进响应缓存，默认 TTL 60 秒，于是窗口内每次重试都命中缓存秒回同一个空回复。生产实测同一 request_id 三条记录：首条真实请求耗时 181 秒，随后两条 `cache_hit=True` 各 0.01 秒返回，重试彻底失去意义
+- 修复：`_should_store_result_in_cache` 加一条判空，所有 choices 都没有实质内容时不写缓存。判空覆盖 `content` 之外的 `tool_calls` / `function_call` / `reasoning_content` / `thinking_blocks` / `audio` / `images`，故纯工具调用与纯推理回复不受影响；空格等仍算内容，不猜测语义。该函数是 sync 与 async、流式与非流式四条路径的唯一决策点（流式经 `_add_streaming_response_to_cache` 汇入），改一处全覆盖
+- 注意：这只让重试重新有意义，治不了空回复本身，那个根因在上游
+- 上游未修，无对应 issue / PR
+
 已移除的补丁（保留记录，便于回溯）：
 
 - ~~**Anthropic passthrough 非标准 SSE 帧健壮性**~~ — 我们提交的 PR [#26000](https://github.com/BerriAI/litellm/pull/26000) 已并入上游，本地补丁移除

@@ -622,3 +622,110 @@ def test_request_kwargs_does_not_retain_logging_obj():
     assert "litellm_logging_obj" not in handler.request_kwargs
     assert handler.request_kwargs["messages"] == kwargs["messages"]
     assert handler.request_kwargs["model"] == "gpt-4o"
+
+
+def _completion(
+    content=None,
+    finish_reason="stop",
+    tool_calls=None,
+    reasoning_content=None,
+    choices_override=None,
+):
+    """构造一个 ModelResponse，默认是上游静默拒答那个形状"""
+    from litellm.types.utils import Choices, Message, ModelResponse
+
+    if choices_override is not None:
+        return ModelResponse(choices=choices_override)
+    message = Message(
+        content=content,
+        role="assistant",
+        tool_calls=tool_calls,
+        reasoning_content=reasoning_content,
+    )
+    return ModelResponse(choices=[Choices(finish_reason=finish_reason, index=0, message=message)])
+
+
+def _handler():
+    def acompletion():  # 名字必须落在 supported_call_types 里
+        ...
+
+    return LLMCachingHandler(
+        original_function=acompletion,
+        request_kwargs={},
+        start_time=datetime.now(),
+    )
+
+
+@pytest.mark.parametrize(
+    "response, expected_stored, case",
+    [
+        (_completion(content=""), False, "空串 content + stop，即上游静默拒答"),
+        (_completion(content=None), False, "content 为 None"),
+        (_completion(choices_override=[]), False, "choices 整个为空"),
+        (_completion(content="hi"), True, "有正常文本"),
+        (_completion(content=" "), True, "只有一个空格也算内容，不猜测语义"),
+        (_completion(content="", reasoning_content="thinking..."), True, "纯推理无正文"),
+        (
+            _completion(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    }
+                ],
+            ),
+            True,
+            "纯工具调用，OpenAI 规范允许 content 为空",
+        ),
+    ],
+)
+def test_contentless_completion_is_not_cached(response, expected_stored, case):
+    """空回复不进缓存：否则客户端在 TTL 内重试会秒回同一个空回复，
+    把重试就能绕过的瞬时故障固化成永久卡死"""
+    import litellm
+
+    handler = _handler()
+    with patch.object(litellm, "cache", MagicMock(supported_call_types=["acompletion"])):
+        assert (
+            handler._should_store_result_in_cache(
+                original_function=handler.original_function,
+                kwargs={},
+                result=response,
+            )
+            is expected_stored
+        ), case
+
+
+def test_non_completion_results_still_cached():
+    """embedding / rerank 等非 completion 结果由调用点收窄成 None，不受这个判据影响"""
+    import litellm
+
+    handler = _handler()
+    with patch.object(litellm, "cache", MagicMock(supported_call_types=["acompletion"])):
+        assert (
+            handler._should_store_result_in_cache(
+                original_function=handler.original_function,
+                kwargs={},
+                result=None,
+            )
+            is True
+        )
+
+
+def test_no_store_flag_still_respected_alongside_empty_check():
+    """新判据不能吃掉原有的 no-store 语义"""
+    import litellm
+
+    handler = _handler()
+    with patch.object(litellm, "cache", MagicMock(supported_call_types=["acompletion"])):
+        assert (
+            handler._should_store_result_in_cache(
+                original_function=handler.original_function,
+                kwargs={"cache": {"no-store": True}},
+                result=_completion(content="hi"),
+            )
+            is False
+        )

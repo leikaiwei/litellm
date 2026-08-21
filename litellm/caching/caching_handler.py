@@ -41,6 +41,7 @@ from litellm.types.utils import (
     CallTypes,
     Embedding,
     EmbeddingResponse,
+    Message,
     ModelResponse,
     TextCompletionResponse,
     TranscriptionResponse,
@@ -111,6 +112,41 @@ def _should_defer_streaming_cache_hit_callbacks(*, kwargs: dict[str, Any]) -> bo
     spend and callback records.
     """
     return kwargs.get("stream", False) is True
+
+
+# Message.__init__ 会 del 掉未设置的可选字段（见 types/utils.py 的性能优化），
+# 属性真的不存在，故必须用 getattr 取默认值而非直接访问
+_OPTIONAL_CONTENT_FIELDS: Final = (
+    "tool_calls",
+    "function_call",
+    "reasoning_content",
+    "thinking_blocks",
+    "audio",
+    "images",
+)
+
+
+def _message_has_content(message: Message) -> bool:
+    content: Final = message.content
+    if content is not None and content != "":
+        return True
+    return any(getattr(message, field, None) for field in _OPTIONAL_CONTENT_FIELDS)
+
+
+def _is_contentless_completion(result: ModelResponse | None) -> bool:
+    """一个内容块都没产出的 completion 不该进缓存。
+
+    上游概率性静默拒答会回 HTTP 200 + 空 content + finish_reason=stop，litellm 记为
+    success。缓存住它会让客户端在 TTL 内的每次重试都秒回同一个空回复，把一个重试就能
+    绕过的瞬时故障固化成用户看到的永久卡死。判空覆盖 content 之外的 tool_calls /
+    reasoning_content / thinking_blocks / audio / images，故纯工具调用与纯推理回复
+    不受影响。非 completion 结果（embedding / rerank 等）由调用点收窄成 None，一律放行。
+    """
+    if result is None:
+        return False
+    if not result.choices:
+        return True
+    return not any(_message_has_content(choice.message) for choice in result.choices)
 
 
 class LLMCachingHandler:
@@ -963,7 +999,10 @@ class LLMCachingHandler:
         parent_otel_span: Final = _get_parent_otel_span_from_kwargs(new_kwargs)
         new_kwargs["parent_otel_span"] = parent_otel_span
         # [OPTIONAL] ADD TO CACHE
-        if self._should_store_result_in_cache(original_function=original_function, kwargs=new_kwargs):
+        completion_result: Final = result if isinstance(result, ModelResponse) else None
+        if self._should_store_result_in_cache(
+            original_function=original_function, kwargs=new_kwargs, result=completion_result
+        ):
             if (
                 isinstance(result, litellm.ModelResponse)
                 or isinstance(result, litellm.EmbeddingResponse)
@@ -1012,12 +1051,17 @@ class LLMCachingHandler:
         if litellm.cache is None:
             return
 
-        if self._should_store_result_in_cache(original_function=self.original_function, kwargs=new_kwargs):
+        sync_completion_result: Final = result if isinstance(result, ModelResponse) else None
+        if self._should_store_result_in_cache(
+            original_function=self.original_function, kwargs=new_kwargs, result=sync_completion_result
+        ):
             litellm.cache.add_cache(result, **new_kwargs)
 
         return
 
-    def _should_store_result_in_cache(self, original_function: Callable, kwargs: dict[str, Any]) -> bool:
+    def _should_store_result_in_cache(
+        self, original_function: Callable, kwargs: dict[str, Any], result: ModelResponse | None = None
+    ) -> bool:
         """
         Helper function to determine if the result should be stored in the cache.
 
@@ -1029,6 +1073,7 @@ class LLMCachingHandler:
             and litellm.cache.supported_call_types is not None
             and (str(original_function.__name__) in litellm.cache.supported_call_types)
             and (kwargs.get("cache", {}).get("no-store", False) is not True)
+            and not _is_contentless_completion(result)
         )
 
     def _is_call_type_supported_by_cache(
