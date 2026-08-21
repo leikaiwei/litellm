@@ -63,6 +63,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 根因：上游偶发静默拒答，回 HTTP 200 加空 `content` 加 `finish_reason: stop`，litellm 判为 success（`attempted_retries: 0`、`error_information: null`，故 `num_retries` 与模型组 fallback 全部绕过）。这个空回复随后被写进响应缓存，默认 TTL 60 秒，于是窗口内每次重试都命中缓存秒回同一个空回复。生产实测同一 request_id 三条记录：首条真实请求耗时 181 秒，随后两条 `cache_hit=True` 各 0.01 秒返回，重试彻底失去意义
 - 修复：`_should_store_result_in_cache` 加一条判空，所有 choices 都没有实质内容时不写缓存。判空覆盖 `content` 之外的 `tool_calls` / `function_call` / `reasoning_content` / `thinking_blocks` / `audio` / `images`，故纯工具调用与纯推理回复不受影响；空格等仍算内容，不猜测语义。该函数是 sync 与 async、流式与非流式四条路径的唯一决策点（流式经 `_add_streaming_response_to_cache` 汇入），改一处全覆盖
 - 注意：这只让重试重新有意义，治不了空回复本身，那个根因在上游
+- 部署状态：生产临时用派生镜像 `v1.98.0-fork.patch.1-cachefix`（在 patch.1 上叠一层 COPY 替换该文件），未发 release、未打 tag。下次大版本随正式 release 构建后即可弃用
 - 上游未修，无对应 issue / PR
 
 已移除的补丁（保留记录，便于回溯）：
