@@ -130,16 +130,16 @@ deepseek 收到图片时的两种表现（均已实测）：
 
 | 入口 | 结果 |
 |---|---|
-| `/v1/chat/completions`（走 newapi） | 400 |
-| `/v1/messages`（走 newapi） | 400 |
-| `/v1/messages`（直连官方 `api.deepseek.com/anthropic`） | **HTTP 200 但静默降级** |
+| `/v1/chat/completions`（经网关） | 400 |
+| `/v1/messages`（经网关） | 400 |
+| `/v1/messages`（直连纯文本模型的原生 anthropic 端点） | **HTTP 200 但静默降级** |
 
 最后一种最危险：DeepSeek 自己把图换成 `[Unsupported Image]`，模型 thinking 里明说
 "无法看到图片内容"，却照样作答、照样计费。用户贴了截图，得到一个看起来合理的错答案。
 
 litellm 与其它网关都没有这个能力：`supports_vision` 全仓只是元数据，唯一按它决策的地方是
 fireworks 直接抛 BadRequestError。Portkey 把媒体预处理列为使用方自己的负担，OpenRouter
-只能按 modality 过滤模型列表，new-api 也没有。
+只能按 modality 过滤模型列表，其它自建网关也没有。
 
 ### 配置
 
@@ -254,7 +254,7 @@ sha256 缓存描述文本，保证同图产出逐字节相同。
 
 ### 实测验证
 
-本地 proxy + 真实纯文本后端（newapi 上的 deepseek 两个模型）+ 真实视觉模型组，
+本地 proxy + 真实纯文本后端（两个纯文本模型）+ 真实视觉模型组，
 识图**准确性**已端到端验证，不再只是机制验证。
 
 识图正确性，问只有真看到图才能答对的细节：
@@ -291,9 +291,9 @@ sha256 缓存描述文本，保证同图产出逐字节相同。
   litellm 解析响应报 `APIError`（后端其实返回了正确内容）。与本 guardrail 无关，
   配成 `custom_openai` 或 `anthropic` 即正常，两者都已实测通过
 
-- **`vision_model` 必须指向一个「每个成员都确认能识图」的组**（生产已踩，2026-07-30）。
+- **`vision_model` 必须指向一个「每个成员都确认能识图」的组**（已踩，2026-07-30）。
   fail-open 只在调用**抛异常**时触发；若视觉模型返回 HTTP 200 加一句客气的拒绝
-  （实测：讯飞 `xopglm52` 回 "I cannot describe the image..."），那句拒绝会被当成合法描述
+  （实测有后端回 "I cannot describe the image..."），那句拒绝会被当成合法描述
   套进 `description_template` 发给下游，**并按 `cache_ttl_seconds` 缓存**，
   整个 TTL 内不再重试，且不打任何 warning。下游模型于是如实回答"看不到图片"。
   `num_retries` 救不了 —— 重试只在异常时触发，200 不算失败。
@@ -478,7 +478,7 @@ guardrails:
       default_on: false          # 必须 false，否则变成全局常开
 ```
 
-再给每个 hoperun deployment 的 `litellm_params.guardrails` 加上 `"thinking-switch"`。
+再给目标模型组每个 deployment 的 `litellm_params.guardrails` 加上 `"thinking-switch"`。
 **`guardrails` 是整列表覆盖语义**，写成 `["thinking-switch"]` 会把 `vision-to-text`
 挤掉，必须写全：`["vision-to-text", "thinking-switch"]`。
 
@@ -492,10 +492,10 @@ thinking.type ∈ {enabled, adaptive}  ->  一个字都不碰
 
 ### 设计要点
 
-**白名单而非黑名单。** 未知取值按不思考处理，与下游 newapi 侧规则的保守默认一致。
+**白名单而非黑名单。** 未知取值按不思考处理，与下游网关侧规则的保守默认一致。
 
-**开态一个字都不碰，是为了不误伤另一个客户端。** hoperun 上还有一路请求发
-`{"type":"enabled","budget_tokens":7168}`（指纹：不带 `anthropic-beta` 头、68/71 个工具、
+**开态一个字都不碰，是为了不误伤另一个客户端。** 同一个模型组上还有一路请求发
+`{"type":"enabled","budget_tokens":7168}`（指纹：不带 `anthropic-beta` 头、几十个工具、
 `max_tokens=8192`、单轮），它的 thinking 本来就完好穿过 litellm —— 闸门对它早退，因为它
 既不带 `output_config` 也不是 adaptive。误伤它等于把好的也弄坏。
 
@@ -509,7 +509,7 @@ deployment 级是那条路上唯一的机会。与 `kiro_session_affinity` 同�
 
 ### 与识图 guardrail 的关系
 
-两者都挂在 hoperun 上，互不干扰：识图动 `messages` 里的图片块，本 guardrail 只动
+两者挂在同一个模型组上，互不干扰：识图动 `messages` 里的图片块，本 guardrail 只动
 `thinking` / `output_config.effort`。
 
 ### 实测验证
@@ -534,9 +534,9 @@ provider=anthropic + drop_params=True + deployment 挂 guardrails）：
 
 ### 下游契约
 
-newapi 侧规则认 `enabled` / `adaptive` 为要思考，其余补 `{"type":"disabled"}`。归一化后
+下游网关侧规则认 `enabled` / `adaptive` 为要思考，其余补 `{"type":"disabled"}`。归一化后
 关态出站 `disabled`（命中它的触发分支）、开态 `enabled`（命中跳过分支），两侧都落在正确侧，
-newapi 那边不用改。
+网关那边不用改。
 
-前提是 newapi **转换时别再丢 `thinking`** —— 它当前在 anthropic -> openai 转换时把该字段
-整个丢掉，不修的话 litellm 这侧改了也传不过去。
+前提是下游网关**转换时别再丢 `thinking`** —— 若它在 anthropic -> openai 转换时把该字段
+整个丢掉，litellm 这侧改了也传不过去。

@@ -173,7 +173,7 @@ def test_trailing_empty_choices_usage_chunk_emits_message_delta_usage():
 
 
 def test_trailing_empty_choices_chunk_without_usage_does_not_crash_stream():
-    """Real-world shape captured from opencode Go's OpenAI-compatible endpoint.
+    """Real-world shape captured from an OpenAI-compatible gateway.
 
     Its stream ends with a vendor-private cost frame -- ``choices: []`` and
     ``usage: null`` -- arriving *after* a ``finish_reason`` chunk that already

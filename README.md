@@ -14,7 +14,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 **Anthropic 流式适配器空 choices 防护** — `llms/anthropic/experimental_pass_through/adapters/transformation.py`、`responses/litellm_completion_transformation/streaming_iterator.py`
 - 症状：Claude Code 等 `/v1/messages` 客户端流式调用 OpenAI 形状后端（如 `custom_openai`）时，内容能完整收到，但请求被记为错误且 tokens=0，日志里是 `IndexError: list index out of range`
-- 根因：OpenAI 兼容后端会在流末尾发出 `choices: []` 的空帧，而适配器多处裸取 `choices[0]`。空帧有两种来源：OpenAI 规范里 `include_usage` 的 usage-only 尾帧（适配器对流式请求强制开启该选项），以及厂商私有帧（实测 opencode Go 发的是 `x-opencode-type: inference-cost` 成本帧，`usage` 为 null，真实 usage 挂在前一个 `finish_reason` 帧上）。崩溃发生在响应头已发出之后，所以状态码仍是 200，只是缺了 `message_delta` 和 `message_stop`
+- 根因：OpenAI 兼容后端会在流末尾发出 `choices: []` 的空帧，而适配器多处裸取 `choices[0]`。空帧有两种来源：OpenAI 规范里 `include_usage` 的 usage-only 尾帧（适配器对流式请求强制开启该选项），以及网关自定义的非标准帧（实测有后端在流末尾追加一个私有类型的计费帧，`usage` 为 null，真实 usage 挂在前一个 `finish_reason` 帧上）。崩溃发生在响应头已发出之后，所以状态码仍是 200，只是缺了 `message_delta` 和 `message_stop`
 - 修复：空 choices 的 chunk 不丢弃，加判空守卫后继续走已有的 usage 合并路径，usage 仍能进 `message_delta`。同类问题在 Responses API 桥接层一并修掉（Azure 前导 `prompt_filter_results` 空帧也走这条路）
 - 上游进展（1.98.0 同步时核对）：`adapters/streaming_iterator.py` 那一处上游已自行修复（PR [#35314](https://github.com/BerriAI/litellm/pull/35314)，走 `_handle_choiceless_chunk` 在裸取前统一跳过空帧，比逐点判空更彻底），该文件已改回上游实现。我们最初跟踪的 PR [#34455](https://github.com/BerriAI/litellm/pull/34455) 未被合并。上游那次只改了这一个文件，`transformation.py` 的 `finish_reason` 裸取与 Responses 桥接层的三处裸取上游仍未防护，故这两个文件的补丁继续保留
 
@@ -33,21 +33,21 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 上游同样未修，且无对应 issue / PR
 
 **Anthropic 适配层参数泄漏与 thinking-only 消息修复** — `llms/anthropic/experimental_pass_through/adapters/transformation.py`、`llms/anthropic/experimental_pass_through/adapters/handler.py`
-- 背景：官方 deepseek 被禁用后 deepseek 全量走 opencode Go（`custom_openai`），`/v1/messages` 必须经 anthropic↔openai 双向适配层，官方原生 anthropic 端点那条路径上的既有补丁全部不参与。以下两个缺陷均以官方 `api.deepseek.com/anthropic` 做对照实测确认：同一请求官方 200、opencode 失败
+- 前提：`/v1/messages` 打 OpenAI 形状后端（`custom_openai`）时要经 anthropic↔openai 双向适配层，原生 anthropic 端点那条路径上的既有补丁全部不参与。以下两个缺陷都用同一请求打原生 anthropic 端点做对照确认：原生 200、经适配层失败
 - 症状一：请求带 `stop_sequences` / `mcp_servers` / `speed` / `cache_control` / `inference_geo` 任一参数时 500，报 `AsyncCompletions.create() got an unexpected keyword argument`
 - 根因一：适配层 `translatable_anthropic_params()` 是反向白名单，名单外的 Anthropic 顶层参数被 `_copy_untranslated_anthropic_params` 原样拷进 `litellm.acompletion(**kwargs)`，一路漏到 OpenAI SDK。`drop_params: true` 拦不住——它只比对 `supported_openai_params`，这些名字压根不在表里。参数有两个注入点：命名参数经 `request_data` 进适配层，其余经 handler 的 `extra_kwargs` 回注，两处都要堵
 - 修复一：`stop_sequences` 映射成 OpenAI 标准的 `stop`（实测语义生效，输出被正确截断）；无 OpenAI 对应的四个参数收进 `ANTHROPIC_ONLY_PARAMS_WITHOUT_OPENAI_EQUIVALENT`，并复用 handler 既有的 `ANTHROPIC_ONLY_REQUEST_KEYS` 机制堵住第二个注入点，清单保持单一来源
-- 症状二：assistant 历史消息只含 thinking 块时上游 400，报错是 opencode 的通用兜底串 `Error from provider (Console Go): Upstream request failed`
+- 症状二：assistant 历史消息只含 thinking 块时上游 400，且上游只回一句通用兜底错误串，不指出违规字段
 - 根因二：`strip_empty_text_blocks_from_anthropic_messages` 先摘掉伴随的空 text 块（那是为原生 anthropic 路径加的，见上游 #22930），适配层随后落到 `assistant_content = assistant_message_str` 拿到 `None`，再被 `utils.py` 的 `cleanup_none_field_in_message` 连键一起删掉，产出既无 `content` 又无 `tool_calls` 的非法 OpenAI 消息。唯一变量法钉死了上游规则：只看 `content` 键存不存在，与其值无关、与 `tools` 无关
 - 修复二：无 `content` 且无 `tool_calls` 的 assistant 消息补 `content: ""`。OpenAI 规范只允许带 `tool_calls` 时省略 `content`，故不影响工具调用那条路
 - 上游均未修，无对应 issue / PR
 - 已知遗留（本轮未修）：`top_k` 同样会漏成 500，但 vertex_ai 等 provider 真支持它，而适配层此处拿不到解析后的 provider（`model` 是 model_group 名），无条件丢弃会让 gemini 等后端静默失去该参数，需按 provider 能力决定去留；`stop_reason` 缺 `stop_sequence` 与 `content_filter` 映射；`count_tokens` 漏算 system 与 tools（两条路径都中）；历史轮 thinking 以非标准 `thinking_blocks` 字段发给 `custom_openai`，未转成 `reasoning_content`（fork 里那个转换挂在 `DeepSeekChatConfig` 上，provider 为 `custom_openai` 时拿到的是 `OpenAILikeChatConfig`，补丁不参与），多轮会丢失上一轮推理链
 
 **deployment 级 guardrail 在 `/v1/messages` 上不执行** — `integrations/custom_guardrail.py`
-- 症状：挂在 deployment `litellm_params.guardrails` 上的 guardrail，在模型组 fallback 落到该 deployment 时完全不执行。生产表现为带图请求打 `hoperun`、退到挂了识图 guardrail 的 deepseek 时仍然报错，而直呼同一个 deepseek deployment 一切正常
+- 症状：挂在 deployment `litellm_params.guardrails` 上的 guardrail，在模型组 fallback 落到该 deployment 时完全不执行。表现为带图请求打主模型组、退到挂了识图 guardrail 的纯文本 deployment 时仍然报错，而直呼同一个 deployment 一切正常
 - 根因：`async_pre_call_deployment_hook` 的 call_type 门只认 `completion` / `acompletion`，而 `/v1/messages` 原生直通的 call_type 是 `anthropic_messages`（`utils.py` 取被装饰函数名，再由 `CallTypes()` 转成枚举）。proxy 级 `pre_call_hook` 又只按**请求里的组名**取 guardrail 并集，且 fallback 只在 router 内部重试、不重跑 proxy 级钩子。两者叠加，这个 deployment 钩子是 fallback 路径上唯一的机会，却被门挡住
 - 修复：门改为查 `_DEPLOYMENT_PRE_CALL_TYPES` 映射表，加入 `anthropic_messages`，同时把 call_type 到下游字面量的转换收敛到该表（原先是内联三元表达式）。`CallTypesLiteral` 本就含这个值，未放宽到 embedding / responses 等无 messages 可改写的 call_type
-- 实测：本地 proxy 构造真实组级 fallback（A 组指向不可达地址必失败 -> B 组为 newapi deepseek + 识图 guardrail），补丁前后同一请求对照。带图 fallback 补丁前 500（surface 出 A 组的连接错误，与生产 `Error doing the fallback` 形态一致），补丁后 200 且 `input_tokens` 与直呼对照逐一致（125），纯文本 deepseek 答出图片真实颜色即证明描述已注入；嵌在 `tool_result` 里的图同样生效（178 vs 补丁前原样透传的 237）
+- 实测：本地 proxy 构造真实组级 fallback（A 组指向不可达地址必失败 -> B 组为真实纯文本模型 + 识图 guardrail），补丁前后同一请求对照。带图 fallback 补丁前 500（surface 出 A 组的连接错误，即 `Error doing the fallback` 形态），补丁后 200 且 `input_tokens` 与直呼对照逐一致（125），纯文本模型答出图片真实颜色即证明描述已注入；嵌在 `tool_result` 里的图同样生效（178 vs 补丁前原样透传的 237）
 - 上游未修，无对应 issue / PR
 - 注意：`vision_model` 指向的组不能挂这个 guardrail。识图那次 `router.acompletion` 的 call_type 是 `acompletion`，天然穿过门，一旦该组自身也挂上就会无限递归，guardrail 里没有递归保护
 

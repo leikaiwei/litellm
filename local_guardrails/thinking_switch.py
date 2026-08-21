@@ -13,7 +13,7 @@
 **`output_config.effort` 非空就足以进去**，随后无条件把 `thinking` 覆盖成
 `{"type": "enabled", "budget_tokens": N}`。而 Claude Code 关闭思考只是不发 `thinking`
 字段，`output_config.effort` 照发（它是独立的强度档，关掉思考后仍停留在上次的值）。
-于是"关"和"开"两种状态出站完全一致，下游 newapi / opencode 无从区分。
+于是"关"和"开"两种状态出站完全一致，下游网关无从区分。
 
 同一个闸门还导致：客户端**明确**发 `{"type": "disabled"}`，只要 effort 还在，也会被
 改写成 enabled。所以本 guardrail 必须同时摘掉 effort，只补 disabled 是不够的。
@@ -24,8 +24,8 @@
     其余情况（缺失 / disabled / 未知值） ->  thinking = {"type": "disabled"}
                                             并摘掉 output_config.effort
 
-第一条保证不误伤另一个客户端：hoperun 上还有一路请求发
-`{"type": "enabled", "budget_tokens": 7168}`（指纹是不带 `anthropic-beta` 头、68/71 个
+第一条保证不误伤另一个客户端：同一个模型组上还有一路请求发
+`{"type": "enabled", "budget_tokens": 7168}`（指纹是不带 `anthropic-beta` 头、几十个
 工具、max_tokens=8192），它的 thinking 本来就完好穿过 litellm，不该被动。
 
 只摘 `effort` 而不是删掉整个 `output_config`：生产里 `output_config` 还承载
@@ -44,12 +44,12 @@
           default_on: false                    # 必须 false，否则变成全局常开
 
     model_list:
-      - model_name: hoperun
+      - model_name: your-model-group
         litellm_params:
           guardrails: ["vision-to-text", "thinking-switch"]   # 整列表覆盖语义，
                                                               # 漏写会把识图挤掉
 
-下游契约：newapi 侧规则认 `enabled` / `adaptive` 为"要思考"，其余补 disabled。本
+下游契约：下游网关侧规则认 `enabled` / `adaptive` 为"要思考"，其余补 disabled。本
 guardrail 归一化后，关态出站是 `disabled`（命中它的触发分支），开态是
 `enabled`（命中跳过分支），两侧都落在正确侧。
 """
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
     from litellm.types.utils import CallTypesLiteral
 
 # 视为"客户端要思考"的 type 取值。白名单而非黑名单：未知取值按不思考处理，
-# 与下游 newapi 侧规则的保守默认一致
+# 与下游网关侧规则的保守默认一致
 THINKING_ON_TYPES = frozenset({"enabled", "adaptive"})
 
 DISABLED_THINKING: Dict[str, str] = {"type": "disabled"}

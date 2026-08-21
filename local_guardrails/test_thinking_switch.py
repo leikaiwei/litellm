@@ -104,7 +104,7 @@ async def test_explicit_disabled_still_has_effort_dropped():
 
 @pytest.mark.asyncio
 async def test_unknown_thinking_type_is_treated_as_off():
-    """白名单语义：未知取值按不思考处理，与下游 newapi 规则的保守默认一致"""
+    """白名单语义：未知取值按不思考处理，与下游网关规则的保守默认一致"""
     data: Dict[str, Any] = {"max_tokens": 32000, "thinking": {"type": "something-new"}}
 
     await _run_pre_call(data)
@@ -171,7 +171,7 @@ async def test_output_config_without_effort_is_left_intact():
 )
 async def test_thinking_on_is_never_touched(thinking):
     """
-    enabled 那两个形状来自 hoperun 上的另一个客户端（不带 anthropic-beta 头、68/71 个
+    enabled 那两个形状来自同一个模型组上的另一个客户端（不带 anthropic-beta 头、几十个
     工具），它的 thinking 本来就完好穿过 litellm，误伤它等于把好的也弄坏
     """
     original_thinking = dict(thinking)
