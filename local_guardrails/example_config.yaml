@@ -58,6 +58,15 @@ guardrails:
       default_on: true
       policy_file: /app/content_policy_02.yaml
 
+  # 错误脱敏：429 / 5xx 只回状态码和一句固定文案，详细内容只留在内部日志。
+  # 它靠 async_post_call_failure_hook 生效，那个钩子由 litellm.callbacks 无条件遍历，
+  # 不看 default_on 也不看模型级 guardrails 列表，所以模型级列表里不用写它
+  - guardrail_name: "error-sanitizer"
+    litellm_params:
+      guardrail: error_sanitizer.ErrorSanitizerGuardrail
+      mode: "post_call"
+      default_on: true
+
 litellm_settings:
   drop_params: true
 

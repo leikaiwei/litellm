@@ -540,3 +540,92 @@ provider=anthropic + drop_params=True + deployment 挂 guardrails）：
 
 前提是下游网关**转换时别再丢 `thinking`** —— 若它在 anthropic -> openai 转换时把该字段
 整个丢掉，litellm 这侧改了也传不过去。
+
+## error_sanitizer — 错误脱敏
+
+把返回给下游的错误体收敛成"只给状态码和一句固定文案"，详细内容只留在内部日志。
+
+### 为什么需要
+
+litellm 默认把内部细节原样透给客户端。限速是最典型的一例，下游看到的是：
+
+```
+Error Code: 429
+Message: litellm.RateLimitError: Rate limit exceeded for model_per_key:
+  deadbeef0123456789abcdef0123456789abcdef0123456789abcdef0badc0de:ratelimit-test.
+  Limit type: requests. Current limit: 3, Remaining: 0.
+  Limit resets at: 2026-08-28 09:57:17 UTC
+```
+
+一行里泄漏了限速维度、key 的哈希、当前额度、剩余量和重置时刻，还带 `litellm.` 前缀暴露
+了网关实现。客户端要做的只是退避重试，这些都不必知道。改写后：
+
+```json
+{"error": {"message": "Rate limit exceeded, please retry later", "type": "rate_limit_error", "code": "429"}}
+```
+
+### 改写规则
+
+| 状态码 | 处理 |
+|---|---|
+| 429 / 500 / 502 / 503 / 504 | 换成固定文案 |
+| 其余（含 400 / 401 / 403 / 404） | 一个字都不碰 |
+
+400 保留原文是刻意的：客户端得知道自己请求哪里写错了，换成一句 "Bad request" 会让人无从
+下手。401 / 403 / 404 同理，本身不含内部细节，且下游要靠原文区分是 key 无效还是模型不存在。
+
+改写只影响 HTTP 响应体。原始异常照旧由 litellm 自己的 failure logging 落进
+`LiteLLM_ErrorLogs` 与容器日志，取证能力不受影响。
+
+`retry-after` 头必须透传，客户端退避只能靠它。同一异常上的 `reset_at`（绝对时刻，暴露
+限速窗口边界）和 `rate_limit_type`（暴露限速维度）都丢掉。这里有个真踩过的坑：
+`_handle_llm_api_exception` 取的是**被顶替后**那个异常的 `headers`，原异常的头不会自动
+继承，第一版漏了它，下游只能靠猜退避间隔。
+
+### 上线方式
+
+```yaml
+guardrails:
+  - guardrail_name: "error-sanitizer"
+    litellm_params:
+      guardrail: error_sanitizer.ErrorSanitizerGuardrail
+      mode: "post_call"
+      default_on: true
+```
+
+`default_on: true` 与其他 guardrail 相反，但**它其实不起作用**：
+`async_post_call_failure_hook` 由 `litellm.callbacks` 无条件遍历
+（`litellm/proxy/utils.py:2158`），不看 `default_on` 也不看模型级 `guardrails` 列表。
+写 `true` 只是让配置读起来不误导人，`mode` 取哪个值同样不影响，`post_call` 是最贴近语义
+的那个。因为绕过模型级开关，模型级 `guardrails: [...]` 列表里**不需要**写它，漏写也不会
+把它关掉。
+
+要临时关掉只能从 config 里摘掉这条再重启。
+
+### 两个不生效的边界
+
+都是上游结构决定的，不是本文件的缺陷。
+
+**认证阶段的错误改不了。** `user_api_key_auth` 里抛的异常（key 无效、模型不在白名单、
+预算超限）走 `ProxyLogging._handle_logging_proxy_only_error`，那条路调
+`post_call_failure_hook` 只为记日志，返回值不参与响应构造。好在这类错误本身文案就干净，
+泄漏面小。
+
+**流式首字节之后的错误不改。** `async_data_generator` 拿到 `HTTPException` 会直接 raise
+而不是 yield SSE error 帧（`common_request_processing.py:3037`），连接被截断，客户端看到
+的是传输层异常而非 JSON 错误体。原路径至少会给一个 error 帧，所以中途改写会更糟。判据
+是 `request_data` 里有没有 `combined_usage_object`：`post_call_failure_hook` 会把已交付
+chunk 的用量提上来（`utils.py:2143`），有它就说明字节已经出门了。
+
+### 测试
+
+26 个用例，变异测试 9/9 全杀：不脱敏、流已交付也脱敏、400 也脱敏、丢 retry-after、透传
+全部 header、日志不记原文、detail 改回 dict、错误 type 抹掉、状态码写死。
+
+最有价值的是末尾那组 e2e：把 guardrail 挂进 `litellm.callbacks`，让真实的
+`ProxyRateLimitError`（限速器实际抛的那个类，不是自造的 `HTTPException`）走完
+`_handle_llm_api_exception`，断言下游最终拿到的 `ProxyException` 里一个内部细节都不剩。
+前面的单元测试全过而它挂掉，说明改写虽然发生了却没落到响应体上，那正是这个补丁的意义。
+
+写测试时踩到的：第一版 `bool` 状态码防护是死代码（`True in {429: ...}` 本来就是 False），
+变异测试里它存活，说明没有测试能杀掉它，删掉了。
