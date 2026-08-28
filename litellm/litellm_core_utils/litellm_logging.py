@@ -1442,7 +1442,9 @@ class Logging(LiteLLMLoggingBaseClass):
         if isinstance(result, BaseModel) and hasattr(result, "_hidden_params"):
             hidden_params: Final = getattr(result, "_hidden_params", {})
             if (
-                "response_cost" in hidden_params and hidden_params["response_cost"] is not None
+                not litellm.always_use_local_pricing
+                and "response_cost" in hidden_params
+                and hidden_params["response_cost"] is not None
             ):  # use cost if already calculated
                 return hidden_params["response_cost"]
             elif router_model_id is None and "model_id" in hidden_params:  # use model_id if not already set
@@ -1830,7 +1832,7 @@ class Logging(LiteLLMLoggingBaseClass):
 
         if self.model_call_details.get("cache_hit") is True:
             self.model_call_details["response_cost"] = 0.0
-        elif "response_cost" in hidden_params:
+        elif not litellm.always_use_local_pricing and "response_cost" in hidden_params:
             self.model_call_details["response_cost"] = hidden_params["response_cost"]
         elif (existing_cost := self.model_call_details.get("response_cost")) is not None and existing_cost != 0:
             # Preserve response_cost if already calculated (e.g., by pass-through

@@ -245,6 +245,10 @@ use_chat_completions_url_for_anthropic_messages: bool = bool(
 # Or via `litellm_settings.strip_anthropic_total_tokens: true` in
 # config.yaml.
 strip_anthropic_total_tokens: bool = False
+# 只按本地配置的单价计费，忽略上游回传的 x-litellm-response-cost。
+# 上游是自建网关时，它报的钱按它自己的定价算，会覆盖本地 model_info 里的单价，
+# 导致同一模型流式与非流式计费口径不一致（流式走上游价，非流式走本地价）。
+always_use_local_pricing: bool = os.getenv("LITELLM_ALWAYS_USE_LOCAL_PRICING", "false").lower() == "true"
 anthropic_sse_ping_interval_seconds: float = 15.0
 sse_keepalive_ping_interval_seconds: float | None = None
 route_all_chat_openai_to_responses: bool = (

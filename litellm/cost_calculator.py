@@ -1694,6 +1694,9 @@ def completion_cost(
 def get_response_cost_from_hidden_params(
     hidden_params: dict | BaseModel,
 ) -> float | None:
+    if litellm.always_use_local_pricing:
+        return None
+
     if isinstance(hidden_params, BaseModel):
         _hidden_params_dict = cast(BaseModel, hidden_params).model_dump()
     else:

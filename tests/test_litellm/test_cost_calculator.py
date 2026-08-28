@@ -3530,3 +3530,88 @@ def test_completion_cost_prices_anthropic_shaped_cache_read_tokens():
     )
 
     assert cost == pytest.approx(3 * 5e-6 + 4014 * 5e-7 + 5 * 3e-5, rel=1e-9)
+
+
+class TestAlwaysUseLocalPricing:
+    """`litellm.always_use_local_pricing` 让计费忽略上游回传的成本，只按本地单价算。"""
+
+    @pytest.fixture(autouse=True)
+    def _reset_flag(self):
+        original = litellm.always_use_local_pricing
+        yield
+        litellm.always_use_local_pricing = original
+
+    @staticmethod
+    def _response_with_upstream_cost(upstream_cost: float) -> ModelResponse:
+        response = ModelResponse(
+            model="gpt-4o",
+            usage=Usage(prompt_tokens=1000, completion_tokens=500, total_tokens=1500),
+        )
+        response._hidden_params = {
+            "additional_headers": {
+                "llm_provider-x-litellm-response-cost": str(upstream_cost),
+            }
+        }
+        return response
+
+    def test_upstream_cost_used_when_flag_off(self):
+        from litellm.cost_calculator import get_response_cost_from_hidden_params
+
+        litellm.always_use_local_pricing = False
+        hidden_params = {"additional_headers": {"llm_provider-x-litellm-response-cost": "0.0123"}}
+        assert get_response_cost_from_hidden_params(hidden_params) == 0.0123
+
+    def test_upstream_cost_ignored_when_flag_on(self):
+        from litellm.cost_calculator import get_response_cost_from_hidden_params
+
+        litellm.always_use_local_pricing = True
+        hidden_params = {"additional_headers": {"llm_provider-x-litellm-response-cost": "0.0123"}}
+        assert get_response_cost_from_hidden_params(hidden_params) is None
+
+    def test_local_pricing_overrides_upstream_cost_end_to_end(self):
+        """关键回归：上游报一个离谱的低价，开关打开后必须按本地单价算出完全不同的钱。"""
+        upstream_cost = 0.000001
+        local_input_cost = 0.00001
+        local_output_cost = 0.00002
+        expected_local = 1000 * local_input_cost + 500 * local_output_cost
+
+        litellm.always_use_local_pricing = False
+        assert (
+            response_cost_calculator(
+                response_object=self._response_with_upstream_cost(upstream_cost),
+                model="gpt-4o",
+                custom_llm_provider="openai",
+                call_type="completion",
+                optional_params={},
+                custom_pricing=True,
+                base_model=None,
+                cache_hit=None,
+                litellm_model_name="gpt-4o",
+            )
+            == upstream_cost
+        )
+
+        litellm.always_use_local_pricing = True
+        litellm.register_model(
+            {
+                "always-local-pricing-probe": {
+                    "input_cost_per_token": local_input_cost,
+                    "output_cost_per_token": local_output_cost,
+                    "litellm_provider": "openai",
+                    "mode": "chat",
+                }
+            }
+        )
+        actual = response_cost_calculator(
+            response_object=self._response_with_upstream_cost(upstream_cost),
+            model="always-local-pricing-probe",
+            custom_llm_provider="openai",
+            call_type="completion",
+            optional_params={},
+            custom_pricing=True,
+            base_model=None,
+            cache_hit=None,
+            litellm_model_name="always-local-pricing-probe",
+        )
+        assert actual == pytest.approx(expected_local)
+        assert actual != pytest.approx(upstream_cost)
