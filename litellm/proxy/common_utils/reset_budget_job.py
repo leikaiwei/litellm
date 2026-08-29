@@ -904,7 +904,12 @@ class ResetBudgetJob:
         reset_at_str: Final = window.get("reset_at")
         if not reset_at_str:
             return False
-        reset_at: Final = datetime.fromisoformat(reset_at_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        parsed_reset_at: Final = datetime.fromisoformat(reset_at_str.replace("Z", "+00:00"))
+        reset_at: Final = (
+            parsed_reset_at.replace(tzinfo=timezone.utc)
+            if parsed_reset_at.tzinfo is None
+            else parsed_reset_at.astimezone(timezone.utc)
+        )
         if reset_at > now:
             return False
         spend_counter_cache.in_memory_cache.set_cache(key=counter_key, value=0.0)
@@ -926,7 +931,7 @@ class ResetBudgetJob:
 
         from litellm.proxy.proxy_server import spend_counter_cache
 
-        now: Final = datetime.utcnow()
+        now: Final = datetime.now(timezone.utc)
 
         # Note on raw SQL: prisma-client-python does not support null-filtering
         # on `Json?` columns (no DbNull/JsonNull sentinel — see
