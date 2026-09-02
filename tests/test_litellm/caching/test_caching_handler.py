@@ -1,7 +1,5 @@
 import asyncio
 import json
-import os
-import sys
 import time
 from unittest.mock import MagicMock, patch
 
@@ -10,11 +8,8 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-sys.path.insert(
-    0, os.path.abspath("../../..")
-)  # Adds the parent directory to the system path
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from litellm.caching.caching_handler import LLMCachingHandler
 
@@ -728,4 +723,69 @@ def test_no_store_flag_still_respected_alongside_empty_check():
                 result=_completion(content="hi"),
             )
             is False
+        )
+
+
+def _anthropic_message(content):
+    """构造 /v1/messages 非流式响应，默认是上游静默拒答那个形状"""
+    return {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "stop_reason": "end_turn",
+        "content": content,
+        "usage": {"input_tokens": 10, "output_tokens": 0},
+    }
+
+
+@pytest.mark.parametrize(
+    "response, expected_stored, case",
+    [
+        (_anthropic_message([]), False, "content 数组为空，即上游静默拒答"),
+        (_anthropic_message([{"type": "text", "text": ""}]), False, "只有一个空 text 块"),
+        (_anthropic_message([{"type": "text", "text": "hi"}]), True, "有正常文本"),
+        (
+            _anthropic_message([{"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}]),
+            True,
+            "纯工具调用，无 text 块",
+        ),
+        (
+            _anthropic_message([{"type": "thinking", "thinking": "..."}]),
+            True,
+            "纯推理，无正文",
+        ),
+    ],
+)
+def test_contentless_anthropic_message_is_not_cached(response, expected_stored, case):
+    """上游 1.99 起 /v1/messages 默认进缓存，空回复同样会被固化成永久卡死"""
+    import litellm
+    from litellm.caching.caching_handler import _narrow_result_for_content_check
+
+    handler = _handler()
+    with patch.object(litellm, "cache", MagicMock(supported_call_types=["acompletion"])):
+        assert (
+            handler._should_store_result_in_cache(
+                original_function=handler.original_function,
+                kwargs={},
+                result=_narrow_result_for_content_check(response),
+            )
+            is expected_stored
+        ), case
+
+
+def test_unrecognized_mapping_result_still_cached():
+    """认不出的 dict 结果一律放行，判空不许扩大到未知形状"""
+    import litellm
+    from litellm.caching.caching_handler import _narrow_result_for_content_check
+
+    handler = _handler()
+    with patch.object(litellm, "cache", MagicMock(supported_call_types=["acompletion"])):
+        assert (
+            handler._should_store_result_in_cache(
+                original_function=handler.original_function,
+                kwargs={},
+                result=_narrow_result_for_content_check({"results": [], "id": "rerank_1"}),
+            )
+            is True
         )

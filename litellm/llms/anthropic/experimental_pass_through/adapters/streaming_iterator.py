@@ -561,7 +561,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 will_merge_into_held = (
                     self.holding_stop_reason_chunk is not None and getattr(chunk, "usage", None) is not None
                 )
-                is_final_chunk = bool(chunk.choices) and chunk.choices[0].finish_reason is not None
+                is_final_chunk = chunk.choices[0].finish_reason is not None
                 processed_chunk = LiteLLMAnthropicMessagesAdapter().translate_streaming_openai_response_to_anthropic(
                     response=chunk,
                     current_content_block_index=self.current_content_block_index,
@@ -624,6 +624,12 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                     return self.chunk_queue.popleft()
 
                 if processed_chunk["type"] == "content_block_delta" and not self._delta_has_content(processed_chunk):
+                    # A tool_use block opens with empty arguments (Bedrock Converse's
+                    # ``contentBlockStart``, OpenAI's ``arguments: ""``), so flush the
+                    # block start queued above instead of waiting for the next upstream
+                    # chunk, which on a trailing-burst provider is the whole generation.
+                    if self.chunk_queue:
+                        return self.chunk_queue.popleft()
                     continue
 
                 if processed_chunk["type"] == "message_delta" and self.sent_content_block_finish is False:
@@ -789,7 +795,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 will_merge_into_held = (
                     self.holding_stop_reason_chunk is not None and getattr(chunk, "usage", None) is not None
                 )
-                is_final_chunk = bool(chunk.choices) and chunk.choices[0].finish_reason is not None
+                is_final_chunk = chunk.choices[0].finish_reason is not None
                 processed_chunk = LiteLLMAnthropicMessagesAdapter().translate_streaming_openai_response_to_anthropic(
                     response=chunk,
                     current_content_block_index=self.current_content_block_index,
@@ -847,6 +853,9 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                     if processed_chunk["type"] == "content_block_delta" and not self._delta_has_content(
                         processed_chunk
                     ):
+                        # See ``__next__``: flush the queued block start (issue #32004).
+                        if self.chunk_queue:
+                            return self.chunk_queue.popleft()
                         continue
 
                     if processed_chunk["type"] == "message_delta" and self.sent_content_block_finish is False:
@@ -1048,8 +1057,6 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
         # Example logic - customize based on your needs:
         # If chunk indicates a tool call
-        if not chunk.choices:
-            return False
         if chunk.choices[0].finish_reason is not None:
             return False
 

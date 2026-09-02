@@ -16,7 +16,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 症状：Claude Code 等 `/v1/messages` 客户端流式调用 OpenAI 形状后端（如 `custom_openai`）时，内容能完整收到，但请求被记为错误且 tokens=0，日志里是 `IndexError: list index out of range`
 - 根因：OpenAI 兼容后端会在流末尾发出 `choices: []` 的空帧，而适配器多处裸取 `choices[0]`。空帧有两种来源：OpenAI 规范里 `include_usage` 的 usage-only 尾帧（适配器对流式请求强制开启该选项），以及网关自定义的非标准帧（实测有后端在流末尾追加一个私有类型的计费帧，`usage` 为 null，真实 usage 挂在前一个 `finish_reason` 帧上）。崩溃发生在响应头已发出之后，所以状态码仍是 200，只是缺了 `message_delta` 和 `message_stop`
 - 修复：空 choices 的 chunk 不丢弃，加判空守卫后继续走已有的 usage 合并路径，usage 仍能进 `message_delta`。同类问题在 Responses API 桥接层一并修掉（Azure 前导 `prompt_filter_results` 空帧也走这条路）
-- 上游进展（1.98.0 同步时核对）：`adapters/streaming_iterator.py` 那一处上游已自行修复（PR [#35314](https://github.com/BerriAI/litellm/pull/35314)，走 `_handle_choiceless_chunk` 在裸取前统一跳过空帧，比逐点判空更彻底），该文件已改回上游实现。我们最初跟踪的 PR [#34455](https://github.com/BerriAI/litellm/pull/34455) 未被合并。上游那次只改了这一个文件，`transformation.py` 的 `finish_reason` 裸取与 Responses 桥接层的三处裸取上游仍未防护，故这两个文件的补丁继续保留
+- 上游进展（1.99.1 同步时核对）：`adapters/streaming_iterator.py` 上游已自行修复（PR [#35314](https://github.com/BerriAI/litellm/pull/35314)，走 `_handle_choiceless_chunk` 在两条流式循环开头统一 `continue` 掉空帧，比逐点判空更彻底），我们在该文件里的三处判空已成死代码，整个文件改回上游实现。我们最初跟踪的 PR [#34455](https://github.com/BerriAI/litellm/pull/34455) 未被合并。`transformation.py` 的 `finish_reason` 裸取与 Responses 桥接层的三处裸取（`_is_reasoning_end`、`_ensure_output_item_for_chunk`、`_get_delta_string_from_streaming_choices`）上游仍未防护，且调用点也没有前置守卫，故这两个文件的补丁继续保留
 
 **OpenRouter OpenAI 系列模型兼容性修复** — `llms/openrouter/chat/transformation.py`
 - 修复 Claude Code `Agent` tool schema 中 Anthropic `type:"custom"` 透传导致 OpenRouter 下游 OpenAI/Azure 模型 API 400 的问题
@@ -51,24 +51,37 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 上游未修，无对应 issue / PR
 - 注意：`vision_model` 指向的组不能挂这个 guardrail。识图那次 `router.acompletion` 的 call_type 是 `acompletion`，天然穿过门，一旦该组自身也挂上就会无限递归，guardrail 里没有递归保护
 
-**UI 会话 team sentinel 被当成已删除团队** — `proxy/auth/user_api_key_auth.py`
-- 症状：升级到 1.98.0 后 Admin UI 能登录、能看到页面框架，但所有数据加载不出来，右上角报 `Team doesn't exist in db. Team=litellm-dashboard. Create team via /team/new call.`（404 auth_error）。API 的模型调用完全不受影响，只有 UI 挂
-- 根因：上游 PR [#36837](https://github.com/BerriAI/litellm/pull/36837) 修了一个真实漏洞（team 被删后残留 key 上 `team_models=[]` 会被模型校验读成"无限制"，等于删团队反而放大权限），手段是新增 `TeamNotFoundError` 精确区分"确实不存在"与"读不到"，前者不再允许 token 自带字段兜底。但 `litellm-dashboard`（`UI_SESSION_TOKEN_TEAM_ID`）是设计上永远没有 DB 行的保留 sentinel —— `/team/new` 显式拒绝创建它。于是"查库查不到"对它是常态，却被新逻辑等同于"团队已被删除"。崩在 `_run_centralized_common_checks`，那是所有路由都要过的唯一鉴权关口，所以整站 UI 一起挂
-- 修复：`_token_can_vouch_for_team` 对该 sentinel 直接放行，等价于把这条路径精确退回 1.95.0 的旧行为。只对这一个 id 生效，真实团队的判定不变，不重新引入上游要堵的漏洞（UI 会话 key 的模型访问本就不该被"团队"概念约束）
-- 选型：也可以在 DB 里插一行 `litellm-dashboard` team，但那会让 `user_api_key_auth.py` 的 "UPDATE TEAM VALUES BASED ON CACHED TEAM OBJECT" 段把挂在该 sentinel 下的全部 key 统一按这一行的字段约束（budget / guardrail / object_permission / 组织归属），影响面无法评估，且违反 `/team/new` 设的保留字不变量
-- 上游状态：通用鉴权路径未修、无对应 issue。同类豁免上游已在 `/search_tools/list`（PR [#36061](https://github.com/BerriAI/litellm/pull/36061)，已合并）和 `/search`（PR [#36063](https://github.com/BerriAI/litellm/pull/36063)，open）做过，但都局限在各自业务代码里，没有下沉到 `_run_centralized_common_checks`。这个 bug 对所有自建 litellm 都会犯，值得提 PR 上游
-
-**空回复不写响应缓存** — `caching/caching_handler.py`
+**空回复不写响应缓存** — `caching/caching_handler.py`、`llms/anthropic/experimental_pass_through/messages/response_cache.py`
 - 症状：客户端调用后长时间无输出，之后自动重试全部瞬时返回同样的空回复，会话彻底卡死，只能手动发一句"继续"才恢复
 - 根因：上游偶发静默拒答，回 HTTP 200 加空 `content` 加 `finish_reason: stop`，litellm 判为 success（`attempted_retries: 0`、`error_information: null`，故 `num_retries` 与模型组 fallback 全部绕过）。这个空回复随后被写进响应缓存，默认 TTL 60 秒，于是窗口内每次重试都命中缓存秒回同一个空回复。生产实测同一 request_id 三条记录：首条真实请求耗时 181 秒，随后两条 `cache_hit=True` 各 0.01 秒返回，重试彻底失去意义
 - 修复：`_should_store_result_in_cache` 加一条判空，所有 choices 都没有实质内容时不写缓存。判空覆盖 `content` 之外的 `tool_calls` / `function_call` / `reasoning_content` / `thinking_blocks` / `audio` / `images`，故纯工具调用与纯推理回复不受影响；空格等仍算内容，不猜测语义。该函数是 sync 与 async、流式与非流式四条路径的唯一决策点（流式经 `_add_streaming_response_to_cache` 汇入），改一处全覆盖
 - 注意：这只让重试重新有意义，治不了空回复本身，那个根因在上游
-- 部署状态：生产临时用派生镜像 `v1.98.0-fork.patch.1-cachefix`（在 patch.1 上叠一层 COPY 替换该文件），未发 release、未打 tag。下次大版本随正式 release 构建后即可弃用
+- 1.99.1 同步时扩面：上游 1.99 新增了原生 `/v1/messages` 响应缓存，`anthropic_messages` / `aanthropic_messages` 直接进了 `DEFAULT_CACHING_SUPPORTED_CALL_TYPES`，等于默认打开。它自带的两道跳过判定只看「有没有 `message_stop`」和「是不是 error 帧」，而静默拒答回的正是一条格式完好、带 `message_stop`、也不是 error 的空流，两道都放行。原补丁挂在 `_should_store_result_in_cache` 上，够不着这条新路径，升级即等于把这个已修的生产 bug 重新打开。故补两处：流式在 `response_cache.py` 的 `_persist` 里按 SSE 形状判空（非 text 的内容块一律算内容，text 块要求真有 delta 文本），非流式把 `_is_contentless_result` 从只认 `ModelResponse` 扩到也认 Anthropic Messages 的 content 块数组，认不出的形状一律放行
+- 部署状态：生产曾用派生镜像 `v1.98.0-fork.patch.1-cachefix`（在 patch.1 上叠一层 COPY 替换该文件），未发 release、未打 tag。1.99.1 起随正式 release 构建，该临时镜像可弃用
 - 上游未修，无对应 issue / PR
+
+**只按本地单价计费** — `__init__.py`、`cost_calculator.py`、`litellm_core_utils/litellm_logging.py`
+- 场景：上游是自建网关时，它会回传 `x-litellm-response-cost`，litellm 优先采信这个值，于是本地 `model_info` 里配的单价被覆盖。同一个模型流式走上游价、非流式走本地价，两套口径对不上，用量报表没法看
+- 修复：加 `litellm.always_use_local_pricing` 开关（环境变量 `LITELLM_ALWAYS_USE_LOCAL_PRICING`，默认关）。打开后 `get_response_cost_from_hidden_params` 直接返回 None，`litellm_logging` 里两处采信 `hidden_params["response_cost"]` 的分支一并跳过，计费全部落回本地单价
+- 默认关，不打开时行为与上游完全一致
+
+**预算窗口 reset_at 按 UTC 比较** — `proxy/common_utils/reset_budget_job.py`
+- 症状：key / team 的 budget 窗口在非 UTC 时区的机器上不按时重置
+- 根因：`reset_at` 用 `.replace(tzinfo=None)` 把带偏移的时间戳直接砍成裸时间（拿到的是当地墙钟），却拿去和裸 UTC `datetime.utcnow()` 比，UTC+8 下整整差 8 小时
+- 修复：`reset_at` 统一 `astimezone(timezone.utc)`，`now` 改用 `datetime.now(timezone.utc)`，两边都是 aware UTC
+- 上游未修：1.99.1 里 `_reset_single_window` 仍是 `.replace(tzinfo=None)`，`reset_budget_windows` 仍是 `datetime.utcnow()`
+
+**Anthropic 能力头定向透传** — `proxy/litellm_pre_call_utils.py`
+- 打 `/v1/messages` 时把客户端的 `anthropic-beta` / `anthropic-version` 透传给下游。Claude Code 的工具 / Agent 能力由 beta 头声明，不透传下游就当这些能力不存在。只放这两个非敏感能力头，不做通用头转发
+
+**本地价格表补缺远端** — `litellm_core_utils/get_model_cost_map.py`
+- 远端价格表拉下来后，把本地 `model_prices_and_context_window.json` 里远端还没有的条目补进去。远端优先，本地只补缺，故上游发布某个模型后自动以上游为准
+- 需要它是因为 fork 里加了上游尚未收录的模型（如 `anthropic/deepseek-v4-pro`），不补的话联网拉表会把这些条目整个丢掉
 
 已移除的补丁（保留记录，便于回溯）：
 
 - ~~**Anthropic passthrough 非标准 SSE 帧健壮性**~~ — 我们提交的 PR [#26000](https://github.com/BerriAI/litellm/pull/26000) 已并入上游，本地补丁移除
+- ~~**UI 会话 team sentinel 被当成已删除团队**~~ — 上游 1.99 已在 `_token_can_vouch_for_team` 里加了同语义的 `UI_TEAM_ID` 豁免（`UI_TEAM_ID` 与我们用的 `UI_SESSION_TOKEN_TEAM_ID` 同为 `litellm-dashboard`），判据与我们那版一致，本地补丁移除，该文件已与上游完全一致
 
 ---
 
@@ -319,6 +332,7 @@ curl -X POST 'http://0.0.0.0:4000/v1/chat/completions' \
 | [Clarifai (`clarifai`)](https://docs.litellm.ai/docs/providers/clarifai) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Cloudflare AI Workers (`cloudflare`)](https://docs.litellm.ai/docs/providers/cloudflare_workers) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Codestral (`codestral`)](https://docs.litellm.ai/docs/providers/codestral) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
+| [Cognition (`cognition`)](https://docs.litellm.ai/docs/providers/cognition) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Cohere (`cohere`)](https://docs.litellm.ai/docs/providers/cohere) | ✅ | ✅ | ✅ | ✅ |  |  |  |  |  | ✅ |
 | [Cohere Chat (`cohere_chat`)](https://docs.litellm.ai/docs/providers/cohere) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [CometAPI (`cometapi`)](https://docs.litellm.ai/docs/providers/cometapi) | ✅ | ✅ | ✅ | ✅ |  |  |  |  |  |  |

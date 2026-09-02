@@ -11,11 +11,7 @@ field set to ``True``.
 
 import json
 import os
-import sys
 
-sys.path.insert(
-    0, os.path.abspath("../..")
-)  # Adds the parent directory to the system path
 
 import litellm
 from litellm.utils import (
@@ -118,9 +114,10 @@ class TestDeepSeekModelCostEntries:
             data = json.load(f)
 
         entry = data["anthropic/deepseek-v4-pro"]
+        native = data["deepseek/deepseek-v4-pro"]
         assert entry["litellm_provider"] == "anthropic"
-        assert entry["input_cost_per_token"] == 4.35e-07
-        assert entry["output_cost_per_token"] == 8.7e-07
+        assert entry["input_cost_per_token"] == native["input_cost_per_token"]
+        assert entry["output_cost_per_token"] == native["output_cost_per_token"]
 
 
 # ---------------------------------------------------------------------------
@@ -160,8 +157,9 @@ class TestSupportsResponseSchemaDeepSeek:
             custom_llm_provider="anthropic",
         )
 
-        assert model_info["input_cost_per_token"] == 4.35e-07
-        assert model_info["output_cost_per_token"] == 8.7e-07
+        native = litellm.model_cost["deepseek/deepseek-v4-pro"]
+        assert model_info["input_cost_per_token"] == native["input_cost_per_token"]
+        assert model_info["output_cost_per_token"] == native["output_cost_per_token"]
 
 
 # ---------------------------------------------------------------------------
