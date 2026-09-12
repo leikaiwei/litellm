@@ -351,7 +351,6 @@ class LiteLLMAnthropicMessagesAdapter:
         return [
             "messages",
             "metadata",
-            "stop_sequences",
             "system",
             "tool_choice",
             "tools",
@@ -1124,23 +1123,6 @@ class LiteLLMAnthropicMessagesAdapter:
         if response_format:
             new_kwargs["response_format"] = response_format
 
-    def _translate_stop_sequences_to_openai(
-        self,
-        anthropic_message_request: AnthropicMessagesRequest,
-        new_kwargs: ChatCompletionRequest,
-    ) -> None:
-        """把 Anthropic 的 ``stop_sequences`` 映射成 OpenAI 的 ``stop``。
-
-        没有这一步时 ``stop_sequences`` 会被原样拷进 ``litellm.acompletion``，
-        漏到 OpenAI SDK 抛 ``TypeError: got an unexpected keyword argument
-        'stop_sequences'`` -> 500。``stop`` 是 OpenAI 的标准参数，
-        OpenAI 兼容后端（含 custom_openai）都在 supported_openai_params 里。
-        """
-        stop_sequences: Any = anthropic_message_request.get("stop_sequences")
-        if not stop_sequences:
-            return
-        new_kwargs["stop"] = stop_sequences
-
     def _copy_untranslated_anthropic_params(
         self,
         anthropic_message_request: AnthropicMessagesRequest,
@@ -1222,11 +1204,6 @@ class LiteLLMAnthropicMessagesAdapter:
         )
         ## CONVERT OUTPUT_FORMAT to RESPONSE_FORMAT
         self._translate_output_format_to_openai(
-            anthropic_message_request=anthropic_message_request,
-            new_kwargs=new_kwargs,
-        )
-        ## CONVERT STOP_SEQUENCES to STOP
-        self._translate_stop_sequences_to_openai(
             anthropic_message_request=anthropic_message_request,
             new_kwargs=new_kwargs,
         )
