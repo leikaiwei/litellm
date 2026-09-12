@@ -3,7 +3,7 @@ import { Info, UserPlus } from "lucide-react";
 import { Alert, AlertTitle } from "@/components/shared/Alert";
 import { useForm } from "react-hook-form";
 import { userFilterUICall } from "@/components/networking";
-import { FieldGroup } from "@/components/shared/form/field";
+import { FieldGroup } from "@/components/ui/field";
 import { FormField } from "@/components/shared/form/FormField";
 import { PaginatedSearchSelect } from "@/components/shared/PaginatedSearchSelect";
 import { Button } from "@/components/ui/button";

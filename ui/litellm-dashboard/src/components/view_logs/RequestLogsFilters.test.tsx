@@ -85,6 +85,7 @@ describe("RequestLogsFilters", () => {
     for (const label of [
       "Team ID",
       "Status",
+      "Cache",
       "Key Alias",
       "User ID",
       "End User",
@@ -276,6 +277,29 @@ describe("RequestLogsFilters", () => {
     expect(await screen.findByText(label)).toBeInTheDocument();
   });
 
+  it.each([
+    ["", "All Requests"],
+    ["hit", "Cache Hit"],
+    ["miss", "Cache Miss"],
+  ])("shows the human label on the Cache trigger for %s", async (cacheState, label) => {
+    renderFilters(cacheState === "" ? {} : { [LOG_FILTER_IDS.CACHE_STATUS]: cacheState });
+
+    expect(await screen.findByText(label)).toBeInTheDocument();
+  });
+
+  it.each([
+    ["Cache Hit", "hit"],
+    ["Cache Miss", "miss"],
+  ])("selecting %s sets the cache filter to %s", async (label, expected) => {
+    const user = userEvent.setup();
+    const { set } = renderFilters();
+
+    await user.click(await screen.findByText("All Requests"));
+    await user.click(await screen.findByRole("option", { name: label }));
+
+    expect(set).toHaveBeenCalledWith(LOG_FILTER_IDS.CACHE_STATUS, expected);
+  });
+
   it("stores the raw status code when a labeled error code is picked", async () => {
     const user = userEvent.setup();
     const { set } = renderFilters();
@@ -310,5 +334,15 @@ describe("RequestLogsFilters", () => {
     await user.click(await screen.findByRole("option", { name: "Use custom code: 418" }));
 
     expect(set).toHaveBeenCalledWith(LOG_FILTER_IDS.ERROR_CODE, "418");
+  });
+
+  it("selecting All Requests clears the cache filter", async () => {
+    const user = userEvent.setup();
+    const { set } = renderFilters({ [LOG_FILTER_IDS.CACHE_STATUS]: "hit" });
+
+    await user.click(await screen.findByText("Cache Hit"));
+    await user.click(await screen.findByRole("option", { name: "All Requests" }));
+
+    expect(set).toHaveBeenCalledWith(LOG_FILTER_IDS.CACHE_STATUS, undefined);
   });
 });
