@@ -22,6 +22,7 @@ from litellm.llms.anthropic.experimental_pass_through.context_management import 
 )
 from litellm.llms.anthropic.experimental_pass_through.utils import (
     is_reasoning_auto_summary_enabled,
+    litellm_logging_obj_from_kwargs,
     local_model_name,
 )
 from litellm.types.llms.anthropic_messages.anthropic_response import (
@@ -629,6 +630,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
                 tool_name_mapping=tool_name_mapping,
                 polyfill_result=polyfill_result,
                 is_async=True,
+                litellm_logging_obj=litellm_logging_obj_from_kwargs(kwargs),
             )
             if transformed_stream is not None:
                 return transformed_stream
@@ -763,6 +765,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
                 tool_name_mapping=tool_name_mapping,
                 polyfill_result=polyfill_result,
                 is_async=False,
+                litellm_logging_obj=litellm_logging_obj_from_kwargs(kwargs),
             )
             if transformed_stream is not None:
                 return transformed_stream

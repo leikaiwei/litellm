@@ -18,6 +18,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 修复：空 choices 的 chunk 不丢弃，加判空守卫后继续走已有的 usage 合并路径，usage 仍能进 `message_delta`。同类问题在 Responses API 桥接层一并修掉（Azure 前导 `prompt_filter_results` 空帧也走这条路）
 - 上游进展（1.99.1 同步时核对）：`adapters/streaming_iterator.py` 上游已自行修复（PR [#35314](https://github.com/BerriAI/litellm/pull/35314)，走 `_handle_choiceless_chunk` 在两条流式循环开头统一 `continue` 掉空帧，比逐点判空更彻底），我们在该文件里的三处判空已成死代码，整个文件改回上游实现。我们最初跟踪的 PR [#34455](https://github.com/BerriAI/litellm/pull/34455) 未被合并。`transformation.py` 的 `finish_reason` 裸取与 Responses 桥接层的三处裸取（`_is_reasoning_end`、`_ensure_output_item_for_chunk`、`_get_delta_string_from_streaming_choices`）上游仍未防护，且调用点也没有前置守卫，故这两个文件的补丁继续保留
 - 1.100.1 同步时复核：`transformation.py` 的 `finish_reason` 裸取与 Responses 桥接层那三处仍未防护，调用点也仍无前置守卫，补丁原样保留
+- 1.101.0 同步时复核：结论同上，上游这一版没有动这两处，补丁原样保留
 
 **OpenRouter OpenAI 系列模型兼容性修复** — `llms/openrouter/chat/transformation.py`
 - 修复 Claude Code `Agent` tool schema 中 Anthropic `type:"custom"` 透传导致 OpenRouter 下游 OpenAI/Azure 模型 API 400 的问题
@@ -59,6 +60,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 注意：这只让重试重新有意义，治不了空回复本身，那个根因在上游
 - 1.99.1 同步时扩面：上游 1.99 新增了原生 `/v1/messages` 响应缓存，`anthropic_messages` / `aanthropic_messages` 直接进了 `DEFAULT_CACHING_SUPPORTED_CALL_TYPES`，等于默认打开。它自带的两道跳过判定只看「有没有 `message_stop`」和「是不是 error 帧」，而静默拒答回的正是一条格式完好、带 `message_stop`、也不是 error 的空流，两道都放行。原补丁挂在 `_should_store_result_in_cache` 上，够不着这条新路径，升级即等于把这个已修的生产 bug 重新打开。故补两处：流式在 `response_cache.py` 的 `_persist` 里按 SSE 形状判空（非 text 的内容块一律算内容，text 块要求真有 delta 文本），非流式把 `_is_contentless_result` 从只认 `ModelResponse` 扩到也认 Anthropic Messages 的 content 块数组，认不出的形状一律放行
 - 1.100.1 同步时复核：上游 `_persist` 仍只有那两道判定，`_should_store_result_in_cache` 也没加判空，两处补丁原样保留。上游 1.100 新增的 `test_async_cache_write_completes_when_asyncio_run_closes_the_loop` 拿空 `ModelResponse()` 当样本，正好被本补丁判成空回复而不写缓存，测试跟着失败；它要测的是「写操作能挺过 event loop 关闭」，与内容无关，故把样本换成带 content 的 response，断言不变
+- 1.101.0 同步时复核：上游 `_persist` 与 `_should_store_result_in_cache` 均无变化，两处补丁原样保留
 - 部署状态：生产曾用派生镜像 `v1.98.0-fork.patch.1-cachefix`（在 patch.1 上叠一层 COPY 替换该文件），未发 release、未打 tag。1.99.1 起随正式 release 构建，该临时镜像可弃用
 - 上游未修，无对应 issue / PR
 
@@ -71,7 +73,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 症状：key / team 的 budget 窗口在非 UTC 时区的机器上不按时重置
 - 根因：`reset_at` 用 `.replace(tzinfo=None)` 把带偏移的时间戳直接砍成裸时间（拿到的是当地墙钟），却拿去和裸 UTC `datetime.utcnow()` 比，UTC+8 下整整差 8 小时
 - 修复：`reset_at` 统一 `astimezone(timezone.utc)`，`now` 改用 `datetime.now(timezone.utc)`，两边都是 aware UTC
-- 上游未修：1.100.1 里 `_reset_expired_window` 仍是 `.replace(tzinfo=None)`，`reset_budget_windows` 仍是 `datetime.utcnow()`
+- 上游未修：1.101.0 里 `_reset_expired_window` 仍是 `.replace(tzinfo=None)`，`reset_budget_windows` 仍是 `datetime.utcnow()`
 - 补丁边界（1.100.1 同步时核对过，结论是不用扩大）：同文件里 `_reset_budget_for_litellm_keys_chunk` / `users_chunk` / `teams_chunk` 三处的 `datetime.utcnow()` 不是同一类错位。它们只有两个去向，一是 Prisma 的 where 过滤（`expires` / `budget_reset_at`），prisma-client-py 0.11.0 的 `builder.serialize_datetime` 明确把 naive 当 UTC 再打上 tzinfo，`utcnow()` 与 `now(timezone.utc)` 序列化出的查询字节完全一致；二是 `current_time` 传进 `_reset_budget_common`，而那个函数根本没读这个参数，新的 `budget_reset_at` 来自 `compute_budget_reset_at`，后者内部自己取 aware UTC。窗口那条路之所以真的错，是因为 `reset_at` 存在 JSON 里是**字符串**（带 `+08:00` 偏移），偏移一丢就变成当地墙钟；列字段那条路上 tzinfo 两头都由 Prisma 归一，从没被丢过
 - 遗留隐患（未改）：上面那三处的正确性依赖「naive 即 UTC」这个 Prisma 契约，`datetime.utcnow()` 恰好满足。Python 3.12 起该方法被弃用，若有人顺手改成 `datetime.now()`，在 UTC+8 上会静默变成 8 小时偏差且无测试拦截；安全的现代化写法是 `datetime.now(timezone.utc)`
 
@@ -82,14 +84,13 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 远端价格表拉下来后，把本地 `model_prices_and_context_window.json` 里远端还没有的条目补进去。远端优先，本地只补缺，故上游发布某个模型后自动以上游为准
 - 需要它是因为 fork 里加了上游尚未收录的模型（如 `anthropic/deepseek-v4-pro`），不补的话联网拉表会把这些条目整个丢掉
 
-随合并带进来的上游代码（不是我们的补丁，别当补丁移除）：
-
-- `integrations/otel/` 的 cache token 属性（上游 PR [#38716](https://github.com/BerriAI/litellm/pull/38716)）。它只进了 1.99.x 这条 stable 线，1.100.x 是从 staging 另行分叉的，里面没有。合并到 1.100.1 时我们这边保住了它，所以 `otel/mappers/genai.py`、`otel/model/payloads.py`、`otel/model/semconv.py` 三个文件与上游 1.100.1 有差异。1.100.x 另起了 `integrations/opentelemetry_utils/gen_ai_semconv.py` 走新路径，两者不冲突
+1.101.0 同步核对结论：上游这一版没有吸收上面任何一个补丁，逐文件核对后全部保留。`llms/deepseek/` 与 `llms/openrouter/chat/transformation.py` 上游在 1.100.1 到 1.101.0 之间没有改动；价格表与上游只差 `anthropic/deepseek-v4-pro` 这一条镜像
 
 已移除的补丁（保留记录，便于回溯）：
 
 - ~~**Anthropic passthrough 非标准 SSE 帧健壮性**~~ — 我们提交的 PR [#26000](https://github.com/BerriAI/litellm/pull/26000) 已并入上游，本地补丁移除
 - ~~**UI 会话 team sentinel 被当成已删除团队**~~ — 上游 1.99 已在 `_token_can_vouch_for_team` 里加了同语义的 `UI_TEAM_ID` 豁免（`UI_TEAM_ID` 与我们用的 `UI_SESSION_TOKEN_TEAM_ID` 同为 `litellm-dashboard`），判据与我们那版一致，本地补丁移除，该文件已与上游完全一致
+- ~~**代管的上游 otel cache token 属性**~~ — 这本来就不是我们的补丁，是上游 PR [#38716](https://github.com/BerriAI/litellm/pull/38716)。它当初只进了 1.99.x 这条 stable 线，1.100.x 里没有，所以 1.100.1 同步时由我们保住。1.101.0 已原生自带且实现更完整（多了 `prompt_tokens_details` 兜底取值），`integrations/otel/` 整目录改回上游，与上游差异归零
 
 ---
 
@@ -402,6 +403,8 @@ curl -X POST 'http://0.0.0.0:4000/v1/chat/completions' \
 | [Petals (`petals`)](https://docs.litellm.ai/docs/providers/petals) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Pinstripes (`pinstripes`)](https://docs.litellm.ai/docs/providers/pinstripes) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Predibase (`predibase`)](https://docs.litellm.ai/docs/providers/predibase) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
+| [Qwen AI Platform (`qwen_ai_platform`)](https://docs.litellm.ai/docs/providers/qwencloud) | ✅ | ✅ | ✅ | ✅ | ✅ |  |  |  |  | ✅ |
+| [QwenCloud (`qwencloud`)](https://docs.litellm.ai/docs/providers/qwencloud) | ✅ | ✅ | ✅ | ✅ | ✅ |  |  |  |  | ✅ |
 | [Recraft (`recraft`)](https://docs.litellm.ai/docs/providers/recraft) |  |  |  |  | ✅ |  |  |  |  |  |
 | [Replicate (`replicate`)](https://docs.litellm.ai/docs/providers/replicate) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Sagemaker Chat (`sagemaker_chat`)](https://docs.litellm.ai/docs/providers/aws_sagemaker) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
