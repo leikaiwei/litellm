@@ -12,13 +12,14 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 修复 Anthropic thinking_blocks 到 DeepSeek reasoning_content 的转换
 - 修复 Anthropic 兼容端点 fallback（如 qwen/claude 回退到 deepseek）时，历史里外来 thinking 块导致 DeepSeek 400 的问题；命中该 400 时自动修复 assistant 历史（redacted_thinking 转占位 thinking 块、给含 tool_use 却无 thinking 块的消息注入占位块）并重试，直连场景不受影响
 
-**Anthropic 流式适配器空 choices 防护** — `llms/anthropic/experimental_pass_through/adapters/transformation.py`、`responses/litellm_completion_transformation/streaming_iterator.py`
+**Anthropic 流式适配器空 choices 防护** — `llms/anthropic/experimental_pass_through/adapters/transformation.py`
 - 症状：Claude Code 等 `/v1/messages` 客户端流式调用 OpenAI 形状后端（如 `custom_openai`）时，内容能完整收到，但请求被记为错误且 tokens=0，日志里是 `IndexError: list index out of range`
 - 根因：OpenAI 兼容后端会在流末尾发出 `choices: []` 的空帧，而适配器多处裸取 `choices[0]`。空帧有两种来源：OpenAI 规范里 `include_usage` 的 usage-only 尾帧（适配器对流式请求强制开启该选项），以及网关自定义的非标准帧（实测有后端在流末尾追加一个私有类型的计费帧，`usage` 为 null，真实 usage 挂在前一个 `finish_reason` 帧上）。崩溃发生在响应头已发出之后，所以状态码仍是 200，只是缺了 `message_delta` 和 `message_stop`
 - 修复：空 choices 的 chunk 不丢弃，加判空守卫后继续走已有的 usage 合并路径，usage 仍能进 `message_delta`。同类问题在 Responses API 桥接层一并修掉（Azure 前导 `prompt_filter_results` 空帧也走这条路）
 - 上游进展（1.99.1 同步时核对）：`adapters/streaming_iterator.py` 上游已自行修复（PR [#35314](https://github.com/BerriAI/litellm/pull/35314)，走 `_handle_choiceless_chunk` 在两条流式循环开头统一 `continue` 掉空帧，比逐点判空更彻底），我们在该文件里的三处判空已成死代码，整个文件改回上游实现。我们最初跟踪的 PR [#34455](https://github.com/BerriAI/litellm/pull/34455) 未被合并。`transformation.py` 的 `finish_reason` 裸取与 Responses 桥接层的三处裸取（`_is_reasoning_end`、`_ensure_output_item_for_chunk`、`_get_delta_string_from_streaming_choices`）上游仍未防护，且调用点也没有前置守卫，故这两个文件的补丁继续保留
 - 1.100.1 同步时复核：`transformation.py` 的 `finish_reason` 裸取与 Responses 桥接层那三处仍未防护，调用点也仍无前置守卫，补丁原样保留
 - 1.101.0 同步时复核：结论同上，上游这一版没有动这两处，补丁原样保留
+- 1.103.1 同步时复核：我们提交的 PR [#34455](https://github.com/BerriAI/litellm/pull/34455) 已于 09-17 并入上游，覆盖的正是 Responses 桥接层那三处裸取，`responses/litellm_completion_transformation/streaming_iterator.py` 合并后与上游完全一致，该文件不再算补丁（上面「#34455 未被合并」是当时的状态）。`transformation.py` 的 `finish_reason` 判空上游仍没有，保留；但它的两个调用点都在 `_handle_choiceless_chunk` 之后，空帧到不了这里，现在只是纵深防护
 
 **OpenRouter OpenAI 系列模型兼容性修复** — `llms/openrouter/chat/transformation.py`
 - 修复 Claude Code `Agent` tool schema 中 Anthropic `type:"custom"` 透传导致 OpenRouter 下游 OpenAI/Azure 模型 API 400 的问题
@@ -61,6 +62,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 1.99.1 同步时扩面：上游 1.99 新增了原生 `/v1/messages` 响应缓存，`anthropic_messages` / `aanthropic_messages` 直接进了 `DEFAULT_CACHING_SUPPORTED_CALL_TYPES`，等于默认打开。它自带的两道跳过判定只看「有没有 `message_stop`」和「是不是 error 帧」，而静默拒答回的正是一条格式完好、带 `message_stop`、也不是 error 的空流，两道都放行。原补丁挂在 `_should_store_result_in_cache` 上，够不着这条新路径，升级即等于把这个已修的生产 bug 重新打开。故补两处：流式在 `response_cache.py` 的 `_persist` 里按 SSE 形状判空（非 text 的内容块一律算内容，text 块要求真有 delta 文本），非流式把 `_is_contentless_result` 从只认 `ModelResponse` 扩到也认 Anthropic Messages 的 content 块数组，认不出的形状一律放行
 - 1.100.1 同步时复核：上游 `_persist` 仍只有那两道判定，`_should_store_result_in_cache` 也没加判空，两处补丁原样保留。上游 1.100 新增的 `test_async_cache_write_completes_when_asyncio_run_closes_the_loop` 拿空 `ModelResponse()` 当样本，正好被本补丁判成空回复而不写缓存，测试跟着失败；它要测的是「写操作能挺过 event loop 关闭」，与内容无关，故把样本换成带 content 的 response，断言不变
 - 1.101.0 同步时复核：上游 `_persist` 与 `_should_store_result_in_cache` 均无变化，两处补丁原样保留
+- 1.103.1 同步时复核：结论同上，两处补丁原样保留
 - 部署状态：生产曾用派生镜像 `v1.98.0-fork.patch.1-cachefix`（在 patch.1 上叠一层 COPY 替换该文件），未发 release、未打 tag。1.99.1 起随正式 release 构建，该临时镜像可弃用
 - 上游未修，无对应 issue / PR
 
@@ -73,7 +75,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 症状：key / team 的 budget 窗口在非 UTC 时区的机器上不按时重置
 - 根因：`reset_at` 用 `.replace(tzinfo=None)` 把带偏移的时间戳直接砍成裸时间（拿到的是当地墙钟），却拿去和裸 UTC `datetime.utcnow()` 比，UTC+8 下整整差 8 小时
 - 修复：`reset_at` 统一 `astimezone(timezone.utc)`，`now` 改用 `datetime.now(timezone.utc)`，两边都是 aware UTC
-- 上游未修：1.101.0 里 `_reset_expired_window` 仍是 `.replace(tzinfo=None)`，`reset_budget_windows` 仍是 `datetime.utcnow()`
+- 上游未修：1.103.1 里 `_reset_expired_window` 仍是 `.replace(tzinfo=None)`，`reset_budget_windows` 仍是 `datetime.utcnow()`
 - 补丁边界（1.100.1 同步时核对过，结论是不用扩大）：同文件里 `_reset_budget_for_litellm_keys_chunk` / `users_chunk` / `teams_chunk` 三处的 `datetime.utcnow()` 不是同一类错位。它们只有两个去向，一是 Prisma 的 where 过滤（`expires` / `budget_reset_at`），prisma-client-py 0.11.0 的 `builder.serialize_datetime` 明确把 naive 当 UTC 再打上 tzinfo，`utcnow()` 与 `now(timezone.utc)` 序列化出的查询字节完全一致；二是 `current_time` 传进 `_reset_budget_common`，而那个函数根本没读这个参数，新的 `budget_reset_at` 来自 `compute_budget_reset_at`，后者内部自己取 aware UTC。窗口那条路之所以真的错，是因为 `reset_at` 存在 JSON 里是**字符串**（带 `+08:00` 偏移），偏移一丢就变成当地墙钟；列字段那条路上 tzinfo 两头都由 Prisma 归一，从没被丢过
 - 遗留隐患（未改）：上面那三处的正确性依赖「naive 即 UTC」这个 Prisma 契约，`datetime.utcnow()` 恰好满足。Python 3.12 起该方法被弃用，若有人顺手改成 `datetime.now()`，在 UTC+8 上会静默变成 8 小时偏差且无测试拦截；安全的现代化写法是 `datetime.now(timezone.utc)`
 
@@ -83,13 +85,15 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 **本地价格表补缺远端** — `litellm_core_utils/get_model_cost_map.py`
 - 远端价格表拉下来后，把本地 `model_prices_and_context_window.json` 里远端还没有的条目补进去。远端优先，本地只补缺，故上游发布某个模型后自动以上游为准
 - 需要它是因为 fork 里加了上游尚未收录的模型（如 `anthropic/deepseek-v4-pro`），不补的话联网拉表会把这些条目整个丢掉
+- 1.103.1 同步时扩面：上游把远端加载重构成三条路径，启动时同步首拉（`get_model_cost_map`）、首拉遇瞬时错误后的后台重试（`_retry_remote_fetch_in_background`）、proxy 运行期重载（`refetch_model_cost_map`）。原补丁只挂在同步首拉上，另外两条一旦生效就会用纯远端表整体替换，把本地条目丢掉。现在三处统一走 `_finalize_remote_model_cost_map`，测试覆盖首拉与运行期重载两条入口
 
-1.101.0 同步核对结论：上游这一版没有吸收上面任何一个补丁，逐文件核对后全部保留。`llms/deepseek/` 与 `llms/openrouter/chat/transformation.py` 上游在 1.100.1 到 1.101.0 之间没有改动；价格表与上游只差 `anthropic/deepseek-v4-pro` 这一条镜像
+1.103.1 同步核对结论：上游吸收了一处（Responses 桥接层空 choices 防护，即我们的 PR #34455），其余逐文件核对后全部保留，与上游有差异的文件 43 -> 42（不含 `local_` 目录）。`llms/openrouter/chat/transformation.py` 上游在 1.101.0 到 1.103.1 之间没有改动；`llms/deepseek/messages/transformation.py` 上游只给 beta 头注入多传了一个 `messages` 参数，而 fork 的实现一直不做 beta 头注入，沿用我方版本。价格表与上游只差 `anthropic/deepseek-v4-pro` 这一条镜像；上游给 native 的 `deepseek/deepseek-v4-pro` 新增了 `off_peak_pricing`（错峰折扣），镜像未跟，因为那是 DeepSeek 官方直连的计费规则。上游删掉了 `test_deepseek_model_metadata.py` 里一批 deepseek-chat / reasoner 的断言，我们只补回自己那三条镜像条目测试
 
 已移除的补丁（保留记录，便于回溯）：
 
 - ~~**Anthropic passthrough 非标准 SSE 帧健壮性**~~ — 我们提交的 PR [#26000](https://github.com/BerriAI/litellm/pull/26000) 已并入上游，本地补丁移除
 - ~~**UI 会话 team sentinel 被当成已删除团队**~~ — 上游 1.99 已在 `_token_can_vouch_for_team` 里加了同语义的 `UI_TEAM_ID` 豁免（`UI_TEAM_ID` 与我们用的 `UI_SESSION_TOKEN_TEAM_ID` 同为 `litellm-dashboard`），判据与我们那版一致，本地补丁移除，该文件已与上游完全一致
+- ~~**Responses 桥接层空 choices 防护**~~ — `responses/litellm_completion_transformation/streaming_iterator.py` 里 `_is_reasoning_end`、`_ensure_output_item_for_chunk`、`_get_delta_string_from_streaming_choices` 三处判空。我们提交的 PR [#34455](https://github.com/BerriAI/litellm/pull/34455) 已并入上游，1.103.1 起该文件与上游一致。回归测试 `test_empty_choices_streaming_iterator.py` 保留
 - ~~**代管的上游 otel cache token 属性**~~ — 这本来就不是我们的补丁，是上游 PR [#38716](https://github.com/BerriAI/litellm/pull/38716)。它当初只进了 1.99.x 这条 stable 线，1.100.x 里没有，所以 1.100.1 同步时由我们保住。1.101.0 已原生自带且实现更完整（多了 `prompt_tokens_details` 兜底取值），`integrations/otel/` 整目录改回上游，与上游差异归零
 
 ---
@@ -310,6 +314,8 @@ curl -X POST 'http://0.0.0.0:4000/v1/chat/completions' \
   }
 }
 ```
+
+For MCP OAuth, an upstream may advertise dynamic client registration but refuse requests with HTTP 401 or 403. If the provider requires a pre-registered OAuth app, configure its `credentials.client_id` and, when required, `credentials.client_secret` on the MCP server. This skips dynamic registration in the gateway sign-in flow. The provider must approve the app for MCP access; reaching its authorization page does not establish that login or tool calls will succeed
 
 [**Docs: MCP Gateway**](https://docs.litellm.ai/docs/mcp)
 
@@ -680,9 +686,8 @@ For detailed contributing guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
 LiteLLM follows the [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html).
 
 Our automated checks include:
-- **Black** for code formatting
-- **Ruff** for linting and code quality
-- **MyPy** for type checking
+- **Ruff** for formatting, linting, and code quality
+- **basedpyright** for type checking
 - **Circular import detection**
 - **Import safety checks**
 

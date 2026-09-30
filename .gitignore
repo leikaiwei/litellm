@@ -148,3 +148,6 @@ crash.*.log
 
 ui/litellm-dashboard/out/
 litellm.log
+
+.coverage-rust
+coverage-rust.xml

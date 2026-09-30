@@ -21,11 +21,12 @@ from types import MappingProxyType
 import httpx
 import pytest
 import respx
+from openai.types.batch import BatchRequestCounts
 
 
 import litellm
 import litellm.batches.batch_utils as bu
-from litellm.types.utils import Usage
+from litellm.types.utils import LiteLLMBatch, Usage
 
 # --------------------------------------------------------------------------- #
 # Builders for batch OUTPUT file rows.
@@ -277,6 +278,8 @@ def test_extract_credentials_all_supported_keys():
         "vertex_credentials",
         "gcs_bucket_name",
         "bucket_name",
+        "s3_endpoint_url",
+        "s3_region_name",
         "timeout",
         "max_retries",
     }
@@ -489,7 +492,9 @@ def test_aggregate_counts_successful_and_failed_requests(monkeypatch):
 
 
 def test_aggregate_returns_batch_cost_usage_result_dataclass(monkeypatch):
-    monkeypatch.setattr(litellm, "completion_cost", lambda **kw: 1.0)
+    import litellm.cost_calculator as cc
+
+    monkeypatch.setattr(cc, "batch_cost_calculator", lambda **kw: (0.4, 0.6))
     result = bu._aggregate_batch_cost_usage_models(
         entries=[_success_row(usage=_usage(10, 5))], custom_llm_provider="openai"
     )
@@ -500,6 +505,7 @@ def test_aggregate_returns_batch_cost_usage_result_dataclass(monkeypatch):
         1,
         0,
     )
+    assert (result.prompt_cost, result.completion_cost) == (0.4, 0.6)
 
 
 # =========================================================================== #
@@ -507,15 +513,17 @@ def test_aggregate_returns_batch_cost_usage_result_dataclass(monkeypatch):
 # =========================================================================== #
 
 
-def test_cost_from_content_completion_cost_path(monkeypatch):
-    # model_info is None -> litellm.completion_cost per successful row.
+def test_cost_without_model_info_prices_each_row_by_its_response_model(monkeypatch):
+    # model_info is None -> batch_cost_calculator per successful row, model from the response body.
+    import litellm.cost_calculator as cc
+
     calls = []
 
-    def _completion_cost(**kw):
+    def _batch_cost(**kw):
         calls.append(kw)
-        return 0.5
+        return (0.3, 0.2)
 
-    monkeypatch.setattr(litellm, "completion_cost", _completion_cost)
+    monkeypatch.setattr(cc, "batch_cost_calculator", _batch_cost)
     rows = [
         _success_row(usage=_usage(10, 5)),
         _failed_row(),  # excluded -> not costed
@@ -524,8 +532,10 @@ def test_cost_from_content_completion_cost_path(monkeypatch):
 
     result = bu._aggregate_batch_cost_usage_models(entries=rows, custom_llm_provider="openai")
 
-    assert result.cost == 1.0  # 2 successful * 0.5
+    assert result.cost == pytest.approx(1.0)  # 2 successful * (0.3 + 0.2)
+    assert (result.prompt_cost, result.completion_cost) == (pytest.approx(0.6), pytest.approx(0.4))
     assert len(calls) == 2  # failed row not costed
+    assert all(call["model"] == "gpt-4o" and call["model_info"] is None for call in calls)
     assert result.successful_requests == 2
     assert result.failed_requests == 1
 
@@ -578,7 +588,9 @@ def test_aggregate_consumes_entries_in_a_single_pass(monkeypatch):
     """A one-shot generator: any implementation that iterates the entries twice
     (e.g. separate cost and usage passes) sees nothing on the second pass and
     returns wrong totals for at least one of cost/usage/models."""
-    monkeypatch.setattr(litellm, "completion_cost", lambda **kw: 0.5)
+    import litellm.cost_calculator as cc
+
+    monkeypatch.setattr(cc, "batch_cost_calculator", lambda **kw: (0.25, 0.25))
     one_shot = (row for row in [_success_row(usage=_usage(10, 5)), _failed_row(), _success_row(usage=_usage(20, 10))])
 
     result = bu._aggregate_batch_cost_usage_models(entries=one_shot, custom_llm_provider="openai")
@@ -635,9 +647,7 @@ async def test_calculate_vertex_disable_transform_needs_model_name(monkeypatch):
         lambda content, model: pytest.fail("raw vertex path should not run"),
     )
 
-    result = await bu.calculate_batch_cost_and_usage(
-        file_content_dictionary=[], custom_llm_provider="vertex_ai"
-    )
+    result = await bu.calculate_batch_cost_and_usage(file_content_dictionary=[], custom_llm_provider="vertex_ai")
     assert result.cost == 0.0
     assert result.usage.total_tokens == 0
     assert result.models == []
@@ -683,6 +693,38 @@ def test_vertex_cost_and_usage_aggregation(monkeypatch):
     )
     assert result.successful_requests == 2
     assert result.failed_requests == 0
+
+
+def test_vertex_batch_usage_preserves_modality_token_details(monkeypatch):
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "vertex_ai/gemini-embedding-2",
+        {
+            "input_cost_per_token_batches": 1e-7,
+            "input_cost_per_audio_token_batches": 3.25e-6,
+            "input_cost_per_image_token_batches": 2.25e-7,
+            "input_cost_per_video_token_batches": 6e-6,
+        },
+    )
+    responses = [
+        {
+            "response": {
+                "usageMetadata": {
+                    "promptTokenCount": 84,
+                    "candidatesTokenCount": 0,
+                    "totalTokenCount": 84,
+                    "promptTokensDetails": [
+                        {"modality": "AUDIO", "tokenCount": 64},
+                        {"modality": "TEXT", "tokenCount": 20},
+                    ],
+                }
+            }
+        }
+    ]
+
+    result = bu.calculate_vertex_ai_batch_cost_and_usage(responses, "gemini-embedding-2")
+
+    assert result.prompt_cost == pytest.approx(64 * 3.25e-6 + 20 * 1e-7)
 
 
 def test_vertex_cost_skips_none_response_body(monkeypatch):
@@ -753,12 +795,15 @@ def test_vertex_cost_error_in_line_is_swallowed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_calculate_batch_cost_and_usage_orchestration(monkeypatch):
+    import litellm.cost_calculator as cc
+
     rows = [_success_row(model="gpt-4o", usage=_usage(10, 5))]
-    monkeypatch.setattr(litellm, "completion_cost", lambda **kw: 2.5)
+    monkeypatch.setattr(cc, "batch_cost_calculator", lambda **kw: (1.5, 1.0))
 
     result = await bu.calculate_batch_cost_and_usage(file_content_dictionary=rows, custom_llm_provider="openai")
 
     assert result.cost == 2.5
+    assert (result.prompt_cost, result.completion_cost) == (1.5, 1.0)
     assert (result.usage.prompt_tokens, result.usage.completion_tokens, result.usage.total_tokens) == (10, 5, 15)
     assert result.models == ["gpt-4o"]
 
@@ -1107,8 +1152,10 @@ async def test_handle_completed_batch_orchestration(monkeypatch):
     async def fake_fetch(batch, custom_llm_provider, litellm_params=None):
         return _vertex_jsonl(rows)
 
+    import litellm.cost_calculator as cc
+
     monkeypatch.setattr(bu, "_fetch_batch_output_file_content", fake_fetch)
-    monkeypatch.setattr(litellm, "completion_cost", lambda **kw: 3.3)
+    monkeypatch.setattr(cc, "batch_cost_calculator", lambda **kw: (2.0, 1.3))
 
     result = await bu._handle_completed_batch(_batch("of"), custom_llm_provider="openai")
 
@@ -1235,6 +1282,7 @@ async def test_handle_completed_batch_no_output_file_is_zero(monkeypatch):
     result set - zero cost, zero usage, no models - instead of letting the file
     fetch raise "Output file id is None" on every aretrieve_batch logging poll.
     """
+
     # The output-file fetch must not even be attempted when there is no output file.
     async def _must_not_fetch(*args, **kwargs):
         pytest.fail("_fetch_batch_output_file_content should not be called")
@@ -1361,7 +1409,10 @@ def test_anthropic_response_body_is_result_message():
 
 
 def test_anthropic_usage_conversion_includes_cache_tokens():
-    body = {"model": "claude-sonnet-4-5-20250929", "usage": _anthropic_usage(1000, 200, cache_creation=2000, cache_read=8000)}
+    body = {
+        "model": "claude-sonnet-4-5-20250929",
+        "usage": _anthropic_usage(1000, 200, cache_creation=2000, cache_read=8000),
+    }
     usage = bu._get_batch_job_usage_from_response_body(body, custom_llm_provider="anthropic")
     assert usage.prompt_tokens == 11000
     assert usage.completion_tokens == 200
@@ -1376,7 +1427,9 @@ def test_bedrock_model_output_line_success_check():
         "modelOutput": {"model": "claude-sonnet-4-6", "usage": {"input_tokens": 13, "output_tokens": 5}},
     }
     assert bu._batch_response_was_successful(row, custom_llm_provider="bedrock") is True
-    assert bu._get_response_from_batch_job_output_file(row, custom_llm_provider="bedrock")["model"] == "claude-sonnet-4-6"
+    assert (
+        bu._get_response_from_batch_job_output_file(row, custom_llm_provider="bedrock")["model"] == "claude-sonnet-4-6"
+    )
 
 
 def test_bedrock_cost_uses_deployment_model_name():
@@ -1430,7 +1483,13 @@ def test_total_usage_without_cache_tokens_has_no_prompt_details(monkeypatch):
     rows = [
         {
             "custom_id": "req-1",
-            "response": {"status_code": 200, "body": {"model": "gpt-5.2", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}},
+            "response": {
+                "status_code": 200,
+                "body": {
+                    "model": "gpt-5.2",
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                },
+            },
         }
     ]
     result = bu._aggregate_batch_cost_usage_models(entries=rows, custom_llm_provider="openai")
@@ -1472,7 +1531,9 @@ def test_anthropic_cost_without_model_info_uses_batch_cost_calculator(monkeypatc
         lambda **kw: pytest.fail("anthropic rows must not go through completion_cost"),
     )
 
-    result = bu._aggregate_batch_cost_usage_models(entries=[_anthropic_succeeded_row()], custom_llm_provider="anthropic")
+    result = bu._aggregate_batch_cost_usage_models(
+        entries=[_anthropic_succeeded_row()], custom_llm_provider="anthropic"
+    )
 
     assert result.cost == pytest.approx(0.3)
     assert seen[0]["model"] == "claude-sonnet-4-5-20250929"
@@ -1507,7 +1568,11 @@ async def test_calculate_batch_cost_and_usage_anthropic_end_to_end():
     )
 
     assert result.cost == pytest.approx(1000 * 3e-6 / 2 + 8000 * 3e-7 / 2 + 2000 * 3.75e-6 / 2 + 200 * 15e-6 / 2)
-    assert (result.usage.prompt_tokens, result.usage.completion_tokens, result.usage.total_tokens) == (11000, 200, 11200)
+    assert (result.usage.prompt_tokens, result.usage.completion_tokens, result.usage.total_tokens) == (
+        11000,
+        200,
+        11200,
+    )
     assert result.models == ["claude-sonnet-4-5"]
 
 
@@ -1623,8 +1688,6 @@ async def test_handle_completed_bedrock_batch_prices_from_deployment_model(monke
     )
 
     assert (result.usage.prompt_tokens, result.usage.completion_tokens, result.usage.total_tokens) == (1800, 1000, 2800)
-    # 3e-06 / 1.5e-05 on-demand, halved for batch.
-    assert result.cost == pytest.approx(1800 * 3e-06 / 2 + 1000 * 1.5e-05 / 2)
 
     # The response model alone cannot price a bedrock batch: this is the $0 bug.
     zero_result = await bu._handle_completed_batch(
@@ -1674,7 +1737,10 @@ async def test_handle_completed_batch_honors_deployment_pricing(monkeypatch) -> 
 
 
 def test_bedrock_converse_shaped_batch_usage_is_parsed():
-    body = {"model": "us.amazon.nova-lite-v1:0", "usage": {"inputTokens": 2202, "outputTokens": 540, "totalTokens": 2742}}
+    body = {
+        "model": "us.amazon.nova-lite-v1:0",
+        "usage": {"inputTokens": 2202, "outputTokens": 540, "totalTokens": 2742},
+    }
     usage = bu._get_batch_job_usage_from_response_body(body, custom_llm_provider="bedrock")
     assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (2202, 540, 2742)
 
@@ -1710,6 +1776,44 @@ def test_bedrock_anthropic_shaped_batch_usage_still_parsed():
     assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (18, 10, 28)
 
 
+def test_bedrock_titan_embedding_batch_usage_is_parsed():
+    """Titan embedding batch lines carry a top-level inputTextTokenCount and no usage block."""
+    body = {"embedding": [0.1, 0.2], "embeddingsByType": {"float": [0.1, 0.2]}, "inputTextTokenCount": 17}
+    usage = bu._get_batch_job_usage_from_response_body(body, custom_llm_provider="bedrock")
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (17, 0, 17)
+
+
+def test_bedrock_titan_embedding_batch_is_billed():
+    """Binary embedding rows carry only embeddingsByType and must bill like float rows."""
+    rows = [
+        {"recordId": "0", "modelOutput": {"embedding": [0.1], "inputTextTokenCount": 10}},
+        {"recordId": "1", "modelOutput": {"embeddingsByType": {"binary": [1, 0]}, "inputTextTokenCount": 7}},
+    ]
+    result = bu._aggregate_batch_cost_usage_models(
+        entries=rows,
+        custom_llm_provider="bedrock",
+        model_name="amazon.titan-embed-text-v2:0",
+        model_info={"input_cost_per_token_batches": 1e-6, "output_cost_per_token_batches": 0.0},
+    )
+    assert (result.usage.prompt_tokens, result.usage.completion_tokens, result.usage.total_tokens) == (17, 0, 17)
+    assert result.cost == pytest.approx(17 * 1e-6)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"embedding": [0.1], "inputTextTokenCount": "17"},
+        {"embedding": [0.1], "inputTextTokenCount": True},
+        {"embedding": [0.1], "inputTextTokenCount": None},
+        {"results": [{"outputText": "hi", "tokenCount": 2}], "inputTextTokenCount": 17},
+    ],
+)
+def test_bedrock_input_text_token_count_outside_embedding_lines_is_not_billed(body):
+    """Only embedding lines are parsed here; Titan text generation lines are left as they were."""
+    usage = bu._get_batch_job_usage_from_response_body(body, custom_llm_provider="bedrock")
+    assert usage.total_tokens == 0
+
+
 def test_unparsable_bedrock_batch_usage_warns(caplog):
     """An unrecognized usage shape must be visible, not a silent $0."""
     body = {"model": "amazon.titan-text-lite-v1", "usage": {"inputTextTokenCount": 42}}
@@ -1718,3 +1822,182 @@ def test_unparsable_bedrock_batch_usage_warns(caplog):
     assert usage.total_tokens == 0
     assert "does not understand" in caplog.text
     assert "inputTextTokenCount" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# batch_cost_is_final
+# --------------------------------------------------------------------------- #
+
+
+def _retrieved_batch(
+    status: str, output_file_id: str | None = None, counts: BatchRequestCounts | None = None
+) -> LiteLLMBatch:
+    return LiteLLMBatch(
+        id="batch_abc",
+        completion_window="24h",
+        created_at=1,
+        endpoint="/v1/chat/completions",
+        input_file_id="file-in",
+        object="batch",
+        status="validating",
+        output_file_id=output_file_id,
+        request_counts=counts,
+    ).model_copy(update={"status": status})
+
+
+class TestBatchCostIsFinal:
+    """Every retrieve of one batch writes the same spend row, so the first retrieve
+    that prices it decides the row for good. A poll before the output exists must
+    therefore not count as final: pricing it recorded $0 and pinned it (LIT-7048)."""
+
+    @pytest.mark.parametrize("status", ["validating", "in_progress", "finalizing", "cancelling"])
+    def test_in_flight_batch_is_not_final(self, status):
+        assert bu.batch_cost_is_final(_retrieved_batch(status)) is False
+
+    @pytest.mark.parametrize("status", ["completed", "complete"])
+    def test_completed_with_output_is_final(self, status):
+        assert bu.batch_cost_is_final(_retrieved_batch(status, output_file_id="file-out")) is True
+
+    def test_completed_without_output_and_unknown_counts_is_not_final(self):
+        assert bu.batch_cost_is_final(_retrieved_batch("completed")) is False
+
+    def test_completed_without_output_and_zero_counts_is_not_final(self):
+        counts = BatchRequestCounts(total=0, completed=0, failed=0)
+        assert bu.batch_cost_is_final(_retrieved_batch("completed", counts=counts)) is False
+
+    def test_completed_without_output_but_successful_lines_is_not_final(self):
+        counts = BatchRequestCounts(total=2, completed=2, failed=0)
+        assert bu.batch_cost_is_final(_retrieved_batch("completed", counts=counts)) is False
+
+    @pytest.mark.parametrize("status", ["completed", "complete"])
+    def test_completed_without_output_and_every_line_failed_is_final(self, status):
+        counts = BatchRequestCounts(total=2, completed=0, failed=2)
+        assert bu.batch_cost_is_final(_retrieved_batch(status, counts=counts)) is True
+
+    @pytest.mark.parametrize("status", ["failed", "expired", "cancelled"])
+    def test_other_terminal_statuses_are_final(self, status):
+        assert bu.batch_cost_is_final(_retrieved_batch(status)) is True
+
+
+def _ocr_row(pages_processed, annotation_pages=None, model="mistral-ocr-latest"):
+    usage_info = {"pages_processed": pages_processed, "doc_size_bytes": 4096}
+    if annotation_pages is not None:
+        usage_info["pages_processed_annotation"] = annotation_pages
+    return _success_row(
+        model=model, pages=[{"index": i, "markdown": "x"} for i in range(pages_processed)], usage_info=usage_info
+    )
+
+
+def test_ocr_rows_are_priced_per_page_at_batch_rate(monkeypatch):
+    monkeypatch.setattr(
+        litellm,
+        "get_model_info",
+        lambda model, custom_llm_provider=None: {"ocr_cost_per_page": 0.004, "ocr_cost_per_page_batches": 0.002},
+    )
+    result = bu._aggregate_batch_cost_usage_models(
+        entries=[_ocr_row(3), _ocr_row(5), _failed_row(model="mistral-ocr-latest")],
+        custom_llm_provider="mistral",
+        model_name="mistral/mistral-ocr-latest",
+    )
+    assert result.cost == pytest.approx(8 * 0.002)
+    assert result.prompt_cost == pytest.approx(8 * 0.002)
+    assert result.completion_cost == 0.0
+    assert (result.successful_requests, result.failed_requests) == (2, 1)
+    assert result.usage.total_tokens == 0
+    assert result.models == ["mistral/mistral-ocr-latest"]
+
+
+def test_ocr_rows_fall_back_to_sync_page_rate_without_batch_price(monkeypatch):
+    monkeypatch.setattr(litellm, "get_model_info", lambda model, custom_llm_provider=None: {"ocr_cost_per_page": 0.004})
+    result = bu._aggregate_batch_cost_usage_models(entries=[_ocr_row(2)], custom_llm_provider="mistral")
+    assert result.cost == pytest.approx(2 * 0.004)
+
+
+def test_ocr_rows_bill_annotation_pages_separately(monkeypatch):
+    monkeypatch.setattr(
+        litellm,
+        "get_model_info",
+        lambda model, custom_llm_provider=None: {
+            "ocr_cost_per_page_batches": 0.002,
+            "annotation_cost_per_page_batches": 0.0025,
+        },
+    )
+    result = bu._aggregate_batch_cost_usage_models(
+        entries=[_ocr_row(4, annotation_pages=4)], custom_llm_provider="mistral"
+    )
+    assert result.cost == pytest.approx(4 * 0.002 + 4 * 0.0025)
+
+
+def test_ocr_rows_use_deployment_model_info_pricing_over_cost_map(monkeypatch):
+    monkeypatch.setattr(
+        litellm, "get_model_info", lambda model, custom_llm_provider=None: pytest.fail("cost map must not be consulted")
+    )
+    result = bu._aggregate_batch_cost_usage_models(
+        entries=[_ocr_row(10)],
+        custom_llm_provider="mistral",
+        model_info={"ocr_cost_per_page_batches": 0.001},
+    )
+    assert result.cost == pytest.approx(0.01)
+
+
+def test_ocr_rows_keep_the_published_page_rate_when_the_deployment_prices_only_annotations(monkeypatch):
+    monkeypatch.setattr(
+        litellm,
+        "get_model_info",
+        lambda model, custom_llm_provider=None: {
+            "ocr_cost_per_page_batches": 0.002,
+            "annotation_cost_per_page_batches": 0.0025,
+        },
+    )
+    result = bu._aggregate_batch_cost_usage_models(
+        entries=[_ocr_row(4, annotation_pages=4)],
+        custom_llm_provider="mistral",
+        model_info={"annotation_cost_per_page_batches": 0.01},
+    )
+    assert result.cost == pytest.approx(4 * 0.002 + 4 * 0.01)
+
+
+def test_ocr_rows_keep_the_deployment_page_rate_when_the_unmapped_model_has_no_annotation_price(monkeypatch):
+    def _unmapped(model, custom_llm_provider=None):
+        raise Exception(f"This model isn't mapped yet: {model}")
+
+    monkeypatch.setattr(litellm, "get_model_info", _unmapped)
+    result = bu._aggregate_batch_cost_usage_models(
+        entries=[_ocr_row(4, annotation_pages=4, model="my-private-ocr-model")],
+        custom_llm_provider="mistral",
+        model_info={"ocr_cost_per_page_batches": 0.001},
+    )
+    assert result.cost == pytest.approx(4 * 0.001 + 4 * 0.001)
+
+
+def test_ocr_rows_bill_the_deployment_sync_page_rate_over_the_published_batch_rate(monkeypatch):
+    monkeypatch.setattr(
+        litellm, "get_model_info", lambda model, custom_llm_provider=None: pytest.fail("cost map must not be consulted")
+    )
+    result = bu._aggregate_batch_cost_usage_models(
+        entries=[_ocr_row(3)],
+        custom_llm_provider="mistral",
+        model_info={"ocr_cost_per_page": 0.0912},
+    )
+    assert result.cost == pytest.approx(3 * 0.0912)
+
+
+def test_ocr_rows_without_pricing_bill_zero_but_count_as_successful(monkeypatch):
+    monkeypatch.setattr(litellm, "get_model_info", lambda model, custom_llm_provider=None: {"mode": "ocr"})
+    result = bu._aggregate_batch_cost_usage_models(entries=[_ocr_row(3)], custom_llm_provider="mistral")
+    assert result.cost == 0.0
+    assert (result.successful_requests, result.failed_requests) == (1, 0)
+
+
+def test_chat_rows_from_mistral_still_use_token_pricing(monkeypatch):
+    monkeypatch.setattr(
+        litellm,
+        "get_model_info",
+        lambda model, custom_llm_provider=None: {"input_cost_per_token": 0.001, "output_cost_per_token": 0.002},
+    )
+    result = bu._aggregate_batch_cost_usage_models(
+        entries=[_success_row(model="mistral-small-latest", usage=_usage(10, 5))],
+        custom_llm_provider="mistral",
+    )
+    assert result.cost == pytest.approx((10 * 0.001 + 5 * 0.002) / 2)
+    assert result.usage.total_tokens == 15
