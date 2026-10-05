@@ -33,9 +33,9 @@ from e2e_http import (
     relayed_provider_rate_limit,
     tolerate_provider_rate_limit,
 )
-from endpoints_client import EndpointsClient
 from lifecycle import ResourceManager
 from models import LiteLLMParamsBody, OcrBody, OcrDocument, OcrResponse
+from proxy_client import ProxyClient
 from pydantic import BaseModel
 
 pytestmark = pytest.mark.e2e
@@ -171,17 +171,13 @@ def _assert_provider_rate_limit_relayed(model: str, outcome: RateLimitedError) -
 
 class TestRustOcrGateway:
     @pytest.mark.parametrize("case", RUST_OCR_CASES, ids=_CASE_IDS)
-    def test_rust_ocr_response(
-        self, endpoints_client: EndpointsClient, resources: ResourceManager, case: _OcrCase
-    ) -> None:
+    def test_rust_ocr_response(self, proxy: ProxyClient, resources: ResourceManager, case: _OcrCase) -> None:
         model = f"rust-ocr-{case.suffix}-{unique_marker()}"
-        model_id = endpoints_client.create_model(model, case.provider.litellm_params())
-        resources.defer(lambda: endpoints_client.delete_model(model_id))
+        model_id = proxy.create_model(model, case.provider.litellm_params())
+        resources.defer(lambda: proxy.delete_model(model_id))
         key = resources.key()
 
-        match tolerate_provider_rate_limit(
-            lambda: endpoints_client.proxy.ocr(key, OcrBody(model=model, document=case.document))
-        ):
+        match tolerate_provider_rate_limit(lambda: proxy.ocr(key, OcrBody(model=model, document=case.document))):
             case Success(data=response):
                 _assert_ocr_document(response)
             case RateLimitedError() as outcome:
@@ -191,16 +187,14 @@ class TestRustOcrGateway:
 
     @pytest.mark.skip(reason="stage red: product gap, /v1/ocr 500s (aocr TypeError) on missing document instead of 400")
     @pytest.mark.covers("llm.ocr.openai.input_validation.nonstream.works")
-    def test_missing_document_returns_error(
-        self, endpoints_client: EndpointsClient, resources: ResourceManager
-    ) -> None:
+    def test_missing_document_returns_error(self, proxy: ProxyClient, resources: ResourceManager) -> None:
         model = f"rust-ocr-val-{unique_marker()}"
-        model_id = endpoints_client.create_model(model, MistralOcr().litellm_params())
-        resources.defer(lambda: endpoints_client.delete_model(model_id))
+        model_id = proxy.create_model(model, MistralOcr().litellm_params())
+        resources.defer(lambda: proxy.delete_model(model_id))
         key = resources.key()
-        result = endpoints_client.proxy.transport.send(
+        result = proxy.transport.send(
             "/v1/ocr",
-            headers=endpoints_client.proxy.transport.bearer(key),
+            headers=proxy.transport.bearer(key),
             json=_OptionalOcrBody(model=model),
         )
         assert_client_error(result, "ocr missing document")

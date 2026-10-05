@@ -22,7 +22,6 @@ from typing import (
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging
-    from litellm.types.utils import CredentialItem
 
 
 class MetadataUpdater(Protocol):
@@ -59,24 +58,17 @@ def setup(
     }
     supplied: Final = arguments.get("litellm_logging_obj")
     if isinstance(supplied, Logging):
-        return CallSetup(supplied, arguments)
+        return _claim_budget_reservation(CallSetup(supplied, arguments), asynchronous)
     logger, prepared = function_setup(call_type, Rules(), start_time, *args, is_async_call=asynchronous, **arguments)
-    return CallSetup(logger, prepared)
+    return _claim_budget_reservation(CallSetup(logger, prepared), asynchronous)
 
 
-def check_limits(kwargs: Mapping[str, object]) -> None:
-    from litellm import (
-        BudgetExceededError,
-        _current_cost,  # pyright: ignore[reportPrivateUsage]  # shared SDK budget counter has no public accessor
-        max_budget,
-        num_retries_per_request,
-    )
-    from litellm.litellm_core_utils.core_helpers import max_retries_per_request_hit
+def _claim_budget_reservation(call_setup: CallSetup, asynchronous: bool) -> CallSetup:
+    from litellm.litellm_core_utils.core_helpers import bind_budget_reservation_to_callbacks
 
-    if max_budget and _current_cost > max_budget:
-        raise BudgetExceededError(current_cost=_current_cost, max_budget=max_budget)
-    if max_retries_per_request_hit(kwargs, num_retries_per_request):
-        raise RuntimeError("Max retries per request hit!")
+    if asynchronous and not is_internal_call():
+        bind_budget_reservation_to_callbacks(call_setup.logger.litellm_params)
+    return call_setup
 
 
 def finalize(
@@ -96,6 +88,9 @@ def finalize(
 
 
 class LoggingSurface(Protocol):
+    @property
+    def litellm_params(self) -> Mapping[str, object]: ...
+
     def update_from_kwargs(
         self,
         kwargs: dict[str, object],
@@ -236,8 +231,12 @@ def sync_success_for_async_call(
 def failure_handler(
     logger: LoggingSurface, error: Exception, start: datetime.datetime, end: datetime.datetime, asynchronous: bool
 ) -> Coroutine[object, object, None] | None:
+    from litellm.litellm_core_utils.core_helpers import unbind_budget_reservation_from_callbacks
+
     trace: Final = "".join(traceback.format_exception(error))
     if asynchronous:
+        if not is_internal_call():
+            unbind_budget_reservation_from_callbacks(logger.litellm_params)
         return logger.async_failure_handler(error, trace, start, end)
     logger.failure_handler(error, trace, start, end)
     return None
@@ -282,22 +281,6 @@ def is_internal_call() -> bool:
     from litellm._internal_context import is_internal_call as internal
 
     return internal.get()
-
-
-def credential_list() -> list[CredentialItem]:
-    from litellm import credential_list as credentials
-
-    return credentials
-
-
-def warn_unknown_credential(name: str, loaded: int) -> None:
-    from litellm._logging import verbose_logger
-
-    verbose_logger.warning(
-        "litellm_credential_name=%s matched none of the %d loaded credentials; the request runs without it",
-        name,
-        loaded,
-    )
 
 
 def before_deployment_call(kwargs: dict[str, object], call_type: str) -> Awaitable[object]:

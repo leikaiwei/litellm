@@ -34,11 +34,18 @@ def delete_key_if_present(candidate: Gateway, key: str) -> None:
     assert read_rows('SELECT token FROM "LiteLLM_VerificationToken" WHERE token=%s', (digest,)) == []
 
 
-def eventually(read: Callable[[], T], satisfied: Callable[[T], bool], seconds: float = 10) -> T:
+def eventually(
+    read: Callable[[], T],
+    satisfied: Callable[[T], bool],
+    seconds: float = 10,
+    return_last_on_timeout: bool = False,
+) -> T:
     deadline: Final = time.monotonic() + seconds
     while True:
         observed: Final = read()
         if satisfied(observed):
+            return observed
+        if return_last_on_timeout and time.monotonic() >= deadline:
             return observed
         assert time.monotonic() < deadline, f"State did not converge: {observed!r}"
         time.sleep(0.1)
@@ -70,6 +77,21 @@ class Gateway:
             json=body,
             params=params,
             headers=request_headers,
+        )
+
+    def request_multipart(
+        self,
+        path: str,
+        fields: Mapping[str, str],
+        files: Mapping[str, tuple[str, bytes, str]],
+        *,
+        key: str | None = None,
+    ) -> httpx.Response:
+        return self.client.post(
+            path,
+            data=fields,
+            files=files,
+            headers={"Authorization": f"Bearer {self.key if key is None else key}"},
         )
 
     def post(self, path: str, body: Mapping[str, JsonValue], *, key: str | None = None) -> dict[str, JsonValue]:

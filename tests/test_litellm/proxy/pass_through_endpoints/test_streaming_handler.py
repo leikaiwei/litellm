@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import Iterator
 from datetime import datetime
 from unittest.mock import MagicMock
@@ -158,16 +159,18 @@ def _interrupted_anthropic_stream(model: str, output_text: str) -> list[bytes]:
 
 
 @pytest.mark.asyncio
-async def test_interrupted_anthropic_stream_recovers_output_tokens_off_the_event_loop():
+async def test_interrupted_anthropic_stream_recovers_output_tokens_off_the_event_loop(caplog):
     from unittest.mock import AsyncMock
 
     from tests.large_text import text
-    from tests.test_litellm.litellm_core_utils.event_loop_lag import (
+    from tests.unit.litellm_core_utils.event_loop_lag import (
         assert_loop_stayed_free,
         timed_with_loop_lags,
         warm_tokenizer,
     )
 
+    caplog.set_level(logging.WARNING, logger="LiteLLM")
+    caplog.set_level(logging.WARNING, logger="LiteLLM Proxy")
     model = "claude-fable-5"
     warm_tokenizer(model)
     logging_obj = _logging_obj()
@@ -197,16 +200,18 @@ async def test_interrupted_anthropic_stream_recovers_output_tokens_off_the_event
 
 
 @pytest.mark.asyncio
-async def test_failed_anthropic_stream_records_partial_usage_off_the_event_loop():
+async def test_failed_anthropic_stream_records_partial_usage_off_the_event_loop(caplog):
     from unittest.mock import AsyncMock
 
     from tests.large_text import text
-    from tests.test_litellm.litellm_core_utils.event_loop_lag import (
+    from tests.unit.litellm_core_utils.event_loop_lag import (
         assert_loop_stayed_free,
         timed_with_loop_lags,
         warm_tokenizer,
     )
 
+    caplog.set_level(logging.WARNING, logger="LiteLLM")
+    caplog.set_level(logging.WARNING, logger="LiteLLM Proxy")
     model = "claude-fable-5"
     warm_tokenizer(model)
     logging_obj = _logging_obj()

@@ -20,6 +20,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 1.100.1 同步时复核：`transformation.py` 的 `finish_reason` 裸取与 Responses 桥接层那三处仍未防护，调用点也仍无前置守卫，补丁原样保留
 - 1.101.0 同步时复核：结论同上，上游这一版没有动这两处，补丁原样保留
 - 1.103.1 同步时复核：我们提交的 PR [#34455](https://github.com/BerriAI/litellm/pull/34455) 已于 09-17 并入上游，覆盖的正是 Responses 桥接层那三处裸取，`responses/litellm_completion_transformation/streaming_iterator.py` 合并后与上游完全一致，该文件不再算补丁（上面「#34455 未被合并」是当时的状态）。`transformation.py` 的 `finish_reason` 判空上游仍没有，保留；但它的两个调用点都在 `_handle_choiceless_chunk` 之后，空帧到不了这里，现在只是纵深防护
+- 1.104.0 同步时复核：结论同上。上游这一版在该文件里只加了 compaction 块的回译与 usage 组装的重写，`finish_reason` 判空仍没有，补丁原样保留
 
 **OpenRouter OpenAI 系列模型兼容性修复** — `llms/openrouter/chat/transformation.py`
 - 修复 Claude Code `Agent` tool schema 中 Anthropic `type:"custom"` 透传导致 OpenRouter 下游 OpenAI/Azure 模型 API 400 的问题
@@ -28,12 +29,14 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 **Docker 自动发布** — `docker_release_auto.yml`
 - tag/release 时自动构建多架构镜像推送 DockerHub 和 GHCR
 
-**流式 tokens 统计修复** — `litellm_core_utils/streaming_chunk_builder_utils.py`、`litellm_core_utils/streaming_handler.py`
+**流式 tokens 统计修复** — `litellm_core_utils/streaming_handler.py`
 - 症状：OpenAI 兼容后端流式调用时 tokens 严重偏低。实测同一 prompt 真实 87/18，客户端与日志只记 15/2；不带 `include_usage` 的那条路径更是直接记 0
 - 根因：统计代码用 `"prompt_tokens" in usage` 判断字段存在，而只有 litellm 自己的 `Usage` 定义了 `__contains__`；OpenAI 兼容后端解析出的是 SDK 原生 `CompletionUsage`，`in` 退化为遍历 `(key, value)` 元组，恒为 False，于是真实 token 数被丢弃、回落到本地 `token_counter` 估算
 - 影响面：所有走流式的客户端，不限于 Claude Code。tokens 是限流、配额与用量分析的依据，偏低会让这些全部失真
 - 修复：改用 shape-aware 读取（dict 用 `.get()`，pydantic 模型用 `getattr`），三种 usage 形状均正确；后端确实未返回 usage 时仍保留估算兜底
 - 上游同样未修，且无对应 issue / PR
+- 1.104.0 同步时复核，按文件拆出两个结论。`streaming_chunk_builder_utils.py` 交还上游：上游 08-31 起（1.103.1 里就有，前两轮同步漏看了）在 `_usage_chunk_calculation_helper` 的唯一调用点前加了 `_extract_usage_chunk`，把原生 `CompletionUsage` 先归一成 litellm `Usage`，那个 `in` 判断从此成立，我们改成 `getattr` 的那段已是冗余。判据是把 fork 的回归测试原样放到纯上游 v1.104.0 上跑，`test_provider_native_completion_usage_is_not_replaced_by_estimate` 通过。`streaming_handler.py` 的 `calculate_total_usage` 上游仍是裸的 `"prompt_tokens" in usage`，同一轮对照里 `test_calculate_total_usage_with_provider_native_completion_usage` 在纯上游下失败（0 ≠ 87），补丁保留。两条回归测试都留着
+- 上游 1.104 同时改了缺省语义：usage 帧明确报 0 就记 0，不再回落到本地估算，只有完全没有 usage 帧才估算
 
 **Anthropic 适配层参数泄漏与 thinking-only 消息修复** — `llms/anthropic/experimental_pass_through/adapters/transformation.py`、`llms/anthropic/experimental_pass_through/adapters/handler.py`
 - 前提：`/v1/messages` 打 OpenAI 形状后端（`custom_openai`）时要经 anthropic↔openai 双向适配层，原生 anthropic 端点那条路径上的既有补丁全部不参与。以下两个缺陷都用同一请求打原生 anthropic 端点做对照确认：原生 200、经适配层失败
@@ -44,6 +47,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 根因二：`strip_empty_text_blocks_from_anthropic_messages` 先摘掉伴随的空 text 块（那是为原生 anthropic 路径加的，见上游 #22930），适配层随后落到 `assistant_content = assistant_message_str` 拿到 `None`，再被 `utils.py` 的 `cleanup_none_field_in_message` 连键一起删掉，产出既无 `content` 又无 `tool_calls` 的非法 OpenAI 消息。唯一变量法钉死了上游规则：只看 `content` 键存不存在，与其值无关、与 `tools` 无关
 - 修复二：无 `content` 且无 `tool_calls` 的 assistant 消息补 `content: ""`。OpenAI 规范只允许带 `tool_calls` 时省略 `content`，故不影响工具调用那条路
 - 四个无 OpenAI 对应的参数上游至今未处理，无对应 issue / PR；症状二上游同样未修
+- 1.104.0 同步时复核：上游往 handler 的 `ANTHROPIC_ONLY_REQUEST_KEYS` 里加了 `safeguards`（它自己已在翻译层映射过的键），与我们那行冲突，解法是取并集 `{"output_config", "safeguards"} | ANTHROPIC_ONLY_PARAMS_WITHOUT_OPENAI_EQUIVALENT`。四个参数与症状二上游仍未处理，补丁保留
 - 已知遗留（本轮未修）：`top_k` 同样会漏成 500，但 vertex_ai 等 provider 真支持它，而适配层此处拿不到解析后的 provider（`model` 是 model_group 名），无条件丢弃会让 gemini 等后端静默失去该参数，需按 provider 能力决定去留；`stop_reason` 缺 `stop_sequence` 与 `content_filter` 映射；`count_tokens` 漏算 system 与 tools（两条路径都中）；历史轮 thinking 以非标准 `thinking_blocks` 字段发给 `custom_openai`，未转成 `reasoning_content`（fork 里那个转换挂在 `DeepSeekChatConfig` 上，provider 为 `custom_openai` 时拿到的是 `OpenAILikeChatConfig`，补丁不参与），多轮会丢失上一轮推理链
 
 **deployment 级 guardrail 在 `/v1/messages` 上不执行** — `integrations/custom_guardrail.py`
@@ -63,6 +67,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 1.100.1 同步时复核：上游 `_persist` 仍只有那两道判定，`_should_store_result_in_cache` 也没加判空，两处补丁原样保留。上游 1.100 新增的 `test_async_cache_write_completes_when_asyncio_run_closes_the_loop` 拿空 `ModelResponse()` 当样本，正好被本补丁判成空回复而不写缓存，测试跟着失败；它要测的是「写操作能挺过 event loop 关闭」，与内容无关，故把样本换成带 content 的 response，断言不变
 - 1.101.0 同步时复核：上游 `_persist` 与 `_should_store_result_in_cache` 均无变化，两处补丁原样保留
 - 1.103.1 同步时复核：结论同上，两处补丁原样保留
+- 1.104.0 同步时复核：上游对 `caching_handler.py` 的改动全在 embedding 缓存（格式版本、部分命中合并），没有新增绕过 `_should_store_result_in_cache` 的写入路径；`_persist` 只是把 payload 收成一行。两处补丁原样保留。上游把测试从 `tests/test_litellm/caching/` 搬到 `tests/unit/caching/` 并大幅扩写，git 认不出是改名，我们的判空用例与那条换样本的修改已手工移植到新位置
 - 部署状态：生产曾用派生镜像 `v1.98.0-fork.patch.1-cachefix`（在 patch.1 上叠一层 COPY 替换该文件），未发 release、未打 tag。1.99.1 起随正式 release 构建，该临时镜像可弃用
 - 上游未修，无对应 issue / PR
 
@@ -75,7 +80,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 症状：key / team 的 budget 窗口在非 UTC 时区的机器上不按时重置
 - 根因：`reset_at` 用 `.replace(tzinfo=None)` 把带偏移的时间戳直接砍成裸时间（拿到的是当地墙钟），却拿去和裸 UTC `datetime.utcnow()` 比，UTC+8 下整整差 8 小时
 - 修复：`reset_at` 统一 `astimezone(timezone.utc)`，`now` 改用 `datetime.now(timezone.utc)`，两边都是 aware UTC
-- 上游未修：1.103.1 里 `_reset_expired_window` 仍是 `.replace(tzinfo=None)`，`reset_budget_windows` 仍是 `datetime.utcnow()`
+- 上游未修：1.104.0 里 `_reset_expired_window` 仍是 `.replace(tzinfo=None)`，`reset_budget_windows` 仍是 `datetime.utcnow()`
 - 补丁边界（1.100.1 同步时核对过，结论是不用扩大）：同文件里 `_reset_budget_for_litellm_keys_chunk` / `users_chunk` / `teams_chunk` 三处的 `datetime.utcnow()` 不是同一类错位。它们只有两个去向，一是 Prisma 的 where 过滤（`expires` / `budget_reset_at`），prisma-client-py 0.11.0 的 `builder.serialize_datetime` 明确把 naive 当 UTC 再打上 tzinfo，`utcnow()` 与 `now(timezone.utc)` 序列化出的查询字节完全一致；二是 `current_time` 传进 `_reset_budget_common`，而那个函数根本没读这个参数，新的 `budget_reset_at` 来自 `compute_budget_reset_at`，后者内部自己取 aware UTC。窗口那条路之所以真的错，是因为 `reset_at` 存在 JSON 里是**字符串**（带 `+08:00` 偏移），偏移一丢就变成当地墙钟；列字段那条路上 tzinfo 两头都由 Prisma 归一，从没被丢过
 - 遗留隐患（未改）：上面那三处的正确性依赖「naive 即 UTC」这个 Prisma 契约，`datetime.utcnow()` 恰好满足。Python 3.12 起该方法被弃用，若有人顺手改成 `datetime.now()`，在 UTC+8 上会静默变成 8 小时偏差且无测试拦截；安全的现代化写法是 `datetime.now(timezone.utc)`
 
@@ -86,14 +91,16 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 远端价格表拉下来后，把本地 `model_prices_and_context_window.json` 里远端还没有的条目补进去。远端优先，本地只补缺，故上游发布某个模型后自动以上游为准
 - 需要它是因为 fork 里加了上游尚未收录的模型（如 `anthropic/deepseek-v4-pro`），不补的话联网拉表会把这些条目整个丢掉
 - 1.103.1 同步时扩面：上游把远端加载重构成三条路径，启动时同步首拉（`get_model_cost_map`）、首拉遇瞬时错误后的后台重试（`_retry_remote_fetch_in_background`）、proxy 运行期重载（`refetch_model_cost_map`）。原补丁只挂在同步首拉上，另外两条一旦生效就会用纯远端表整体替换，把本地条目丢掉。现在三处统一走 `_finalize_remote_model_cost_map`，测试覆盖首拉与运行期重载两条入口
+- 1.104.0 同步时复核：上游在 `_finalize_loaded_model_cost_map` 里加了一份「最近一次加载的目录」快照（`loaded_model_cost_map`，供模型管理接口读）。我们的 `_finalize_remote_model_cost_map` 是先补缺再调它，所以快照里同样带着本地条目，不用改
 
-1.103.1 同步核对结论：上游吸收了一处（Responses 桥接层空 choices 防护，即我们的 PR #34455），其余逐文件核对后全部保留，与上游有差异的文件 43 -> 42（不含 `local_` 目录）。`llms/openrouter/chat/transformation.py` 上游在 1.101.0 到 1.103.1 之间没有改动；`llms/deepseek/messages/transformation.py` 上游只给 beta 头注入多传了一个 `messages` 参数，而 fork 的实现一直不做 beta 头注入，沿用我方版本。价格表与上游只差 `anthropic/deepseek-v4-pro` 这一条镜像；上游给 native 的 `deepseek/deepseek-v4-pro` 新增了 `off_peak_pricing`（错峰折扣），镜像未跟，因为那是 DeepSeek 官方直连的计费规则。上游删掉了 `test_deepseek_model_metadata.py` 里一批 deepseek-chat / reasoner 的断言，我们只补回自己那三条镜像条目测试
+1.104.0 同步核对结论：本轮没有补丁被上游新吸收，但查出一处早已冗余的（流式 tokens 统计在 `streaming_chunk_builder_utils.py` 里的那一半，见上），该文件交还上游，其余逐文件核对后全部保留。与上游有差异的文件 42 -> 41（不含 `local_` 目录）。上游这一版把 `tests/test_litellm` 的大部分测试搬到了 `tests/unit`，补丁测试跟着搬：多数由 git 按改名自动带过去，`test_caching_handler.py` 因上游同时大幅扩写而认不出改名，手工移植；fork 独有的两份根目录测试（`test_anthropic_messages_header_forwarding.py`、`test_model_cost_map_local_merge.py`）一并挪到 `tests/unit/`。`llms/deepseek/` 下两个文件上游本轮没有改动；`llms/openrouter/chat/transformation.py` 上游只换了 tokenizer 的类型标注。价格表与上游只差 `anthropic/deepseek-v4-pro` 这一条镜像，native 的 `deepseek/deepseek-v4-pro` 本轮没有调价，镜像仍未跟 `off_peak_pricing`（那是 DeepSeek 官方直连的计费规则）
 
 已移除的补丁（保留记录，便于回溯）：
 
 - ~~**Anthropic passthrough 非标准 SSE 帧健壮性**~~ — 我们提交的 PR [#26000](https://github.com/BerriAI/litellm/pull/26000) 已并入上游，本地补丁移除
 - ~~**UI 会话 team sentinel 被当成已删除团队**~~ — 上游 1.99 已在 `_token_can_vouch_for_team` 里加了同语义的 `UI_TEAM_ID` 豁免（`UI_TEAM_ID` 与我们用的 `UI_SESSION_TOKEN_TEAM_ID` 同为 `litellm-dashboard`），判据与我们那版一致，本地补丁移除，该文件已与上游完全一致
 - ~~**Responses 桥接层空 choices 防护**~~ — `responses/litellm_completion_transformation/streaming_iterator.py` 里 `_is_reasoning_end`、`_ensure_output_item_for_chunk`、`_get_delta_string_from_streaming_choices` 三处判空。我们提交的 PR [#34455](https://github.com/BerriAI/litellm/pull/34455) 已并入上游，1.103.1 起该文件与上游一致。回归测试 `test_empty_choices_streaming_iterator.py` 保留
+- ~~**流式 tokens 统计在 chunk builder 里的那一半**~~ — `litellm_core_utils/streaming_chunk_builder_utils.py` 的 `_usage_chunk_calculation_helper` 改 `getattr` 读取。上游自 08-31 起在调用前统一归一成 litellm `Usage`，补丁冗余，1.104.0 起该文件与上游一致。回归测试保留
 - ~~**代管的上游 otel cache token 属性**~~ — 这本来就不是我们的补丁，是上游 PR [#38716](https://github.com/BerriAI/litellm/pull/38716)。它当初只进了 1.99.x 这条 stable 线，1.100.x 里没有，所以 1.100.1 同步时由我们保住。1.101.0 已原生自带且实现更完整（多了 `prompt_tokens_details` 兜底取值），`integrations/otel/` 整目录改回上游，与上游差异归零
 
 ---
@@ -221,7 +228,7 @@ from a2a.utils.constants import TransportProtocol
 from uuid import uuid4
 
 base_url = "http://localhost:4000/a2a/my-agent"  # LiteLLM proxy + agent name
-headers = {"Authorization": "Bearer sk-1234"}    # LiteLLM Virtual Key
+headers = {"Authorization": "Bearer <your-master-key>"}    # LiteLLM master key or a virtual key
 
 async with httpx.AsyncClient(headers=headers, timeout=60.0) as http_client:
     resolver = A2ACardResolver(httpx_client=http_client, base_url=base_url)
@@ -286,7 +293,7 @@ async with stdio_client(server_params) as (read, write):
 
 ```bash
 curl -X POST 'http://0.0.0.0:4000/v1/chat/completions' \
-  -H 'Authorization: Bearer sk-1234' \
+  -H 'Authorization: Bearer <your-master-key>' \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "gpt-4o",
@@ -308,7 +315,7 @@ curl -X POST 'http://0.0.0.0:4000/v1/chat/completions' \
     "LiteLLM": {
       "url": "http://localhost:4000/mcp/",
       "headers": {
-        "x-litellm-api-key": "Bearer sk-1234"
+        "x-litellm-api-key": "Bearer <your-master-key>"
       }
     }
   }
@@ -360,6 +367,7 @@ For MCP OAuth, an upstream may advertise dynamic client registration but refuse 
 | [Deepgram (`deepgram`)](https://docs.litellm.ai/docs/providers/deepgram) | ✅ | ✅ | ✅ |  |  | ✅ |  |  |  |  |
 | [DeepInfra (`deepinfra`)](https://docs.litellm.ai/docs/providers/deepinfra) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Deepseek (`deepseek`)](https://docs.litellm.ai/docs/providers/deepseek) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
+| [Eden AI (`edenai`)](https://docs.litellm.ai/docs/providers/edenai) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |  |  |
 | [ElevenLabs (`elevenlabs`)](https://docs.litellm.ai/docs/providers/elevenlabs) | ✅ | ✅ | ✅ |  |  | ✅ | ✅ |  |  |  |
 | [Empower (`empower`)](https://docs.litellm.ai/docs/providers/empower) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Fal AI (`fal_ai`)](https://docs.litellm.ai/docs/providers/fal_ai) | ✅ | ✅ | ✅ |  | ✅ |  |  |  |  |  |
@@ -409,7 +417,7 @@ For MCP OAuth, an upstream may advertise dynamic client registration but refuse 
 | [Petals (`petals`)](https://docs.litellm.ai/docs/providers/petals) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Pinstripes (`pinstripes`)](https://docs.litellm.ai/docs/providers/pinstripes) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Predibase (`predibase`)](https://docs.litellm.ai/docs/providers/predibase) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
-| [Qwen AI Platform (`qwen_ai_platform`)](https://docs.litellm.ai/docs/providers/qwencloud) | ✅ | ✅ | ✅ | ✅ | ✅ |  |  |  |  | ✅ |
+| [Qianwen AI Platform (`qwen_ai_platform`)](https://docs.litellm.ai/docs/providers/qwencloud) | ✅ | ✅ | ✅ | ✅ | ✅ |  |  |  |  | ✅ |
 | [QwenCloud (`qwencloud`)](https://docs.litellm.ai/docs/providers/qwencloud) | ✅ | ✅ | ✅ | ✅ | ✅ |  |  |  |  | ✅ |
 | [Recraft (`recraft`)](https://docs.litellm.ai/docs/providers/recraft) |  |  |  |  | ✅ |  |  |  |  |  |
 | [Replicate (`replicate`)](https://docs.litellm.ai/docs/providers/replicate) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
