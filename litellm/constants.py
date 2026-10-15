@@ -46,6 +46,18 @@ ROUTER_SETTINGS_MANAGED_OUTSIDE_CONFIG: Final[frozenset[str]] = frozenset(
 )
 DEFAULT_BATCH_SIZE: Final = int(os.getenv("DEFAULT_BATCH_SIZE", 512))
 DEFAULT_FLUSH_INTERVAL_SECONDS: Final = int(os.getenv("DEFAULT_FLUSH_INTERVAL_SECONDS", 5))
+CLICKHOUSE_BATCH_SIZE: Final = get_env_int("CLICKHOUSE_BATCH_SIZE", 10_000)
+CLICKHOUSE_FLUSH_INTERVAL_SECONDS: Final = float(os.getenv("CLICKHOUSE_FLUSH_INTERVAL_SECONDS", "1.0"))
+CLICKHOUSE_MAX_BUFFERED_ROWS: Final = get_env_int("CLICKHOUSE_MAX_BUFFERED_ROWS", 200_000)
+CLICKHOUSE_MAX_RETRIES: Final = get_env_int("CLICKHOUSE_MAX_RETRIES", 3)
+AGENT_TRACING_RETENTION_DAYS: Final = get_env_int("AGENT_TRACING_RETENTION_DAYS", 30)
+AGENT_TRACING_SPEND_LOG_RETENTION_DAYS: Final = get_env_int("AGENT_TRACING_SPEND_LOG_RETENTION_DAYS", 90)
+OTLP_MAX_BODY_BYTES: Final = get_env_int("OTLP_MAX_BODY_BYTES", 16 * 1024 * 1024)
+OTLP_MAX_ATTRIBUTE_VALUE_BYTES: Final = get_env_int("OTLP_MAX_ATTRIBUTE_VALUE_BYTES", 64 * 1024)
+OTLP_RETRY_AFTER_SECONDS: Final = get_env_int("OTLP_RETRY_AFTER_SECONDS", 2)
+OTLP_MAX_CONCURRENT_INGESTS: Final = get_env_int("OTLP_MAX_CONCURRENT_INGESTS", 2)
+AGENT_TRACING_INPUT_PREVIEW_CHARS: Final = get_env_int("AGENT_TRACING_INPUT_PREVIEW_CHARS", 240)
+AGENT_TRACING_LIST_PAGE_SIZE: Final = get_env_int("AGENT_TRACING_LIST_PAGE_SIZE", 50)
 DEFAULT_S3_FLUSH_INTERVAL_SECONDS: Final = int(os.getenv("DEFAULT_S3_FLUSH_INTERVAL_SECONDS", 10))
 DEFAULT_S3_BATCH_SIZE: Final = int(os.getenv("DEFAULT_S3_BATCH_SIZE", 512))
 DEFAULT_S3_MAX_CONCURRENT_UPLOADS: Final = int(os.getenv("DEFAULT_S3_MAX_CONCURRENT_UPLOADS", "16"))
@@ -57,6 +69,7 @@ S3_PREFIX_DIGEST_CHARS: Final = 16
 # s3 allows 2048 bytes of combined metadata headers, which Content-Disposition counts against
 MAX_S3_OBJECT_DOWNLOAD_FILENAME_BYTES: Final = 1024
 S3_LOG_PROMPTS_ONLY_ENV_VAR: Final = "S3_LOG_PROMPTS_ONLY"
+S3_PARTITION_GRANULARITY_ENV_VAR: Final = "S3_PARTITION_GRANULARITY"
 MAX_FILE_LIST_LIMIT: Final = 10000
 DEFAULT_SQS_FLUSH_INTERVAL_SECONDS: Final = int(os.getenv("DEFAULT_SQS_FLUSH_INTERVAL_SECONDS", 10))
 DEFAULT_NUM_WORKERS_LITELLM_PROXY: Final = int(os.getenv("DEFAULT_NUM_WORKERS_LITELLM_PROXY", 1))
@@ -253,6 +266,7 @@ DEFAULT_REASONING_EFFORT_MINIMAL_THINKING_BUDGET: Final = int(
 
 # Provider-specific API base URLs
 XAI_API_BASE: Final = "https://api.x.ai/v1"
+PLACEHOLDER_API_KEY: Final = "fake-api-key"
 OPEN_SANDBOX_API_BASE_ENV_VAR: Final = "OPEN_SANDBOX_API_BASE"
 OPEN_SANDBOX_API_KEY_ENV_VAR: Final = "OPEN_SANDBOX_API_KEY"
 OPEN_SANDBOX_DEFAULT_TEMPLATE: Final = "opensandbox/code-interpreter:v1.1.0"
@@ -946,8 +960,11 @@ openai_compatible_endpoints: Final[list] = [
     "https://api.libertai.io/v1",
     "https://pinstripes.io/v1",
     "https://api.meta.ai/v1",
+    "https://api.sailresearch.com/v1",
     "https://api.cognition.ai/v1",
+    "https://api.cortecs.ai/v1",
     "https://api.scx.ai/v1",
+    "https://api.prisminference.com/v1",
     "https://gigachat.devices.sberbank.ru/api/v1",
 ]
 
@@ -1020,7 +1037,10 @@ openai_compatible_providers: Final[list] = [
     "darkbloom",
     "meta",  # Meta Model API (Muse Spark) - JSON-configured provider
     "cognition",
+    "cortecs",
     "scx-ai",
+    "prism",
+    "sail",
 ]
 
 OPENAI_AUDIO_TRANSCRIPTION_PROVIDERS: Final = frozenset({"openai"} | frozenset(openai_compatible_providers))
@@ -1608,6 +1628,8 @@ ALLOWED_VERTEX_AI_PASSTHROUGH_HEADERS: Final = {
 # e.g., 'x-pass-anthropic-beta: value' becomes 'anthropic-beta: value'
 # Works for all LLM pass-through endpoints (Vertex AI, Anthropic, Bedrock, etc.)
 PASS_THROUGH_HEADER_PREFIX: Final = "x-pass-"
+INTERNAL_KWARG_PREFIX: Final = "_litellm_"
+CONTROL_OPTIONS_KEY: Final = f"{INTERNAL_KWARG_PREFIX}control"
 
 AZURE_SPEECH_CUSTOM_LLM_PROVIDER: Final = "azure_speech"
 AZURE_SPEECH_PASS_THROUGH_ROUTE_PREFIX: Final = "/azure_speech"
@@ -1771,6 +1793,10 @@ SCHEDULED_JOB_SHUTDOWN_CANCEL_TIMEOUT_SECONDS: Final = float(
     os.getenv("SCHEDULED_JOB_SHUTDOWN_CANCEL_TIMEOUT_SECONDS", "5")
 )
 TOOL_SPEND_TOP_TOOLS: Final = 100
+MODEL_INSIGHTS_TOP_MODELS: Final = 10
+MODEL_INSIGHTS_MAX_RANGE_DAYS: Final = 365
+MODEL_INSIGHTS_DEFAULT_TASK: Final = "uncategorized"
+MODEL_INSIGHTS_TASK_TAG_PREFIX: Final = "task:"
 SPEND_LOG_PARTITION_INTERVAL: Final = os.getenv("SPEND_LOG_PARTITION_INTERVAL", "day")
 SPEND_LOG_PARTITION_PRECREATE_AHEAD: Final = int(os.getenv("SPEND_LOG_PARTITION_PRECREATE_AHEAD", 7))
 SPEND_LOG_WRITE_BATCH_MAX_BYTES: Final = max(1, int(os.getenv("SPEND_LOG_WRITE_BATCH_MAX_BYTES", 2_000_000)))
@@ -1873,6 +1899,7 @@ LITELLM_SETTINGS_SAFE_DB_OVERRIDES: Final = [
     "cost_margin_config",
     "block_requests_for_models_without_pricing",
     "budget_exceeded_throttle_percentage",
+    "log_auth_failure_key_identity",
     # Every field editable from the Admin UI (proxy_server._GENERAL_SETTINGS_UI_LITELLM_FIELDS)
     # must be listed here so a DB write from one worker overrides the live litellm attribute on
     # the others when config reloads; otherwise peer workers stay on their startup value.
@@ -1897,6 +1924,7 @@ SPEND_LOG_KEY_METADATA_CACHE_TTL: Final = 600
 SPEND_LOG_KEY_METADATA_MISS_CACHE_TTL: Final = 30
 SPEND_LOG_KEY_METADATA_CACHE_MAX_ITEMS: Final = 10000
 SPEND_LOG_KEY_METADATA_QUERY_TIMEOUT_MS: Final = 5000
+SPEND_LOG_KEY_METADATA_ROWS_PER_PROBE: Final = 100
 # Short TTL for negative MCP access-group existence lookups. Keeps unauthenticated
 # callers from forcing a DB query per request for unknown names, while bounding
 # staleness so a transient DB error (which surfaces as an empty list) cannot
@@ -1953,6 +1981,15 @@ SENTRY_DENYLIST: Final = [
     "auth_token",
     "jwt_token",
     "private_key",
+    "authorization",
+    "api-key",
+    "x-api-key",
+    "x-goog-api-key",
+    "ocp-apim-subscription-key",
+    "x-litellm-api-key",
+    "x-mcp-auth",
+    "cookie",
+    "set-cookie",
     "SLACK_WEBHOOK_URL",
     "ALERTING_WEBHOOK_URL",
     "webhook_url",
@@ -1975,6 +2012,12 @@ SENTRY_DENYLIST: Final = [
 ]
 SENTRY_PII_DENYLIST: Final = [
     "user_id",
+    "user_email",
+    "end_user_id",
+    "user_api_key_hash",
+    "user_api_key_user_id",
+    "user_api_key_user_email",
+    "user_api_key_end_user_id",
     "email",
     "phone",
     "address",
@@ -2120,6 +2163,17 @@ MCP_SPEND_LOG_MODEL_PREFIX: Final[str] = "MCP: "
 PTU_SENTINEL_API_KEY: Final[str] = "__ptu_flat_cost__"
 PTU_ROLLUP_JOB_ID: Final[str] = "ptu_flat_cost_rollup_job"
 PTU_ROLLUP_LOCK_TTL_SECONDS: Final[int] = 900
+USAGE_TOP_API_KEYS_DEFAULT: Final[int] = 100
+USAGE_TOP_API_KEYS_MAX: Final[int] = 1000
+USAGE_KEY_PAGE_DEFAULT: Final[int] = 50
+USAGE_KEY_PAGE_MAX: Final[int] = 100
+USAGE_KEY_SEARCH_DEFAULT: Final[int] = 100
+USAGE_KEY_SEARCH_MAX: Final[int] = 100
+USAGE_MODEL_TOP_KEYS_DEFAULT: Final[int] = 5
+USAGE_MODEL_TOP_KEYS_MAX: Final[int] = 100
+USAGE_CACHE_LEAKAGE_KEYS_DEFAULT: Final[int] = 20
+USAGE_CACHE_LEAKAGE_KEYS_MAX: Final[int] = 100
+USAGE_EXPORT_BATCH_SIZE: Final[int] = 1000
 # Furthest back the catch-up pass looks for unpriced PTU days when a deployment
 # declares no ptu_effective_from, bounding the scan for an open-ended window.
 PTU_ROLLUP_MAX_BACKFILL_DAYS: Final[int] = 90
@@ -2157,3 +2211,26 @@ EMPTY_MAPPING: Final = MappingProxyType({})
 
 # API endpoint for breached password k-anonymity search
 HIBP_RANGE_API_BASE: Final = "https://api.pwnedpasswords.com/range"
+
+# litellm.harness defaults
+HARNESS_ENDPOINT_HOST: Final = "127.0.0.1"
+HARNESS_ENDPOINT_STARTUP_TIMEOUT_SECONDS: Final = 10.0
+HARNESS_ENDPOINT_REQUEST_TIMEOUT_SECONDS: Final = 600.0
+HARNESS_SESSION_TOKEN_BYTES: Final = 32
+HARNESS_MAX_DIFF_BYTES: Final = 256 * 1024
+HARNESS_STDERR_TAIL_LINES: Final = 40
+HARNESS_STREAM_READ_CHUNK_BYTES: Final = 64 * 1024
+HARNESS_EVENT_QUEUE_MAX_SIZE: Final = 1024
+HARNESS_PROCESS_KILL_GRACE_SECONDS: Final = 5.0
+HARNESS_SNAPSHOT_SKIP_DIRS: Final = frozenset(
+    {
+        ".git",
+        "node_modules",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+    }
+)

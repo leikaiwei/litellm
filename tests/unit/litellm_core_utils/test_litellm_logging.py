@@ -19,8 +19,9 @@ from openai import AsyncOpenAI
 from openai._legacy_response import HttpxBinaryResponseContent
 
 import litellm
+from litellm._internal_context import in_post_response_phase
 from litellm._logging import session_id_var, trace_id_var
-from litellm.constants import SENTRY_DENYLIST, SENTRY_PII_DENYLIST
+from litellm.constants import REDACTED_BY_LITELLM, SENTRY_PII_DENYLIST
 from litellm.cost_calculator import ocr_batch_cost
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.litellm_logging import Logging as LitellmLogging
@@ -357,108 +358,23 @@ def test_post_call_serializes_dict_with_datetime(logging_obj):
     assert "2026-05-11" in serialized
 
 
-def test_sentry_sample_rate(monkeypatch):
-    existing_sample_rate = os.getenv("SENTRY_API_SAMPLE_RATE")
-    try:
-        # test with default value by removing the environment variable
-        if existing_sample_rate:
-            del os.environ["SENTRY_API_SAMPLE_RATE"]
-
-        set_callbacks(["sentry"])
-        # Check if the default sample rate is set to 1.0
-        assert os.environ.get("SENTRY_API_SAMPLE_RATE") == "1.0"
-
-        # test with custom value
-        monkeypatch.setenv("SENTRY_API_SAMPLE_RATE", "0.5")
-
-        set_callbacks(["sentry"])
-        # Check if the custom sample rate is set correctly
-        assert os.environ.get("SENTRY_API_SAMPLE_RATE") == "0.5"
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        # Restore the original environment variable
-        if existing_sample_rate:
-            monkeypatch.setenv("SENTRY_API_SAMPLE_RATE", existing_sample_rate)
-        else:
-            if "SENTRY_API_SAMPLE_RATE" in os.environ:
-                del os.environ["SENTRY_API_SAMPLE_RATE"]
-
-
 def test_sentry_environment(monkeypatch):
-    """Test that SENTRY_ENVIRONMENT is properly handled during Sentry initialization"""
-    existing_environment = os.getenv("SENTRY_ENVIRONMENT")
-    existing_dsn = os.getenv("SENTRY_DSN")
+    import sentry_sdk
 
-    # Create mock sentry_sdk module
-    mock_event_scrubber_instance = MagicMock()
-    mock_event_scrubber_cls = MagicMock(return_value=mock_event_scrubber_instance)
-
-    mock_scrubber_module = MagicMock()
-    mock_scrubber_module.EventScrubber = mock_event_scrubber_cls
-
-    mock_sentry_sdk = MagicMock()
-    mock_sentry_sdk.scrubber = mock_scrubber_module
     mock_init = MagicMock()
-    mock_sentry_sdk.init = mock_init
+    monkeypatch.setattr(sentry_sdk, "init", mock_init)
+    monkeypatch.setenv("SENTRY_DSN", "https://test@sentry.io/123456")
+    monkeypatch.delenv("SENTRY_ENVIRONMENT", raising=False)
 
-    # Inject mocks into sys.modules
-    sys.modules["sentry_sdk"] = mock_sentry_sdk
-    sys.modules["sentry_sdk.scrubber"] = mock_scrubber_module
+    set_callbacks(["sentry"])
+    assert mock_init.call_args[1]["environment"] == "production"
 
-    try:
-        # Set a mock DSN to allow Sentry initialization
-        monkeypatch.setenv("SENTRY_DSN", "https://test@sentry.io/123456")
-
-        # Test with default value (no environment set)
-        if existing_environment:
-            del os.environ["SENTRY_ENVIRONMENT"]
-
+    for environment in ("development", "staging"):
+        monkeypatch.setenv("SENTRY_ENVIRONMENT", environment)
         mock_init.reset_mock()
         set_callbacks(["sentry"])
-        # Check that init was called with default environment "production"
         mock_init.assert_called_once()
-        call_kwargs = mock_init.call_args[1]
-        assert call_kwargs["environment"] == "production"
-
-        # Test with custom environment value
-        monkeypatch.setenv("SENTRY_ENVIRONMENT", "development")
-
-        mock_init.reset_mock()
-        set_callbacks(["sentry"])
-        # Check that init was called with custom environment "development"
-        mock_init.assert_called_once()
-        call_kwargs = mock_init.call_args[1]
-        assert call_kwargs["environment"] == "development"
-
-        # Test with staging environment
-        monkeypatch.setenv("SENTRY_ENVIRONMENT", "staging")
-
-        mock_init.reset_mock()
-        set_callbacks(["sentry"])
-        # Check that init was called with custom environment "staging"
-        mock_init.assert_called_once()
-        call_kwargs = mock_init.call_args[1]
-        assert call_kwargs["environment"] == "staging"
-
-    except Exception as e:
-        print(f"Error: {e}")
-        raise
-    finally:
-        # Restore the original environment variables
-        if existing_environment:
-            monkeypatch.setenv("SENTRY_ENVIRONMENT", existing_environment)
-        else:
-            if "SENTRY_ENVIRONMENT" in os.environ:
-                del os.environ["SENTRY_ENVIRONMENT"]
-
-        if existing_dsn:
-            monkeypatch.setenv("SENTRY_DSN", existing_dsn)
-        else:
-            if "SENTRY_DSN" in os.environ:
-                del os.environ["SENTRY_DSN"]
-
-
+        assert mock_init.call_args[1]["environment"] == environment
 def test_use_custom_pricing_for_model():
     from litellm.litellm_core_utils.litellm_logging import use_custom_pricing_for_model
 
@@ -579,7 +495,7 @@ class TestZeroCostDiagnostic:
     DEPLOYMENT_ID: Final = "lit7898-query-only-priced-deployment"
     MODEL_GROUP: Final = "query-only-priced-chat"
     QUERY_ONLY_PRICING: Final = {"input_cost_per_query": 0.00042}
-    PER_SECOND_PRICING: Final = {"input_cost_per_second": 0.00042, "output_cost_per_second": 0.00042}
+    PER_SECOND_PRICING: Final = {"cost_per_second": 0.00042}
     FREE_PRICING: Final = {"input_cost_per_token": 0, "output_cost_per_token": 0}
 
     @pytest.fixture(params=["query_only", "free"])
@@ -929,7 +845,7 @@ class TestZeroCostDiagnostic:
             response: Final = self._response(usage)
             response._response_ms = 1000.0
             with caplog.at_level(logging.WARNING, logger="LiteLLM"):
-                assert logging_obj._response_cost_calculator(result=response) == pytest.approx(0.00084)
+                assert logging_obj._response_cost_calculator(result=response) == pytest.approx(0.00042)
 
             assert logging_obj.model_call_details["zero_cost_diagnostic"] is None
             assert self._zero_cost_warnings(caplog) == []
@@ -1700,6 +1616,48 @@ async def test_logfire_logger_accepts_env_vars_for_base_url(monkeypatch):
         logging_module._in_memory_loggers.clear()
 
 
+@pytest.mark.parametrize(
+    ("api_host", "expected_endpoint"),
+    [
+        (None, "https://app.langtrace.ai/api/trace"),
+        ("http://langtrace.internal:3000/", "http://langtrace.internal:3000/api/trace"),
+        ("http://langtrace.internal:3000/api/trace", "http://langtrace.internal:3000/api/trace"),
+    ],
+)
+def test_langtrace_callback_exports_to_api_trace_with_x_api_key(
+    monkeypatch: pytest.MonkeyPatch, api_host: str | None, expected_endpoint: str
+) -> None:
+    """The exporter must post to Langtrace's complete /api/trace path with the key in x-api-key,
+    without leaking it into the process-wide OTEL_EXPORTER_OTLP_TRACES_HEADERS."""
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    from litellm.integrations.opentelemetry import OpenTelemetry
+    from litellm.litellm_core_utils import litellm_logging as logging_module
+
+    api_key: Final = "synthetic-langtrace-key"
+    monkeypatch.setenv("LANGTRACE_API_KEY", api_key)
+    monkeypatch.delenv("LANGTRACE_API_HOST", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", raising=False)
+    if api_host is not None:
+        monkeypatch.setenv("LANGTRACE_API_HOST", api_host)
+    logging_module._in_memory_loggers.clear()
+    try:
+        logger: Final = logging_module._init_custom_logger_compatible_class(
+            logging_integration="langtrace",
+            internal_usage_cache=None,
+            llm_router=None,
+            custom_logger_init_args={},
+        )
+        assert type(logger) is OpenTelemetry and logger.callback_name == "langtrace"
+        exporter: Final = logger._get_span_processor().span_exporter
+        assert isinstance(exporter, OTLPSpanExporter)
+        assert exporter._endpoint == expected_endpoint
+        assert exporter._headers == {"x-api-key": api_key}
+        assert "OTEL_EXPORTER_OTLP_TRACES_HEADERS" not in os.environ
+    finally:
+        logging_module._in_memory_loggers.clear()
+
+
 @pytest.mark.asyncio
 async def test_logging_result_for_bridge_calls(logging_obj):
     """
@@ -2053,6 +2011,62 @@ def test_success_handler_runs_sync_callbacks_for_sync_requests(logging_obj, call
 
     dummy_logger.log_success_event.assert_called_once()
     dummy_logger.log_stream_event.assert_not_called()
+
+
+class _PhaseRecordingLogger(CustomLogger):
+    """Records whether each success callback ran inside the post-response phase."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.phases: list[bool] = []
+
+    def log_success_event(self, kwargs, response_obj, start_time, end_time) -> None:
+        self.phases.append(in_post_response_phase())
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time) -> None:
+        self.phases.append(in_post_response_phase())
+
+
+def _success_response() -> ModelResponse:
+    return ModelResponse(
+        id="resp-123",
+        model="gpt-4o-mini",
+        choices=[{"message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop", "index": 0}],
+        usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    )
+
+
+def test_success_handler_runs_sync_callbacks_in_the_post_response_phase(logging_obj):
+    """Service spans logged by success callbacks must detach from the request trace even
+    while the server span is still open, so the callbacks run inside the phase marker."""
+    logging_obj.stream = False
+    logging_obj.model_call_details["litellm_params"] = {}
+    logging_obj.litellm_params = {}
+    recorder = _PhaseRecordingLogger()
+
+    with patch.object(logging_obj, "get_combined_callback_list", return_value=[recorder]):
+        logging_obj.success_handler(result=_success_response())
+
+    assert recorder.phases == [True], "log_success_event must observe the post-response phase"
+    assert in_post_response_phase() is False, "the phase must end with the handler"
+
+
+@pytest.mark.asyncio
+async def test_async_success_handler_runs_async_callbacks_in_the_post_response_phase(logging_obj):
+    logging_obj.stream = False
+    logging_obj.model_call_details["litellm_params"] = {"acompletion": True}
+    logging_obj.litellm_params = logging_obj.model_call_details["litellm_params"]
+    recorder = _PhaseRecordingLogger()
+
+    with patch.object(logging_obj, "get_combined_callback_list", return_value=[recorder]):
+        await logging_obj.async_success_handler(
+            result=_success_response(),
+            start_time=datetime.datetime.now(datetime.timezone.utc),
+            end_time=datetime.datetime.now(datetime.timezone.utc),
+        )
+
+    assert recorder.phases == [True], "async_log_success_event must observe the post-response phase"
+    assert in_post_response_phase() is False, "the phase must not leak into the request task"
 
 
 def test_is_sync_litellm_request():
@@ -3100,37 +3114,34 @@ def test_speech_call_is_still_priced_from_input_characters(call_type):
 
 
 def test_sentry_event_scrubber_initialization(monkeypatch):
-    # Step 1: Create a fake sentry_sdk.scrubber module
-    mock_event_scrubber_instance = MagicMock()
-    mock_event_scrubber_cls = MagicMock(return_value=mock_event_scrubber_instance)
+    import sentry_sdk
 
-    mock_scrubber_module = MagicMock()
-    mock_scrubber_module.EventScrubber = mock_event_scrubber_cls
-
-    # Step 2: Create a fake sentry_sdk module and insert into sys.modules
-    mock_sentry_sdk = MagicMock()
-    mock_sentry_sdk.scrubber = mock_scrubber_module
     mock_init = MagicMock()
-    mock_sentry_sdk.init = mock_init
+    monkeypatch.setattr(sentry_sdk, "init", mock_init)
+    monkeypatch.delenv("SENTRY_SEND_DEFAULT_PII", raising=False)
 
-    # Step 3: Inject both into sys.modules BEFORE import occurs
-    sys.modules["sentry_sdk"] = mock_sentry_sdk
-    sys.modules["sentry_sdk.scrubber"] = mock_scrubber_module
-
-    # Step 4: Run the actual sentry setup code
     set_callbacks(["sentry"])
 
-    # Step 5: Assert the EventScrubber was constructed correctly
-    mock_event_scrubber_cls.assert_called_once_with(
-        denylist=SENTRY_DENYLIST,
-        pii_denylist=SENTRY_PII_DENYLIST,
-    )
-
-    # Step 6: Assert the event_scrubber and PII args were passed
     mock_init.assert_called_once()
     call_args = mock_init.call_args[1]
-    assert call_args["event_scrubber"] == mock_event_scrubber_instance
     assert call_args["send_default_pii"] is False
+    assert call_args["event_scrubber"].recursive is True
+    assert {name.lower() for name in SENTRY_PII_DENYLIST} <= {name.lower() for name in call_args["event_scrubber"].denylist}
+    assert call_args["before_send"] is call_args["before_send_transaction"]
+
+
+def test_sentry_send_default_pii_opt_in(monkeypatch):
+    import sentry_sdk
+
+    mock_init = MagicMock()
+    monkeypatch.setattr(sentry_sdk, "init", mock_init)
+    monkeypatch.setenv("SENTRY_SEND_DEFAULT_PII", "true")
+
+    set_callbacks(["sentry"])
+
+    call_args = mock_init.call_args[1]
+    assert call_args["send_default_pii"] is True
+    assert not {name.lower() for name in SENTRY_PII_DENYLIST} & {name.lower() for name in call_args["event_scrubber"].denylist}
 
 
 def test_get_masked_values():
@@ -3216,6 +3227,7 @@ async def test_e2e_generate_cold_storage_object_key_successful():
             prefix="",  # No prefix for cold storage
             start_time=start_time,
             s3_file_name="time-10-30-45-123456_chatcmpl-test-12345",
+            partition_granularity="day",
         )
 
         # Verify the result
@@ -3265,6 +3277,7 @@ async def test_e2e_generate_cold_storage_object_key_with_custom_logger_s3_path()
             prefix="",
             start_time=start_time,
             s3_file_name="time-10-30-45-123456_chatcmpl-test-12345",
+            partition_granularity="day",
         )
 
         # Verify the result
@@ -3309,6 +3322,7 @@ async def test_e2e_generate_cold_storage_object_key_with_logger_no_s3_path():
             prefix="",
             start_time=start_time,
             s3_file_name="time-10-30-45-123456_chatcmpl-test-12345",
+            partition_granularity="day",
         )
 
         # Verify the result
@@ -4847,6 +4861,75 @@ def test_get_standard_logging_object_payload_includes_litellm_call_id(logging_ob
     assert payload["litellm_call_id"] == call_id
 
 
+@pytest.mark.parametrize(
+    "client_sent_oauth_token, custom_llm_provider, expected",
+    [(True, "anthropic", True), (True, "bedrock", False), (False, "anthropic", False), (None, "anthropic", None)],
+)
+def test_get_standard_logging_object_payload_resolves_used_client_oauth_token_against_the_selected_provider(
+    logging_obj, client_sent_oauth_token: bool | None, custom_llm_provider: str, expected: bool | None
+):
+    """The proxy stamps whether the client presented an Anthropic OAuth bearer before routing, but the
+    bearer only reaches an Anthropic deployment, so the logged flag must follow the provider that was called."""
+    from datetime import datetime
+
+    from litellm.litellm_core_utils.litellm_logging import get_standard_logging_object_payload
+
+    request_metadata = {} if client_sent_oauth_token is None else {"used_client_oauth_token": client_sent_oauth_token}
+    now = datetime.now()
+    payload = get_standard_logging_object_payload(
+        kwargs={
+            "model": "claude-sonnet-5",
+            "messages": [],
+            "custom_llm_provider": custom_llm_provider,
+            "litellm_params": {"metadata": request_metadata},
+        },
+        init_response_obj={},
+        start_time=now,
+        end_time=now,
+        logging_obj=logging_obj,
+        status="success",
+    )
+
+    assert payload is not None
+    assert payload["metadata"]["used_client_oauth_token"] is expected
+
+
+@pytest.mark.parametrize(
+    "metadata, litellm_metadata, expected",
+    [
+        ({"used_client_oauth_token": True}, {"used_client_oauth_token": False}, False),
+        ({"used_client_oauth_token": False}, {"used_client_oauth_token": True}, True),
+        ({"used_client_oauth_token": True}, {"compression_savings": 1}, True),
+    ],
+)
+def test_get_standard_logging_object_payload_takes_used_client_oauth_token_from_the_proxy_stamped_slot(
+    logging_obj, metadata: dict, litellm_metadata: dict, expected: bool
+):
+    """On routes that carry proxy metadata in `litellm_metadata`, `metadata` is the caller's own body field,
+    so a caller writing the flag there must not override what the proxy stamped."""
+    from datetime import datetime
+
+    from litellm.litellm_core_utils.litellm_logging import get_standard_logging_object_payload
+
+    now = datetime.now()
+    payload = get_standard_logging_object_payload(
+        kwargs={
+            "model": "claude-sonnet-5",
+            "messages": [],
+            "custom_llm_provider": "anthropic",
+            "litellm_params": {"metadata": metadata, "litellm_metadata": litellm_metadata},
+        },
+        init_response_obj={},
+        start_time=now,
+        end_time=now,
+        logging_obj=logging_obj,
+        status="success",
+    )
+
+    assert payload is not None
+    assert payload["metadata"]["used_client_oauth_token"] is expected
+
+
 def test_get_standard_logging_object_payload_carries_matched_access_groups(logging_obj):
     """Access groups stamped at auth time reach the logging payload, so integrations see what a request billed."""
     from datetime import datetime
@@ -5396,6 +5479,19 @@ def test_handle_anthropic_messages_response_logging_passes_model_response_throug
     assert logging_obj._handle_anthropic_messages_response_logging(result=model_response) is model_response
 
 
+def test_anthropic_messages_logged_response_tolerates_a_stream_that_assembled_nothing():
+    """A /v1/messages stream whose upstream yielded no chunks assembles to None; the spend
+    row must still land under the message id the caller was served instead of crashing."""
+    logging_obj = _anthropic_messages_logging_obj()
+    logging_obj.record_streamed_anthropic_message_id("msg_served")
+
+    result = logging_obj._anthropic_messages_logged_response(result=None)
+
+    assert isinstance(result, ModelResponse)
+    assert result.id == "msg_served"
+    assert result.model == "openai/my-local"
+
+
 def test_handle_anthropic_messages_response_logging_degrades_on_unparseable_responses_payload():
     """If the Responses translation raises (eg. empty output on an incomplete response),
     the row must still land: a minimal ModelResponse with model + usage is returned."""
@@ -5715,7 +5811,7 @@ def _interactions_logging_obj(stream: bool, call_type: str = "acreate"):
         messages=[],
         stream=stream,
         call_type=call_type,
-        start_time=time.time(),
+        start_time=datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc).timestamp(),
         litellm_call_id="interactions-call-id",
         function_id="interactions-fn-id",
     )
@@ -6688,6 +6784,65 @@ def test_pre_call_redacts_and_masks_raw_request(logging_obj):
     raw_api_base = logging_obj.model_call_details["raw_request_typed_dict"]["raw_request_api_base"]
     assert _GEMINI_KEY not in raw_api_base
     assert "key=*****" in raw_api_base
+
+
+_PRIVATE_RAW_REQUEST_ARGS: Final = {
+    "api_base": "https://api.openai.com/v1/chat/completions",
+    "headers": {},
+    "complete_input_dict": {"messages": [{"role": "user", "content": "PRIVATE-PHRASE"}]},
+}
+
+
+def _pre_call_with_raw_request_logging(logging_obj) -> dict:
+    metadata: Final = {"user_api_key_alias": "qa-key"}
+    logging_obj.model_call_details["litellm_params"] = {"metadata": metadata}
+    logging_obj.log_raw_request_response = True
+    logging_obj.pre_call(input="hi", api_key="", additional_args=_PRIVATE_RAW_REQUEST_ARGS)
+    return metadata
+
+
+def _assert_raw_request_redacted_for_callbacks_only(logging_obj, metadata: dict) -> None:
+    assert metadata["raw_request"] == REDACTED_BY_LITELLM
+    typed_dict: Final = logging_obj.model_call_details["raw_request_typed_dict"]
+    assert typed_dict["raw_request_body"] == _PRIVATE_RAW_REQUEST_ARGS["complete_input_dict"]
+    assert typed_dict["error"] is None
+
+
+def test_pre_call_raw_request_honors_turn_off_message_logging_set_after_import(logging_obj, monkeypatch):
+    monkeypatch.setattr(litellm, "turn_off_message_logging", True)
+
+    metadata = _pre_call_with_raw_request_logging(logging_obj)
+
+    _assert_raw_request_redacted_for_callbacks_only(logging_obj, metadata)
+
+
+def test_pre_call_raw_request_honors_per_request_turn_off_message_logging(logging_obj, monkeypatch):
+    monkeypatch.setattr(litellm, "turn_off_message_logging", False)
+    logging_obj.model_call_details["standard_callback_dynamic_params"] = {"turn_off_message_logging": True}
+
+    metadata = _pre_call_with_raw_request_logging(logging_obj)
+
+    _assert_raw_request_redacted_for_callbacks_only(logging_obj, metadata)
+
+
+def test_debugging_log_honors_json_logs_set_after_import(logging_obj, monkeypatch):
+    monkeypatch.setattr(litellm, "json_logs", True)
+    logging_obj.litellm_request_debug = True
+
+    with patch("litellm.litellm_core_utils.litellm_logging.verbose_logger.warning") as warning:
+        logging_obj._print_llm_call_debugging_log(api_base="https://api.openai.com/v1", headers={}, additional_args={})
+
+    assert "https://api.openai.com/v1" in warning.call_args.kwargs["extra"]["api_base"]
+
+
+def test_debugging_log_with_json_logs_tolerates_missing_headers(logging_obj, monkeypatch):
+    monkeypatch.setattr(litellm, "json_logs", True)
+    logging_obj.litellm_request_debug = True
+
+    with patch("litellm.litellm_core_utils.litellm_logging.verbose_logger.warning") as warning:
+        logging_obj._print_llm_call_debugging_log(api_base="https://api.openai.com/v1", headers=None, additional_args={})
+
+    assert "https://api.openai.com/v1" in warning.call_args.kwargs["extra"]["api_base"]
 
 
 def _streaming_logging_obj_with_callbacks(callbacks: list[CustomLogger]):
@@ -7856,6 +8011,9 @@ _PUBLISHED_BATCH_RATES: Final = MappingProxyType(
         "output_cost_per_token_batches": 4.1e-6,
         "cache_read_input_token_cost_batches": 1.2e-7,
         "cache_creation_input_token_cost_batches": 1.3e-6,
+        "input_cost_per_token_above_200k_tokens_batches": 2.1e-6,
+        "output_cost_per_token_above_200k_tokens_batches": 5.1e-6,
+        "cache_read_input_token_cost_above_200k_tokens_batches": 2.2e-7,
         "input_cost_per_token_above_272k_tokens_batches": 3.1e-6,
         "output_cost_per_token_above_272k_tokens_batches": 7.1e-6,
         "cache_read_input_token_cost_above_272k_tokens_batches": 3.2e-7,
@@ -7864,14 +8022,17 @@ _PUBLISHED_BATCH_RATES: Final = MappingProxyType(
 )
 _PUBLISHED_INPUT_BATCH_KEYS: Final = (
     "input_cost_per_token_batches",
+    "input_cost_per_token_above_200k_tokens_batches",
     "input_cost_per_token_above_272k_tokens_batches",
     "cache_read_input_token_cost_batches",
+    "cache_read_input_token_cost_above_200k_tokens_batches",
     "cache_read_input_token_cost_above_272k_tokens_batches",
     "cache_creation_input_token_cost_batches",
     "cache_creation_input_token_cost_above_272k_tokens_batches",
 )
 _PUBLISHED_OUTPUT_BATCH_KEYS: Final = (
     "output_cost_per_token_batches",
+    "output_cost_per_token_above_200k_tokens_batches",
     "output_cost_per_token_above_272k_tokens_batches",
 )
 
@@ -7960,28 +8121,30 @@ def test_batch_cost_calculator_bills_the_carried_output_tier_when_the_deployment
     )
 
 
+@pytest.mark.parametrize(
+    "tier_key",
+    ["input_cost_per_token_above_200k_tokens_batches", "input_cost_per_token_above_272k_tokens_batches"],
+)
 def test_deployment_pricing_model_info_honors_a_tier_only_batch_override_over_the_published_flat_rates(
-    _published_batch_model: None,
+    _published_batch_model: None, tier_key: str
 ) -> None:
     from litellm.litellm_core_utils.litellm_logging import deployment_pricing_model_info
 
-    info: Final = deployment_pricing_model_info(
-        _batch_deployment_id({"input_cost_per_token_above_272k_tokens_batches": 1e-3}), _PUBLISHED_BATCH_DEPLOYMENT
-    )
+    info: Final = deployment_pricing_model_info(_batch_deployment_id({tier_key: 1e-3}), _PUBLISHED_BATCH_DEPLOYMENT)
     carried_keys: Final = tuple(
-        key
-        for key in (*_PUBLISHED_INPUT_BATCH_KEYS, *_PUBLISHED_OUTPUT_BATCH_KEYS)
-        if key != "input_cost_per_token_above_272k_tokens_batches"
+        key for key in (*_PUBLISHED_INPUT_BATCH_KEYS, *_PUBLISHED_OUTPUT_BATCH_KEYS) if key != tier_key
     )
 
     assert info is not None
-    assert info["input_cost_per_token_above_272k_tokens_batches"] == 1e-3
+    assert info[tier_key] == 1e-3
     assert {key: info[key] for key in carried_keys} == {key: _PUBLISHED_BATCH_RATES[key] for key in carried_keys}
 
 
 @pytest.mark.parametrize(
     "override_key",
     (
+        "output_cost_per_token_above_200k_tokens_batches",
+        "cache_read_input_token_cost_above_200k_tokens_batches",
         "cache_creation_input_token_cost_above_200k_tokens_batches",
     ),
 )
@@ -8720,6 +8883,58 @@ async def test_async_failure_handler_delivers_failure_payload_to_custom_logger()
     assert events.empty()
 
 
+def test_responses_completed_event_bills_the_served_service_tier():
+    """The served service_tier on response.completed's inner ResponsesAPIResponse
+    must reach the cost calculator, so a priority-served stream prices at the
+    priority rates instead of the default tier's."""
+    logging_obj: Final = LitellmLogging(
+        model="openai/gpt-5.1",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+        call_type="aresponses",
+        start_time=time.time(),
+        litellm_call_id="resp-served-tier",
+        function_id="resp-served-tier",
+    )
+    logging_obj.update_environment_variables(
+        model="openai/gpt-5.1",
+        user="",
+        optional_params={},
+        litellm_params={},
+        custom_llm_provider="openai",
+    )
+    inner: Final = ResponsesAPIResponse(
+        id="resp-served-tier",
+        created_at=1,
+        object="response",
+        status="completed",
+        model="gpt-5.1",
+        output=[],
+        usage=ResponseAPIUsage(input_tokens=10, output_tokens=20, total_tokens=30),
+        service_tier="priority",
+    )
+    event: Final = ResponseCompletedEvent(type="response.completed", response=inner)
+
+    cost: Final = logging_obj._response_cost_calculator(result=event)  # pyright: ignore[reportPrivateUsage]  # parity with the suite's own direct calls
+
+    billed_response: Final = ModelResponse(
+        model="gpt-5.1",
+        usage=litellm.Usage(prompt_tokens=10, completion_tokens=20, total_tokens=30),
+    )
+    tier_cost: Final = litellm.completion_cost(
+        completion_response=billed_response,
+        model="openai/gpt-5.1",
+        service_tier="priority",
+    )
+    default_cost: Final = litellm.completion_cost(
+        completion_response=billed_response,
+        model="openai/gpt-5.1",
+    )
+
+    assert cost == pytest.approx(tier_cost)
+    assert cost > default_cost
+
+
 def _image_logging_obj() -> LitellmLogging:
     logging_obj = LitellmLogging(
         model="gpt-image-2",
@@ -8841,3 +9056,158 @@ async def test_prompt_management_with_unchanged_variables_replays_a_byte_identic
     assert json.dumps(messages_n_plus_one[: len(messages_n)], sort_keys=True) == json.dumps(messages_n, sort_keys=True)
     assert messages_n[0] == {"role": "system", "content": "You are a pirate. Answer in one sentence."}
     assert len(messages_n_plus_one) == len(messages_n) + 2
+
+
+def test_signoz_dispatch_prefers_otel_v2_when_flag_on(monkeypatch):
+    from litellm.integrations.otel.logger import OpenTelemetryV2
+    from litellm.integrations.otel.model.config import ExporterOwner, is_otel_v2_enabled
+    from litellm.litellm_core_utils import litellm_logging as logging_module
+
+    logging_module._in_memory_loggers.clear()
+    monkeypatch.setenv("LITELLM_OTEL_V2", "true")
+    monkeypatch.setenv("SIGNOZ_INGESTION_ENDPOINT", "https://ingest.eu.signoz.cloud:443")
+    monkeypatch.setenv("SIGNOZ_INGESTION_KEY", "test-key")
+    is_otel_v2_enabled.cache_clear()
+    try:
+        v2_logger = logging_module._init_custom_logger_compatible_class(
+            logging_integration="signoz",
+            internal_usage_cache=None,
+            llm_router=None,
+            custom_logger_init_args={},
+        )
+        assert isinstance(v2_logger, OpenTelemetryV2)
+        assert v2_logger.callback_name == "signoz"
+        spec = next(e for e in v2_logger.config.exporters if e.owner == ExporterOwner.SIGNOZ)
+        assert spec.endpoint == "https://ingest.eu.signoz.cloud:443"
+        assert spec.headers == "signoz-ingestion-key=test-key"
+        again = logging_module._init_custom_logger_compatible_class(
+            logging_integration="signoz",
+            internal_usage_cache=None,
+            llm_router=None,
+            custom_logger_init_args={},
+        )
+        assert again is v2_logger
+    finally:
+        logging_module._in_memory_loggers.clear()
+        monkeypatch.delenv("LITELLM_OTEL_V2", raising=False)
+        is_otel_v2_enabled.cache_clear()
+
+
+def test_signoz_dispatch_keeps_legacy_otel_when_flag_off(monkeypatch):
+    from litellm.integrations.opentelemetry import OpenTelemetry
+    from litellm.integrations.otel.model.config import is_otel_v2_enabled
+    from litellm.litellm_core_utils import litellm_logging as logging_module
+
+    logging_module._in_memory_loggers.clear()
+    monkeypatch.delenv("LITELLM_OTEL_V2", raising=False)
+    monkeypatch.setenv("SIGNOZ_INGESTION_ENDPOINT", "http://signoz-collector.internal:4318")
+    monkeypatch.setenv("SIGNOZ_INGESTION_KEY", "legacy-key")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", raising=False)
+    is_otel_v2_enabled.cache_clear()
+    try:
+        legacy = logging_module._init_custom_logger_compatible_class(
+            logging_integration="signoz",
+            internal_usage_cache=None,
+            llm_router=None,
+            custom_logger_init_args={},
+        )
+        assert isinstance(legacy, OpenTelemetry)
+        assert legacy.callback_name == "signoz"
+        assert legacy.config.endpoint == "http://signoz-collector.internal:4318/v1/traces"
+        assert legacy.config.headers == "signoz-ingestion-key=legacy-key"
+        assert "OTEL_EXPORTER_OTLP_TRACES_HEADERS" not in os.environ
+        # Same name resolves to the same instance, not a second exporter.
+        again = logging_module._init_custom_logger_compatible_class(
+            logging_integration="signoz",
+            internal_usage_cache=None,
+            llm_router=None,
+            custom_logger_init_args={},
+        )
+        assert again is legacy
+    finally:
+        logging_module._in_memory_loggers.clear()
+        is_otel_v2_enabled.cache_clear()
+
+
+def test_signoz_dispatch_requires_an_endpoint(monkeypatch):
+    from litellm.integrations.otel.model.config import is_otel_v2_enabled
+    from litellm.litellm_core_utils import litellm_logging as logging_module
+
+    logging_module._in_memory_loggers.clear()
+    monkeypatch.setenv("LITELLM_OTEL_V2", "true")
+    monkeypatch.delenv("SIGNOZ_INGESTION_ENDPOINT", raising=False)
+    monkeypatch.delenv("SIGNOZ_INGESTION_KEY", raising=False)
+    is_otel_v2_enabled.cache_clear()
+    try:
+        created = logging_module._init_custom_logger_compatible_class(
+            logging_integration="signoz",
+            internal_usage_cache=None,
+            llm_router=None,
+            custom_logger_init_args={},
+        )
+        assert created is None
+        assert not [
+            cb for cb in logging_module._in_memory_loggers if getattr(cb, "callback_name", None) == "signoz"
+        ]
+    finally:
+        logging_module._in_memory_loggers.clear()
+        monkeypatch.delenv("LITELLM_OTEL_V2", raising=False)
+        is_otel_v2_enabled.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_background_interaction_completion_logs_while_in_progress_handler_is_parked(monkeypatch):
+    """
+    The create's in_progress success handler can still be parked on awaited work when
+    the settlement arrives. The completed result is the only event carrying usage and
+    cost, so it has to reach the success callbacks whatever the one-success-log-per-request
+    dedupe does, or the settlement is marked billed with no spend row behind it.
+    """
+    from litellm.litellm_core_utils import litellm_logging
+    from litellm.types.interactions import InteractionsAPIResponse
+
+    class CountingLogger(CustomLogger):
+        def __init__(self):
+            super().__init__()
+            self.logged_results: list[object] = []
+
+        async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+            self.logged_results.append(response_obj)
+
+    counting_logger: Final = CountingLogger()
+    monkeypatch.setattr(litellm, "_async_success_callback", [counting_logger])
+
+    in_progress_parked: Final = asyncio.Event()
+    release_in_progress: Final = asyncio.Event()
+    real_truncate: Final = litellm_logging.truncate_base64_in_messages_async
+    calls: list[int] = []
+
+    async def parked_then_real_truncate(messages):
+        calls.append(1)
+        if len(calls) == 1:
+            in_progress_parked.set()
+            await release_in_progress.wait()
+        return await real_truncate(messages)
+
+    monkeypatch.setattr(litellm_logging, "truncate_base64_in_messages_async", parked_then_real_truncate)
+
+    logging_obj: Final = _interactions_logging_obj(stream=False)
+    in_progress: Final = InteractionsAPIResponse(id="interactions/abc", model="gemini-2.5-flash", status="in_progress")
+    completed: Final = InteractionsAPIResponse(
+        id="interactions/abc",
+        model="gemini-2.5-flash",
+        status="completed",
+        steps=[],
+        usage=dict(INTERACTIONS_USAGE_BLOCK),
+    )
+
+    first: Final = asyncio.create_task(logging_obj.async_success_handler(result=in_progress))
+    await in_progress_parked.wait()
+    completion: Final = asyncio.create_task(logging_obj.async_log_background_interaction_completion(result=completed))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    release_in_progress.set()
+    await first
+    await completion
+
+    assert counting_logger.logged_results == [completed, in_progress], counting_logger.logged_results

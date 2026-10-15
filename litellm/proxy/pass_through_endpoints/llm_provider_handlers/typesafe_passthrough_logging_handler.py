@@ -17,6 +17,7 @@ from litellm.types.utils import ModelResponse, StandardPassThroughResponseObject
 class _TypeSafeUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
+    cost: float | None = None
 
 
 class _TypeSafeResponse(BaseModel):
@@ -82,14 +83,16 @@ class TypeSafePassthroughLoggingHandler:
         )
         pricing: Final = _pricing_for(candidate_model_keys)
         response_cost: Final = (
-            input_tokens * pricing.input_cost_per_token + output_tokens * pricing.output_cost_per_token
+            usage.cost
+            if custom_llm_provider == "openrouter" and usage.cost is not None
+            else input_tokens * pricing.input_cost_per_token + output_tokens * pricing.output_cost_per_token
         )
         usage_object: Final = Usage(
             prompt_tokens=input_tokens,
             completion_tokens=output_tokens,
             total_tokens=input_tokens + output_tokens,
         )
-        updated_kwargs: Final = {  # mutable-ok: pass-through logging contract requires mutable kwargs
+        updated_kwargs: Final = {
             **kwargs,
             "model": model_name,
             "custom_llm_provider": custom_llm_provider,
@@ -109,9 +112,9 @@ class TypeSafePassthroughLoggingHandler:
             logging_obj=logging_obj,
             status="success",
         )
-        return {  # mutable-ok: pass-through logging contract requires mutable result
+        return {
             "result": StandardPassThroughResponseObject(response=result),
-            "kwargs": {  # mutable-ok: pass-through logging contract requires mutable kwargs
+            "kwargs": {
                 **updated_kwargs,
                 "standard_logging_object": standard_logging_object,
             },

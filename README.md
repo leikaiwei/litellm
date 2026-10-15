@@ -12,7 +12,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 修复 Anthropic thinking_blocks 到 DeepSeek reasoning_content 的转换
 - 修复 Anthropic 兼容端点 fallback（如 qwen/claude 回退到 deepseek）时，历史里外来 thinking 块导致 DeepSeek 400 的问题；命中该 400 时自动修复 assistant 历史（redacted_thinking 转占位 thinking 块、给含 tool_use 却无 thinking 块的消息注入占位块）并重试，直连场景不受影响
 
-**Anthropic 流式适配器空 choices 防护** — `llms/anthropic/experimental_pass_through/adapters/transformation.py`
+**Anthropic 流式适配器空 choices 防护** — `llms/anthropic/pass_through/adapters/transformation.py`
 - 症状：Claude Code 等 `/v1/messages` 客户端流式调用 OpenAI 形状后端（如 `custom_openai`）时，内容能完整收到，但请求被记为错误且 tokens=0，日志里是 `IndexError: list index out of range`
 - 根因：OpenAI 兼容后端会在流末尾发出 `choices: []` 的空帧，而适配器多处裸取 `choices[0]`。空帧有两种来源：OpenAI 规范里 `include_usage` 的 usage-only 尾帧（适配器对流式请求强制开启该选项），以及网关自定义的非标准帧（实测有后端在流末尾追加一个私有类型的计费帧，`usage` 为 null，真实 usage 挂在前一个 `finish_reason` 帧上）。崩溃发生在响应头已发出之后，所以状态码仍是 200，只是缺了 `message_delta` 和 `message_stop`
 - 修复：空 choices 的 chunk 不丢弃，加判空守卫后继续走已有的 usage 合并路径，usage 仍能进 `message_delta`。同类问题在 Responses API 桥接层一并修掉（Azure 前导 `prompt_filter_results` 空帧也走这条路）
@@ -38,7 +38,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 1.104.0 同步时复核，按文件拆出两个结论。`streaming_chunk_builder_utils.py` 交还上游：上游 08-31 起（1.103.1 里就有，前两轮同步漏看了）在 `_usage_chunk_calculation_helper` 的唯一调用点前加了 `_extract_usage_chunk`，把原生 `CompletionUsage` 先归一成 litellm `Usage`，那个 `in` 判断从此成立，我们改成 `getattr` 的那段已是冗余。判据是把 fork 的回归测试原样放到纯上游 v1.104.0 上跑，`test_provider_native_completion_usage_is_not_replaced_by_estimate` 通过。`streaming_handler.py` 的 `calculate_total_usage` 上游仍是裸的 `"prompt_tokens" in usage`，同一轮对照里 `test_calculate_total_usage_with_provider_native_completion_usage` 在纯上游下失败（0 ≠ 87），补丁保留。两条回归测试都留着
 - 上游 1.104 同时改了缺省语义：usage 帧明确报 0 就记 0，不再回落到本地估算，只有完全没有 usage 帧才估算
 
-**Anthropic 适配层参数泄漏与 thinking-only 消息修复** — `llms/anthropic/experimental_pass_through/adapters/transformation.py`、`llms/anthropic/experimental_pass_through/adapters/handler.py`
+**Anthropic 适配层参数泄漏与 thinking-only 消息修复** — `llms/anthropic/pass_through/adapters/transformation.py`、`llms/anthropic/pass_through/adapters/handler.py`
 - 前提：`/v1/messages` 打 OpenAI 形状后端（`custom_openai`）时要经 anthropic↔openai 双向适配层，原生 anthropic 端点那条路径上的既有补丁全部不参与。以下两个缺陷都用同一请求打原生 anthropic 端点做对照确认：原生 200、经适配层失败
 - 症状一：请求带 `stop_sequences` / `mcp_servers` / `speed` / `cache_control` / `inference_geo` 任一参数时 500，报 `AsyncCompletions.create() got an unexpected keyword argument`
 - 根因一：适配层 `translatable_anthropic_params()` 是反向白名单，名单外的 Anthropic 顶层参数被 `_copy_untranslated_anthropic_params` 原样拷进 `litellm.acompletion(**kwargs)`，一路漏到 OpenAI SDK。`drop_params: true` 拦不住——它只比对 `supported_openai_params`，这些名字压根不在表里。参数有两个注入点：命名参数经 `request_data` 进适配层，其余经 handler 的 `extra_kwargs` 回注，两处都要堵
@@ -58,7 +58,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 上游未修，无对应 issue / PR
 - 注意：`vision_model` 指向的组不能挂这个 guardrail。识图那次 `router.acompletion` 的 call_type 是 `acompletion`，天然穿过门，一旦该组自身也挂上就会无限递归，guardrail 里没有递归保护
 
-**空回复不写响应缓存** — `caching/caching_handler.py`、`llms/anthropic/experimental_pass_through/messages/response_cache.py`
+**空回复不写响应缓存** — `caching/caching_handler.py`、`llms/anthropic/pass_through/messages/response_cache.py`
 - 症状：客户端调用后长时间无输出，之后自动重试全部瞬时返回同样的空回复，会话彻底卡死，只能手动发一句"继续"才恢复
 - 根因：上游偶发静默拒答，回 HTTP 200 加空 `content` 加 `finish_reason: stop`，litellm 判为 success（`attempted_retries: 0`、`error_information: null`，故 `num_retries` 与模型组 fallback 全部绕过）。这个空回复随后被写进响应缓存，默认 TTL 60 秒，于是窗口内每次重试都命中缓存秒回同一个空回复。生产实测同一 request_id 三条记录：首条真实请求耗时 181 秒，随后两条 `cache_hit=True` 各 0.01 秒返回，重试彻底失去意义
 - 修复：`_should_store_result_in_cache` 加一条判空，所有 choices 都没有实质内容时不写缓存。判空覆盖 `content` 之外的 `tool_calls` / `function_call` / `reasoning_content` / `thinking_blocks` / `audio` / `images`，故纯工具调用与纯推理回复不受影响；空格等仍算内容，不猜测语义。该函数是 sync 与 async、流式与非流式四条路径的唯一决策点（流式经 `_add_streaming_response_to_cache` 汇入），改一处全覆盖
@@ -92,6 +92,10 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 需要它是因为 fork 里加了上游尚未收录的模型（如 `anthropic/deepseek-v4-pro`），不补的话联网拉表会把这些条目整个丢掉
 - 1.103.1 同步时扩面：上游把远端加载重构成三条路径，启动时同步首拉（`get_model_cost_map`）、首拉遇瞬时错误后的后台重试（`_retry_remote_fetch_in_background`）、proxy 运行期重载（`refetch_model_cost_map`）。原补丁只挂在同步首拉上，另外两条一旦生效就会用纯远端表整体替换，把本地条目丢掉。现在三处统一走 `_finalize_remote_model_cost_map`，测试覆盖首拉与运行期重载两条入口
 - 1.104.0 同步时复核：上游在 `_finalize_loaded_model_cost_map` 里加了一份「最近一次加载的目录」快照（`loaded_model_cost_map`，供模型管理接口读）。我们的 `_finalize_remote_model_cost_map` 是先补缺再调它，所以快照里同样带着本地条目，不用改
+
+1.105.1 同步核对结论：同步 105 系列最新稳定补丁版，包含 105.0 的模型用量聚合锁争用与 Responses 桥接重复日志修复。现有生产补丁上游仍未吸收，全部保留。Anthropic 目录从 `experimental_pass_through` 改为 `pass_through`，生产补丁、自有测试与 thinking-switch 测试随之迁移。空回复缓存判定保留上游新的 call-type 规则与后台写入机制，回归测试等待后台写入后再检查缓存；两条上游缓存生命周期测试改用非空样本，仍验证原来的写入时序。deployment guardrail 同时保留我们的 `anthropic_messages` 支持和上游从 metadata 提取鉴权信息的新逻辑。旧 UI sentinel 回归测试已由上游拆分后的 `test_user_api_key_auth_request_flow.py` 中三条同类用例覆盖，不再保留重复测试。DeepSeek Anthropic 镜像条目继续与本地表一起补缺远端价格表
+
+105 新增六份数据库迁移，没有业务数据重写；SpendLogs 仅新增可空 `billing_agent_id`，仍需在部署窗口获取表锁。数据库初始化失败现在始终退出，`ENFORCE_PRISMA_MIGRATION_CHECK=false` 不能再绕过，`--no-enforce_prisma_migration_check` 已移除。SpendLogs 手工索引改为启动后后台并发补建。构建和推送镜像不代表生产部署，生产切换须另行执行
 
 1.104.0 同步核对结论：本轮没有补丁被上游新吸收，但查出一处早已冗余的（流式 tokens 统计在 `streaming_chunk_builder_utils.py` 里的那一半，见上），该文件交还上游，其余逐文件核对后全部保留。与上游有差异的文件 42 -> 41（不含 `local_` 目录）。上游这一版把 `tests/test_litellm` 的大部分测试搬到了 `tests/unit`，补丁测试跟着搬：多数由 git 按改名自动带过去，`test_caching_handler.py` 因上游同时大幅扩写而认不出改名，手工移植；fork 独有的两份根目录测试（`test_anthropic_messages_header_forwarding.py`、`test_model_cost_map_local_merge.py`）一并挪到 `tests/unit/`。`llms/deepseek/` 下两个文件上游本轮没有改动；`llms/openrouter/chat/transformation.py` 上游只换了 tokenizer 的类型标注。价格表与上游只差 `anthropic/deepseek-v4-pro` 这一条镜像，native 的 `deepseek/deepseek-v4-pro` 本轮没有调价，镜像仍未跟 `off_peak_pricing`（那是 DeepSeek 官方直连的计费规则）
 
@@ -328,6 +332,31 @@ For MCP OAuth, an upstream may advertise dynamic client registration but refuse 
 
 </details>
 
+<details>
+<summary><b>Agents</b> - Run Claude Code, Codex, OpenCode or Deep Agents on any model (Python SDK)</summary>
+
+### Python SDK - Agents
+
+```python
+import litellm
+from litellm import Harness, sandbox
+
+result = litellm.agent(
+    Harness.CLAUDE_CODE,  # or Harness.CODEX, Harness.OPENCODE, Harness.DEEPAGENTS
+    "Find why tests/test_router.py is flaky and fix it.",
+    sandbox=sandbox.local("./repo"),
+    model="litellm_proxy/claude-sonnet-4-5",  # a model group on your AI Gateway
+)
+
+print(result.text, result.cost, [f.path for f in result.files])
+```
+
+Set `LITELLM_PROXY_API_BASE` and `LITELLM_PROXY_API_KEY` and every model call the agent makes goes through your AI Gateway, tagged `harness,claude_code`. Drop the `litellm_proxy/` prefix to call a provider directly. Install `starlette uvicorn` plus the agent's CLI (`claude`, `codex` or `opencode`), or `deepagents langchain-litellm` for Deep Agents.
+
+[**Docs: Agent Harnesses**](https://docs.litellm.ai/docs/harness)
+
+</details>
+
 ### Supported Providers ([Website Supported Models](https://models.litellm.ai/) | [Docs](https://docs.litellm.ai/docs/providers))
 
 | Provider                                                                            | `/chat/completions` | `/messages` | `/responses` | `/embeddings` | `/image/generations` | `/audio/transcriptions` | `/audio/speech` | `/moderations` | `/batches` | `/rerank` |
@@ -422,13 +451,16 @@ For MCP OAuth, an upstream may advertise dynamic client registration but refuse 
 | [Recraft (`recraft`)](https://docs.litellm.ai/docs/providers/recraft) |  |  |  |  | ✅ |  |  |  |  |  |
 | [Replicate (`replicate`)](https://docs.litellm.ai/docs/providers/replicate) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Sagemaker Chat (`sagemaker_chat`)](https://docs.litellm.ai/docs/providers/aws_sagemaker) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
+| [Sail (`sail`)](https://docs.litellm.ai/docs/providers/sail) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Sambanova (`sambanova`)](https://docs.litellm.ai/docs/providers/sambanova) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Snowflake (`snowflake`)](https://docs.litellm.ai/docs/providers/snowflake) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
+| [Strands Decider (`strands_decider`)](https://docs.litellm.ai/docs/providers) |  |  |  |  |  |  |  |  |  |  |
 | [Text Completion Codestral (`text-completion-codestral`)](https://docs.litellm.ai/docs/providers/codestral) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Text Completion OpenAI (`text-completion-openai`)](https://docs.litellm.ai/docs/providers/text_completion_openai) | ✅ | ✅ | ✅ |  |  | ✅ | ✅ | ✅ | ✅ |  |
 | [Together AI (`together_ai`)](https://docs.litellm.ai/docs/providers/togetherai) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Topaz (`topaz`)](https://docs.litellm.ai/docs/providers/topaz) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Triton (`triton`)](https://docs.litellm.ai/docs/providers/triton-inference-server) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
+| [Typesafe Decisions API (`typesafe`)](https://docs.litellm.ai/docs/providers) |  |  |  |  |  |  |  |  |  |  |
 | [V0 (`v0`)](https://docs.litellm.ai/docs/providers/v0) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Vercel AI Gateway (`vercel_ai_gateway`)](https://docs.litellm.ai/docs/providers/vercel_ai_gateway) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [VLLM (`vllm`)](https://docs.litellm.ai/docs/providers/vllm) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |

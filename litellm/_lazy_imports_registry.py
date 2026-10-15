@@ -153,6 +153,14 @@ LLM_CONFIG_NAMES: Final = (
     "JinaAIRerankConfig",
     "DeepinfraRerankConfig",
     "HostedVLLMRerankConfig",
+    "PerplexityDecisionsConfig",
+    "TypeSafeDecisionsConfig",
+    "OpenRouterDecisionsConfig",
+    "CloudflareDecisionsConfig",
+    "StrandsDeciderDecisionsConfig",
+    "HostedVLLMDecisionsConfig",
+    "OpenAIDecisionsConfig",
+    "AzureAIDecisionsConfig",
     "NvidiaNimRerankConfig",
     "NvidiaNimRankingConfig",
     "VertexAIRerankConfig",
@@ -206,6 +214,7 @@ LLM_CONFIG_NAMES: Final = (
     "AmazonTwelveLabsPegasusConfig",
     "AmazonInvokeConfig",
     "AmazonBedrockOpenAIConfig",
+    "AmazonBedrockRuntimeChatCompletionsConfig",
     "AmazonStabilityConfig",
     "AmazonStability3Config",
     "AmazonNovaCanvasConfig",
@@ -695,6 +704,20 @@ _LLM_CONFIGS_IMPORT_MAP: Final = {
         ".llms.hosted_vllm.rerank.transformation",
         "HostedVLLMRerankConfig",
     ),
+    "PerplexityDecisionsConfig": (".llms.perplexity.decisions.transformation", "PerplexityDecisionsConfig"),
+    "TypeSafeDecisionsConfig": (".llms.typesafe.decisions.transformation", "TypeSafeDecisionsConfig"),
+    "OpenRouterDecisionsConfig": (".llms.openrouter.decisions.transformation", "OpenRouterDecisionsConfig"),
+    "CloudflareDecisionsConfig": (".llms.cloudflare.decisions.transformation", "CloudflareDecisionsConfig"),
+    "StrandsDeciderDecisionsConfig": (
+        ".llms.strands_decider.decisions.transformation",
+        "StrandsDeciderDecisionsConfig",
+    ),
+    "HostedVLLMDecisionsConfig": (
+        ".llms.hosted_vllm.decisions.transformation",
+        "HostedVLLMDecisionsConfig",
+    ),
+    "OpenAIDecisionsConfig": (".llms.openai.decisions.transformation", "OpenAIDecisionsConfig"),
+    "AzureAIDecisionsConfig": (".llms.azure_ai.decisions.transformation", "AzureAIDecisionsConfig"),
     "NvidiaNimRerankConfig": (
         ".llms.nvidia_nim.rerank.transformation",
         "NvidiaNimRerankConfig",
@@ -742,7 +765,7 @@ _LLM_CONFIGS_IMPORT_MAP: Final = {
     ),
     "CohereChatConfig": (".llms.cohere.chat.transformation", "CohereChatConfig"),
     "AnthropicMessagesConfig": (
-        ".llms.anthropic.experimental_pass_through.messages.transformation",
+        ".llms.anthropic.pass_through.messages.transformation",
         "AnthropicMessagesConfig",
     ),
     "BedrockClaudePlatformMessagesConfig": (
@@ -867,6 +890,10 @@ _LLM_CONFIGS_IMPORT_MAP: Final = {
     "AmazonBedrockOpenAIConfig": (
         ".llms.bedrock.chat.invoke_transformations.amazon_openai_transformation",
         "AmazonBedrockOpenAIConfig",
+    ),
+    "AmazonBedrockRuntimeChatCompletionsConfig": (
+        ".llms.bedrock.chat.chat_completions.transformation",
+        "AmazonBedrockRuntimeChatCompletionsConfig",
     ),
     "AmazonStabilityConfig": (
         ".llms.bedrock.image_generation.amazon_stability1_transformation",

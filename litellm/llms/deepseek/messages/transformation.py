@@ -7,7 +7,7 @@ from typing import Any, Final
 import httpx
 
 import litellm
-from litellm.llms.anthropic.experimental_pass_through.messages.transformation import (
+from litellm.llms.anthropic.pass_through.messages.transformation import (
     AnthropicMessagesConfig,
 )
 from litellm.llms.bedrock.common_utils import (

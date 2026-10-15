@@ -45,6 +45,7 @@ import litellm.router as litellm_router_module  # noqa: E402  # same import-time
 import litellm.utils as litellm_utils_module  # noqa: E402  # same import-time dependency
 from litellm._logging import ALL_LOGGERS  # noqa: E402  # same import-time dependency
 from litellm.anthropic_beta_headers_manager import reload_beta_headers_config  # noqa: E402  # same import-time dependency
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER  # noqa: E402  # same import-time dependency
 from litellm.litellm_core_utils.prompt_templates import factory as prompt_factory_module  # noqa: E402  # same import-time dependency
 from litellm.litellm_core_utils.prompt_templates import (  # noqa: E402  # same import-time dependency
     image_handling as image_handling_module,
@@ -157,6 +158,31 @@ def _run_coroutine_if_needed(result: object) -> None:
         loop.create_task(coroutine)
 
 
+async def _complete_test_logging() -> None:
+    await GLOBAL_LOGGING_WORKER.flush()
+    await GLOBAL_LOGGING_WORKER.stop()
+
+
+def _flush_completed_test_logging() -> None:
+    queue: Final = GLOBAL_LOGGING_WORKER._queue
+    if queue is None or queue._unfinished_tasks == 0:
+        return
+    worker_loop: Final = GLOBAL_LOGGING_WORKER._bound_loop
+    if worker_loop is None or worker_loop.is_closed():
+        _run_coroutine_if_needed(_complete_test_logging())
+        return
+    if worker_loop.is_running():
+        asyncio.run_coroutine_threadsafe(_complete_test_logging(), worker_loop).result()
+        return
+    worker_loop.run_until_complete(_complete_test_logging())
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call() -> Iterator[None]:
+    yield
+    _flush_completed_test_logging()
+
+
 def _close_handler_if_needed(handler: object) -> None:
     close: Final = getattr(handler, "close", None)
     if not callable(close):
@@ -180,6 +206,11 @@ def _flush_client_caches() -> None:
     litellm.in_memory_llm_clients_cache.flush_cache()
     image_handling_module.in_memory_cache.flush_cache()
     _reset_aws_auth_caches()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def bundled_tiktoken_cache() -> None:
+    importlib.import_module("litellm.litellm_core_utils.default_encoding")
 
 
 @pytest.fixture(scope="session")

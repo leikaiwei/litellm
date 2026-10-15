@@ -13,7 +13,7 @@ import guardrailsAiLogo from "../../../../../public/assets/logos/guardrails_ai.j
 import javelinLogo from "../../../../../public/assets/logos/javelin.png";
 import lakeraAiLogo from "../../../../../public/assets/logos/lakeraai.jpeg";
 import lassoLogo from "../../../../../public/assets/logos/lasso.png";
-import litellmLogo from "../../../../../public/assets/logos/litellm_logo.jpg";
+import litellmLogo from "../../../../../public/assets/logos/litellm_monogram.svg";
 import microsoftAzureLogo from "../../../../../public/assets/logos/microsoft_azure.svg";
 import nomaSecurityLogo from "../../../../../public/assets/logos/noma_security.png";
 import openaiSmallLogo from "../../../../../public/assets/logos/openai_small.svg";
@@ -87,6 +87,12 @@ export const guardrail_provider_map: Record<string, string> = {
   Repelloai: "repelloai",
   Alice: "alice",
   Conduct: "conduct",
+  DecisionModel: "decision_model",
+};
+
+// Search aliases matched alongside the provider label in the add-guardrail provider combobox
+export const guardrail_provider_search_aliases: Record<string, string[]> = {
+  decision_model: ["jev", "typesafe", "prompt injection", "jailbreak", "decision"],
 };
 
 // Function to populate provider map from API response - updates the original map
@@ -177,6 +183,11 @@ export const shouldRenderLLMJudgeFields = (provider: string | null) => {
   return guardrail_provider_map[provider] === "llm_as_a_judge";
 };
 
+export const shouldRenderDecisionModelFields = (provider: string | null) => {
+  if (!provider) return false;
+  return guardrail_provider_map[provider] === "decision_model";
+};
+
 export const guardrailLogoMap = {
   "Zscaler AI Guard": zscalerLogo.src,
   "Presidio PII": microsoftAzureLogo.src,
@@ -212,6 +223,7 @@ export const guardrailLogoMap = {
   Alice: aliceLogo.src,
   "Microsoft Agent 365": microsoftAzureLogo.src,
   "Conduct Guard": conductLogo.src,
+  "Decision Model": litellmLogo.src,
 } satisfies Record<string, string>;
 
 export const getGuardrailLogo = (displayName: string): string | undefined =>

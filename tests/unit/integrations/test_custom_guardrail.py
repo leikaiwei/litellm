@@ -65,11 +65,14 @@ class TestCustomGuardrailDeploymentHook:
             "messages": original_messages,
             "model": "gpt-3.5-turbo",
             "guardrails": ["some_guardrail"],
-            "user_api_key_user_id": "test_user",
-            "user_api_key_team_id": "test_team",
-            "user_api_key_end_user_id": "test_end_user",
-            "user_api_key_hash": "test_hash",
-            "user_api_key_request_route": "test_route",
+            "user_api_key_team_id": "team-typed-into-the-request-body",
+            "metadata": {
+                "user_api_key_user_id": "test_user",
+                "user_api_key_team_id": "test_team",
+                "user_api_key_end_user_id": "test_end_user",
+                "user_api_key_hash": "test_hash",
+                "user_api_key_request_route": "test_route",
+            },
         }
 
         result = await custom_guardrail.async_pre_call_deployment_hook(kwargs=kwargs, call_type=CallTypes.completion)
@@ -200,9 +203,7 @@ class TestCustomGuardrailDeploymentHook:
         it dead for the whole fallback path."""
         custom_guardrail = CustomGuardrail(guardrail_name="g1", default_on=True)
         rewritten = [{"role": "user", "content": "[Image description: a red square]"}]
-        custom_guardrail.async_pre_call_hook = AsyncMock(
-            return_value={"messages": rewritten}
-        )
+        custom_guardrail.async_pre_call_hook = AsyncMock(return_value={"messages": rewritten})
 
         kwargs = {
             "messages": [
@@ -222,6 +223,12 @@ class TestCustomGuardrailDeploymentHook:
             ],
             "model": "deepseek-v4-flash",
             "guardrails": ["g1"],
+            "metadata": {
+                "user_api_key_user_id": "user-1",
+                "user_api_key_team_id": "team-1",
+                "user_api_key_hash": "hashed-key",
+                "user_api_key_request_route": "/v1/messages",
+            },
         }
 
         result = await custom_guardrail.async_pre_call_deployment_hook(
@@ -229,11 +236,15 @@ class TestCustomGuardrailDeploymentHook:
         )
 
         custom_guardrail.async_pre_call_hook.assert_called_once()
-        assert (
-            custom_guardrail.async_pre_call_hook.call_args[1]["call_type"]
-            == "anthropic_messages"
-        )
+        assert custom_guardrail.async_pre_call_hook.call_args[1]["call_type"] == "anthropic_messages"
         assert result["messages"] == rewritten
+        auth: Final = custom_guardrail.async_pre_call_hook.call_args.kwargs["user_api_key_dict"]
+        assert (auth.user_id, auth.team_id, auth.api_key, auth.request_route) == (
+            "user-1",
+            "team-1",
+            "hashed-key",
+            "/v1/messages",
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -252,9 +263,7 @@ class TestCustomGuardrailDeploymentHook:
         original = [{"role": "user", "content": "hi"}]
         kwargs = {"messages": original, "model": "gpt-4o", "guardrails": ["g1"]}
 
-        result = await custom_guardrail.async_pre_call_deployment_hook(
-            kwargs=kwargs, call_type=call_type
-        )
+        result = await custom_guardrail.async_pre_call_deployment_hook(kwargs=kwargs, call_type=call_type)
 
         custom_guardrail.async_pre_call_hook.assert_not_called()
         assert result["messages"] == original
@@ -2030,7 +2039,7 @@ class TestOnlyScanNewMessages:
     def _guardrail(self, **overrides):
         params = dict(guardrail_name="test-guard", only_scan_new_messages=True)
         params.update(overrides)
-        return CustomGuardrail(**params)
+        return CustomGuardrail(**params)  # pyright: ignore[reportArgumentType]  # params values mix str/bool
 
     def _cache(self):
         from litellm.caching import DualCache
@@ -3006,9 +3015,7 @@ async def test_native_lifecycle_guardrail_logging_only_scans_assembled_response(
     from litellm.types.utils import Choices, Message, ModelResponse
 
     guardrail = _NativeLifecycleLoggingGuardrail()
-    assembled = ModelResponse(
-        choices=[Choices(message=Message(role="assistant", content="assembled stream text"))]
-    )
+    assembled = ModelResponse(choices=[Choices(message=Message(role="assistant", content="assembled stream text"))])
     sentinel_result = object()
     kwargs = {
         "model": "gpt-5.4-mini",
@@ -3233,3 +3240,37 @@ class TestPreCallHookResponseIsNotLoggedVerbatim:
         )
 
         assert self._logged_response(data) == "allow"
+
+
+class TestCustomGuardrailTimeout:
+    def test_timeout_constructor_exposes_it(self):
+        guardrail = CustomGuardrail(guardrail_name="g1", timeout=2.5)
+
+        assert guardrail.timeout == 2.5
+
+    def test_timeout_unset_stays_none(self):
+        guardrail = CustomGuardrail(guardrail_name="g1")
+
+        assert guardrail.timeout is None
+
+    @pytest.mark.parametrize("configured, expected", [(None, 10.0), (3, 3)])
+    def test_unset_timeout_keeps_default_assigned_before_super_init(self, configured, expected):
+        class PresetTimeoutGuardrail(CustomGuardrail):
+            def __init__(self, **kwargs):
+                self.timeout = 10.0
+                super().__init__(guardrail_name="preset", **kwargs)
+
+        guardrail = PresetTimeoutGuardrail(timeout=configured)
+
+        assert guardrail.timeout == expected
+
+    def test_update_in_memory_litellm_params_refreshes_timeout(self):
+        from litellm.types.guardrails import LitellmParams
+
+        guardrail = CustomGuardrail(guardrail_name="g1", timeout=2.5)
+
+        guardrail.update_in_memory_litellm_params(
+            LitellmParams(guardrail="generic_guardrail_api", mode="pre_call", timeout=7)
+        )
+
+        assert guardrail.timeout == 7.0

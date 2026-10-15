@@ -1,5 +1,6 @@
 """Test health check helper functions"""
 
+import json
 import socket
 import struct
 import zlib
@@ -8,6 +9,7 @@ from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import respx
 
 import litellm
 from litellm.constants import LITTELM_INTERNAL_HEALTH_SERVICE_ACCOUNT_NAME
@@ -361,6 +363,26 @@ async def test_batch_health_check_uses_alist_batches_for_supported_providers():
 
 
 @pytest.mark.asyncio
+async def test_batch_health_check_hands_the_resolved_provider_to_alist_batches():
+    filtered_model_params: Final = {
+        "model": "xai/grok-4.3",
+        "api_key": "sk-test",
+        "litellm_metadata": {"tags": [LITTELM_INTERNAL_HEALTH_SERVICE_ACCOUNT_NAME]},
+    }
+
+    with patch("litellm.alist_batches", new_callable=AsyncMock, return_value={}) as mock_alist:
+        await HealthCheckHelpers._batch_health_check(
+            custom_llm_provider="xai",
+            model_params={**filtered_model_params, "messages": []},
+            filtered_model_params=filtered_model_params,
+        )
+
+    assert mock_alist.call_args.kwargs["custom_llm_provider"] == "xai"
+    assert mock_alist.call_args.kwargs["model"] == "xai/grok-4.3"
+    assert mock_alist.call_args.kwargs["api_key"] == "sk-test"
+
+
+@pytest.mark.asyncio
 async def test_batch_health_check_falls_back_to_acompletion_for_unsupported():
     """Providers not in LIST_BATCHES_SUPPORTED_PROVIDERS fall back to acompletion."""
     mock_logging_obj = MagicMock()
@@ -528,3 +550,175 @@ def test_ocr_health_check_document_raises_without_the_extension():
             _ocr_health_check_document(model="mistral/mistral-ocr-latest", custom_llm_provider="mistral")
     finally:
         NATIVE_OCR_HEALTH_CHECK_DOCUMENT.reset()
+
+
+@pytest.mark.parametrize(
+    ("model", "upstream_url"),
+    (
+        ("perplexity/pplx-decider-v1-27b", "https://api.perplexity.ai/v1/decisions"),
+        ("cloudflare/clef", "https://api.cloudflare.com/client/v4/accounts/acct-1/ai/run/@cf/cloudflare/clef"),
+    ),
+)
+async def test_ahealth_check_probes_evaluation_models_through_the_decisions_api(
+    model: str,
+    upstream_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    respx_mock: respx.MockRouter,
+) -> None:
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct-1")
+    monkeypatch.delenv("CLOUDFLARE_API_BASE", raising=False)
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    litellm.in_memory_llm_clients_cache.flush_cache()
+    upstream: Final = respx_mock.post(upstream_url).respond(
+        json={
+            "model": model,
+            "answers": {"reachable": {"type": "noul", "noul": 1.0}},
+            "usage": {"input_tokens": 12, "output_tokens": 1},
+        }
+    )
+
+    result: Final = await ahealth_check({"model": model, "api_key": "sk-test"}, mode=None)
+
+    assert "error" not in result, result
+    assert upstream.called
+    sent: Final = json.loads(upstream.calls[0].request.content)
+    assert sent["state"] == "health check"
+    assert sent["questions"]["reachable"]["type"] == "noul"
+
+
+@pytest.mark.asyncio
+async def test_ahealth_check_evaluation_uses_configured_probe_state_and_questions(
+    monkeypatch: pytest.MonkeyPatch,
+    respx_mock: respx.MockRouter,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    litellm.in_memory_llm_clients_cache.flush_cache()
+    upstream: Final = respx_mock.post("https://api.perplexity.ai/v1/decisions").respond(
+        json={
+            "model": "perplexity/pplx-decider-v1-27b",
+            "answers": {"ok": {"type": "noul", "noul": 1.0}},
+            "usage": {"input_tokens": 12, "output_tokens": 1},
+        }
+    )
+
+    result: Final = await ahealth_check(
+        {
+            "model": "perplexity/pplx-decider-v1-27b",
+            "api_key": "sk-test",
+            "state": "custom probe",
+            "questions": {"ok": {"type": "noul", "instructions": "Is it ok?"}},
+        },
+        mode=None,
+    )
+
+    assert "error" not in result, result
+    assert upstream.called
+    sent: Final = json.loads(upstream.calls[0].request.content)
+    assert sent["state"] == "custom probe"
+    assert set(sent["questions"]) == {"ok"}
+
+
+@pytest.mark.asyncio
+async def test_ahealth_check_probes_strands_through_decisions_without_mode(
+    local_model_cost_map: None,
+    monkeypatch: pytest.MonkeyPatch,
+    respx_mock: respx.MockRouter,
+) -> None:
+    monkeypatch.delenv("STRANDS_DECIDER_API_KEY", raising=False)
+    monkeypatch.delenv("STRANDS_DECIDER_API_BASE", raising=False)
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    litellm.in_memory_llm_clients_cache.flush_cache()
+    upstream: Final = respx_mock.post("http://strands.local:8080/v1/systemone").respond(
+        json={
+            "model": "strands-decider-2B-hobson-v19",
+            "answers": {"reachable": {"type": "noul", "noul": 1.0}},
+            "usage": {"input_tokens": 12, "output_tokens": 1},
+        }
+    )
+
+    result: Final = await ahealth_check(
+        {
+            "model": "strands_decider/strands-decider-2B-hobson-v19",
+            "api_base": "http://strands.local:8080",
+        },
+        mode=None,
+    )
+
+    assert "error" not in result, result
+    assert upstream.called
+    assert "authorization" not in upstream.calls[0].request.headers
+
+
+@pytest.mark.asyncio
+async def test_ahealth_check_probes_hosted_vllm_with_a_choice_question(
+    monkeypatch: pytest.MonkeyPatch,
+    respx_mock: respx.MockRouter,
+) -> None:
+    monkeypatch.delenv("HOSTED_VLLM_API_KEY", raising=False)
+    monkeypatch.delenv("HOSTED_VLLM_API_BASE", raising=False)
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    litellm.in_memory_llm_clients_cache.flush_cache()
+    upstream: Final = respx_mock.post("http://vllm.local:8000/v1/systemone").respond(
+        json={
+            "model": "Qwen/Qwen3-0.6B",
+            "answers": {
+                "reachable": {
+                    "type": "choice",
+                    "choice": "yes",
+                    "confidence": 1.0,
+                    "probabilities": {"yes": 1.0, "no": 0.0},
+                }
+            },
+            "usage": {"input_tokens": 12, "output_tokens": 1},
+        }
+    )
+
+    result: Final = await ahealth_check(
+        {
+            "model": "hosted_vllm/Qwen/Qwen3-0.6B",
+            "api_base": "http://vllm.local:8000",
+        },
+        mode="evaluation",
+    )
+
+    assert "error" not in result, result
+    assert upstream.called
+    sent: Final = json.loads(upstream.calls[0].request.content)
+    assert sent["questions"] == {
+        "reachable": {
+            "type": "choice",
+            "instructions": "Is the service reachable?",
+            "criteria": {"yes": None, "no": None},
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_ahealth_check_keeps_the_noul_probe_for_other_decisions_providers(
+    monkeypatch: pytest.MonkeyPatch,
+    respx_mock: respx.MockRouter,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    litellm.in_memory_llm_clients_cache.flush_cache()
+    upstream: Final = respx_mock.post("https://api.typesafe.ai/v1/systemone").respond(
+        json={
+            "model": "jev-1.13",
+            "answers": {"reachable": {"type": "noul", "noul": 1.0}},
+            "usage": {"input_tokens": 12, "output_tokens": 1},
+        }
+    )
+
+    result: Final = await ahealth_check(
+        {
+            "model": "typesafe/jev-1.13",
+            "api_key": "sk-test",
+        },
+        mode="evaluation",
+    )
+
+    assert "error" not in result, result
+    assert upstream.called
+    sent: Final = json.loads(upstream.calls[0].request.content)
+    assert sent["questions"] == {
+        "reachable": {"type": "noul", "instructions": "Is the service reachable?"}
+    }

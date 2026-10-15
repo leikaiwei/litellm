@@ -343,6 +343,8 @@ _BANNED_REQUEST_BODY_PARAMS: Final[tuple[str, ...]] = (
     "anthropic_workspace_id",
     "anthropic-workspace-id",
     "bedrock_tags",
+    # Deployment-pinned AgentCore session: every new caller-chosen value provisions another microVM.
+    "agentcore_runtime_session_id",
     # Provider-specific endpoint overrides that flow into the outbound
     # request via ``optional_params``. Same threat as ``api_base``:
     # ``s3_endpoint_url`` redirects Bedrock file uploads to attacker
@@ -1259,7 +1261,7 @@ def enforce_batch_enqueued_token_limit_is_admin_only(
         return
     raise HTTPException(
         status_code=403,
-        detail={  # mutable-ok: HTTPException.detail has no immutable form
+        detail={
             "error": f"Only proxy admins can set {BATCH_ENQUEUED_TOKEN_LIMIT_METADATA_KEY} on a {entity}. "
             "It replaces the standard rate limit checks for batch submissions."
         },

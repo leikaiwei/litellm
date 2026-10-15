@@ -27,6 +27,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.routing import BaseRoute, Route
 from starlette.websockets import WebSocketState
 from websockets.asyncio.client import connect
 from websockets.exceptions import (
@@ -65,6 +66,7 @@ from litellm.llms.base_llm.managed_resources.utils import (
 )
 from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
 from litellm.passthrough import BasePassthroughUtils
+from litellm.proxy._lazy_features import lazy_owned_routes
 from litellm.proxy._types import (
     ConfigFieldInfo,
     ConfigFieldUpdate,
@@ -377,8 +379,10 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         return return_headers
 
     @staticmethod
-    def get_endpoint_type(url: str) -> EndpointType:
+    def get_endpoint_type(url: str, custom_llm_provider: str | None = None) -> EndpointType:
         parsed_url: Final = urlparse(url)
+        if custom_llm_provider == "typesafe" and parsed_url.path.removesuffix("/").endswith("/v1/systemone"):
+            return EndpointType.DECISIONS
         if (
             ("generateContent") in url
             or ("streamGenerateContent") in url
@@ -843,16 +847,16 @@ def _resolve_team_callback_wiring(
     logging_kwargs: Final = (
         None
         if not callback_vars
-        else {  # mutable-ok: Logging arg
+        else {
             **callback_vars,
             TRUSTED_CALLBACK_VARS_FIELD: callback_vars,
-            "metadata": {},  # mutable-ok: Logging arg
-            "model_info": {},  # mutable-ok: Logging arg
+            "metadata": {},
+            "model_info": {},
         }
     )
     return _TeamCallbackWiring(
-        success_callbacks=None if success_callbacks is None else [*success_callbacks],  # mutable-ok: Logging arg
-        failure_callbacks=None if failure_callbacks is None else [*failure_callbacks],  # mutable-ok: Logging arg
+        success_callbacks=None if success_callbacks is None else [*success_callbacks],
+        failure_callbacks=None if failure_callbacks is None else [*failure_callbacks],
         logging_kwargs=logging_kwargs,
     )
 
@@ -1093,7 +1097,9 @@ async def pass_through_request(
 
         requested_query_params: dict | None = query_params or dict(request.query_params) or None
 
-        endpoint_type: Final[EndpointType] = HttpPassThroughEndpointHelpers.get_endpoint_type(str(url))
+        endpoint_type: Final[EndpointType] = HttpPassThroughEndpointHelpers.get_endpoint_type(
+            str(url), custom_llm_provider
+        )
 
         # SigV4-signed callers (e.g. Bedrock) attach the exact bytes that were
         # signed via request.state; we must send those instead of re-encoding the
@@ -1180,6 +1186,7 @@ async def pass_through_request(
             user_api_key_dict=user_api_key_dict,
             data=_parsed_body,
             call_type="pass_through_endpoint",
+            endpoint_type=endpoint_type,
         )
         resolved_timeout: Final = resolve_pass_through_request_timeout(timeout)
         async_client_obj: Final = get_async_httpx_client(
@@ -2221,7 +2228,7 @@ def _rewrite_vertex_live_setup_model(text_data: str, setup_model_rewriter: Calla
     rewritten_model: Final = setup_model_rewriter(setup_model)
     if rewritten_model == setup_model:
         return text_data
-    return json.dumps({**message, "setup": {**setup, "model": rewritten_model}})  # mutable-ok: one-shot json payload
+    return json.dumps({**message, "setup": {**setup, "model": rewritten_model}})
 
 
 def _resolved_vertex_live_setup(
@@ -2290,14 +2297,14 @@ def _upstream_close_to_relay(task_results: Iterable[object]) -> Close | None:
     return upstream_close
 
 
-_WEBSOCKET_FORWARDED_HEADERS: Final = frozenset(("authorization", "x-api-key", "x-goog-user-project"))
+_WEBSOCKET_FORWARDED_HEADERS: Final = frozenset(("x-goog-user-project",))
 
 
 def _with_trace_context(headers: Mapping[str, str], parent_span: object) -> dict[str, str]:
     try:
         from litellm.integrations.otel.plumbing.context import inject_trace_context
     except ImportError:
-        return dict(headers)  # mutable-ok: matches inject_trace_context's carrier return type
+        return dict(headers)
     return inject_trace_context(headers, parent_span=parent_span)
 
 
@@ -2343,7 +2350,7 @@ async def websocket_passthrough_request(
         await websocket.accept()
         verbose_proxy_logger.debug("WebSocket passthrough (%s): WebSocket connection accepted", endpoint)
 
-    forwarded_headers: Final = {  # mutable-ok: one-shot upstream header dict, read as a Mapping
+    forwarded_headers: Final = {
         **custom_headers,
         **{
             header_name: header_value
@@ -2868,35 +2875,34 @@ def _extract_model_from_vertex_ai_setup(setup_response: Mapping[str, object]) ->
     return None
 
 
+def _placed_ahead(routes: Sequence[BaseRoute], moving: BaseRoute, before: BaseRoute) -> tuple[BaseRoute, ...]:
+    kept: Final = tuple(route for route in routes if route is not moving)
+    at: Final = next(index for index, route in enumerate(kept) if route is before)
+    return (*kept[:at], moving, *kept[at:])
+
+
 class SafeRouteAdder:
     """
     Wrapper class for adding routes to FastAPI app.
-    Only adds routes if they don't already exist on the app.
+    Only adds routes if they don't already exist on the app. A route a lazy feature registered
+    does not count: a route added at its path goes ahead of it, the precedence a config
+    pass-through at /v1/decisions gets in lazy mode, where the feature has not loaded yet.
     """
 
     @staticmethod
+    def _colliding_routes(app: FastAPI, path: str, methods: Sequence[str]) -> tuple[Route, ...]:
+        wanted: Final = frozenset(methods)
+        return tuple(
+            route
+            for route in app.routes
+            if isinstance(route, Route) and route.path == path and not wanted.isdisjoint(route.methods or ())
+        )
+
+    @staticmethod
     def _is_path_registered(app: FastAPI, path: str, methods: list[str]) -> bool:
-        """
-        Check if a path with any of the specified methods is already registered on the app.
-
-        Args:
-            app: The FastAPI application instance
-            path: The path to check (e.g., "/v1/chat/completions")
-            methods: List of HTTP methods to check (e.g., ["GET", "POST"])
-
-        Returns:
-            True if the path is already registered with any of the methods, False otherwise
-        """
-        for route in app.routes:
-            # Use getattr to safely access route attributes
-            route_path = getattr(route, "path", None)
-            route_methods = getattr(route, "methods", None)
-
-            if route_path == path and route_methods is not None:
-                # Check if any of the methods overlap
-                if any(method in route_methods for method in methods):
-                    return True
-        return False
+        """True when a route the app itself defines already serves the path with one of the methods."""
+        lazy_owned: Final = lazy_owned_routes(app)
+        return any(id(route) not in lazy_owned for route in SafeRouteAdder._colliding_routes(app, path, methods))
 
     @staticmethod
     def add_api_route_if_not_exists(
@@ -2927,12 +2933,17 @@ class SafeRouteAdder:
             )
             return False
 
+        shadowed: Final = SafeRouteAdder._colliding_routes(app, path, methods)
         app.add_api_route(
             path=path,
             endpoint=endpoint,
             methods=methods,
             dependencies=dependencies,
         )
+        if shadowed:
+            app.router.routes[:] = _placed_ahead(  # rebind-ok: the app owns its route table
+                app.router.routes, app.router.routes[-1], shadowed[0]
+            )
         verbose_proxy_logger.debug(
             "Successfully added route: %s with methods %s",
             path,
