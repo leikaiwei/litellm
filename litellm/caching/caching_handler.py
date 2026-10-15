@@ -19,7 +19,7 @@ import datetime
 import inspect
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Generator, Mapping
-from typing import TYPE_CHECKING, Any, Final, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Final, Optional, TypeVar
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -1144,7 +1144,7 @@ class LLMCachingHandler:
         parent_otel_span: Final = _get_parent_otel_span_from_kwargs(new_kwargs)
         new_kwargs["parent_otel_span"] = parent_otel_span
         # [OPTIONAL] ADD TO CACHE
-        cacheable_result: Final = _narrow_result_for_content_check(cast(object, result))
+        cacheable_result: Final = _narrow_result_for_content_check(result)
         if self._should_store_result_in_cache(
             original_function=original_function, kwargs=new_kwargs, result=cacheable_result
         ):
@@ -1196,7 +1196,7 @@ class LLMCachingHandler:
         if litellm.cache is None:
             return
 
-        sync_cacheable_result: Final = _narrow_result_for_content_check(cast(object, result))
+        sync_cacheable_result: Final = _narrow_result_for_content_check(result)
         if self._should_store_result_in_cache(
             original_function=self.original_function, kwargs=new_kwargs, result=sync_cacheable_result
         ):

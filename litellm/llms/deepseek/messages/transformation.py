@@ -52,7 +52,7 @@ def _is_deepseek_thinking_block_error(error_text: str) -> bool:
     return False
 
 
-def _repair_assistant_message_for_deepseek(message: Any) -> Any:
+def _repair_assistant_message_for_deepseek(message: object) -> object:
     """
     修复单条 assistant 消息使 DeepSeek 接受：
       - redacted_thinking 块 -> 占位 thinking 块（DeepSeek 不认 redacted_thinking）
