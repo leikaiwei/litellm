@@ -97,6 +97,8 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 105 新增六份数据库迁移，没有业务数据重写；SpendLogs 仅新增可空 `billing_agent_id`，仍需在部署窗口获取表锁。数据库初始化失败现在始终退出，`ENFORCE_PRISMA_MIGRATION_CHECK=false` 不能再绕过，`--no-enforce_prisma_migration_check` 已移除。SpendLogs 手工索引改为启动后后台并发补建。构建和推送镜像不代表生产部署，生产切换须另行执行
 
+1.105.1 验证记录（2026-10-15）：补丁所在 18 个测试文件与两个 `local_` 目录共 1,703 项通过，扩大模块回归 9,384 passed、1 skipped。扩大回归用 UTC 运行，排除 macOS/Python MIME 映射缺少 `text/markdown` 的一条上游用例，以及上游 Realtime 测试文件：后者的旧 mock 未适配新的异步日志 dispatcher，原样运行有 24 项在日志 flush 超时，仅在测试进程内补齐 mock 后整文件 122 项通过，源码与测试文件均未改动。`make lint` 全部通过，未修改预算文件。`make check` 的 API-types 同步仍有上游基线漂移，纯 v1.105.1 在同一环境也生成完全相同的 1,097 行新增内容，保留上游生成文件。临时本地 proxy 调真实 DeepSeek V4 的七条 curl 请求全部 200，覆盖 chat/messages、原生/适配层、流式/非流式及 custom tool schema；流式包含结束事件与 token 用量。wheel 构建通过并核对包内补丁源码及 Anthropic 新路径，生产部署另行执行
+
 1.104.0 同步核对结论：本轮没有补丁被上游新吸收，但查出一处早已冗余的（流式 tokens 统计在 `streaming_chunk_builder_utils.py` 里的那一半，见上），该文件交还上游，其余逐文件核对后全部保留。与上游有差异的文件 42 -> 41（不含 `local_` 目录）。上游这一版把 `tests/test_litellm` 的大部分测试搬到了 `tests/unit`，补丁测试跟着搬：多数由 git 按改名自动带过去，`test_caching_handler.py` 因上游同时大幅扩写而认不出改名，手工移植；fork 独有的两份根目录测试（`test_anthropic_messages_header_forwarding.py`、`test_model_cost_map_local_merge.py`）一并挪到 `tests/unit/`。`llms/deepseek/` 下两个文件上游本轮没有改动；`llms/openrouter/chat/transformation.py` 上游只换了 tokenizer 的类型标注。价格表与上游只差 `anthropic/deepseek-v4-pro` 这一条镜像，native 的 `deepseek/deepseek-v4-pro` 本轮没有调价，镜像仍未跟 `off_peak_pricing`（那是 DeepSeek 官方直连的计费规则）
 
 已移除的补丁（保留记录，便于回溯）：
