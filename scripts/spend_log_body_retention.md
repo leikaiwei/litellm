@@ -40,6 +40,20 @@ python3 scripts/spend_log_body_retention.py --apply \
 
 timer设置 `Persistent=false`，错过低峰时不在白天补跑，下次低峰继续。服务的运行预算应大于每日新增过期数据与一天重叠范围所需时间，历史积压则在监控下单独分批回填，不能把完成部署等同于历史已清完
 
+随附service与timer模板使用北京时间每日04:00、100条一批、每批间隔1秒、每次最多30分钟，以及64GiB磁盘保护水位。先确认目标路径与策略，获准后在宿主机安装
+
+```bash
+install -d -m 700 /root/litellm/maintenance/body-retention /root/litellm/maintenance/body-retention-canary
+install -m 700 scripts/spend_log_body_retention.py /root/litellm/maintenance/spend_log_body_retention.py
+install -m 644 scripts/litellm-spend-log-body-retention.service /etc/systemd/system/
+install -m 644 scripts/litellm-spend-log-body-retention.timer /etc/systemd/system/
+systemd-analyze verify /etc/systemd/system/litellm-spend-log-body-retention.service /etc/systemd/system/litellm-spend-log-body-retention.timer
+systemctl daemon-reload
+systemctl enable --now litellm-spend-log-body-retention.timer
+```
+
+停止任务时只停用这个timer和service，保留整行保留期为null。代理升级时备份并保留维护脚本、两个unit、游标与审计文件，不恢复会删除基础明细的旧90d设置
+
 只清正文会产生UPDATE、WAL和死元组，普通vacuum主要让空间供数据库内部复用，不保证操作系统文件立即缩小。不要顺手执行VACUUM FULL、全表UPDATE或在启动migration中回填数据
 
 ## 测试
