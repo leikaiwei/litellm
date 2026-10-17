@@ -2,6 +2,8 @@
 
 Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础上打了以下补丁：
 
+宿主机日志维护：[基础日志永久保存、正文保留90天](scripts/spend_log_body_retention.md)，独立于代理镜像运行，避免官方整行保留策略删除费用和token明细
+
 **PostgreSQL 空字节修复** — `proxy/utils.py`
 - 清洗 spend logs 中的 `\x00` 空字节，避免 PostgreSQL jsonb 写入失败（22P05）
 
