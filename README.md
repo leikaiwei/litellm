@@ -4,6 +4,10 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 宿主机日志维护：[基础日志永久保存、正文保留90天](scripts/spend_log_body_retention.md)，独立于代理镜像运行，避免官方整行保留策略删除费用和token明细
 
+**工具数组 token 计数兼容**：`litellm_core_utils/token_counter.py`
+- 回移上游 [PR #46180](https://github.com/BerriAI/litellm/pull/46180) 的最小修复，兼容工具数组未声明 `items`、布尔及旧版元组 schema，避免计数抛出 `KeyError` 或 `AttributeError`
+- 仅修复计数异常，不改变上下文阈值、计数失败策略或路由规则，本地 token 计数仍是估算
+
 **PostgreSQL 空字节修复** — `proxy/utils.py`
 - 清洗 spend logs 中的 `\x00` 空字节，避免 PostgreSQL jsonb 写入失败（22P05）
 

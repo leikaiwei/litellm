@@ -514,6 +514,35 @@ def test_token_counter_skips_non_mapping_tools():
     assert mixed_tokens == valid_tokens
 
 
+@pytest.mark.parametrize("tool_shape", ("openai", "anthropic", "responses", "nested"))
+@pytest.mark.parametrize("items", (None, True, False, [{"type": "string"}]))
+def test_token_counter_counts_unconstrained_array_tools(tool_shape: str, items: object):
+    messages: Final = [{"role": "user", "content": "List the available values"}]
+
+    def count_with_array(array_schema: Mapping[str, object]) -> int:
+        properties: Final = (
+            {"group": {"type": "object", "properties": {"values": array_schema}}}
+            if tool_shape == "nested"
+            else {"values": array_schema}
+        )
+        schema: Final = {"type": "object", "properties": properties}
+        definition: Final = {"name": "list_values", "description": "List available values"}
+        tool: Final = (
+            {**definition, "input_schema": schema}
+            if tool_shape == "anthropic"
+            else {**definition, "type": "function", "parameters": schema}
+            if tool_shape == "responses"
+            else {"type": "function", "function": {**definition, "parameters": schema}}
+        )
+        return token_counter_new(messages=messages, tools=[tool])
+
+    baseline: Final = count_with_array({"type": "array", "items": {}})
+    actual: Final = count_with_array({"type": "array", **({"items": items} if items is not None else {})})
+
+    assert actual == baseline
+    assert actual > token_counter_new(messages=messages)
+
+
 class NeedsToleranceUpdateError(Exception):
     """Custom exception to mark tests that have improved"""
 
