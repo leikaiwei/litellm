@@ -40,7 +40,9 @@ python3 scripts/spend_log_body_retention.py --apply \
 
 timer设置 `Persistent=false`，错过低峰时不在白天补跑，下次低峰继续。服务的运行预算应大于每日新增过期数据与一天重叠范围所需时间，历史积压则在监控下单独分批回填，不能把完成部署等同于历史已清完
 
-随附service与timer模板使用北京时间每日04:00、100条一批、每批间隔1秒、每次最多30分钟，以及64GiB磁盘保护水位。先确认目标路径与策略，获准后在宿主机安装
+随附service与timer模板使用北京时间每日04:00、10条一批、每批间隔1秒、每次最多30分钟，以及64GiB磁盘保护水位。先确认目标路径与策略，获准后在宿主机安装
+
+2026-10-23生产日志确认100条批次触发15秒statement_timeout，批量下调为10；临时夜间回填wrapper须同步使用10条。保留原超时和锁等待保护，失败仍停止并保留游标，不通过延长SQL超时增加业务阻塞。连续两批各10条生产验证成功，首批基础字段哈希及记录数量核验不变；完整夜间回填仍需后续运行验证
 
 ```bash
 install -d -m 700 /root/litellm/maintenance/body-retention /root/litellm/maintenance/body-retention-canary

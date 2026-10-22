@@ -9,5 +9,5 @@ UMask=0077
 Nice=10
 WorkingDirectory=/root/litellm/maintenance
 ExecStartPre=/usr/bin/find /root/litellm/maintenance/body-retention-canary -maxdepth 1 -type f -name body-*.json.gz -mmin +10080 -delete
-ExecStart=/usr/bin/python3 /root/litellm/maintenance/spend_log_body_retention.py --apply --state-file /root/litellm/maintenance/body-retention/state.json --batch-size 100 --run-budget-seconds 1800 --max-batches 2000 --sleep-seconds 1 --min-free-gib 64
+ExecStart=/usr/bin/python3 /root/litellm/maintenance/spend_log_body_retention.py --apply --state-file /root/litellm/maintenance/body-retention/state.json --batch-size 10 --run-budget-seconds 1800 --max-batches 2000 --sleep-seconds 1 --min-free-gib 64
 TimeoutStartSec=35min
