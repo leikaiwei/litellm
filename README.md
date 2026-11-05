@@ -4,6 +4,10 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 宿主机日志维护：[基础日志永久保存、正文保留90天](scripts/spend_log_body_retention.md)，独立于代理镜像运行，避免官方整行保留策略删除费用和token明细
 
+**Claude Code 独立审查直接放行**：外部 [claude_code_review callback](local_guardrails/README.md#claude_code_review-claude-code-独立审查请求直接放行)
+- 单文件全局 hook 和本地固定响应 provider，命中已知独立审查协议后返回 `<block>no</block>`，不调用上游模型
+- 保留入口鉴权，使用正常成功日志、零 token 和零费用；未知模板继续原路处理，功能需要显式注册，不随镜像升级自动启用
+
 **工具数组 token 计数兼容**：`litellm_core_utils/token_counter.py`
 - 回移上游 [PR #46180](https://github.com/BerriAI/litellm/pull/46180) 的最小修复，兼容工具数组未声明 `items`、布尔及旧版元组 schema，避免计数抛出 `KeyError` 或 `AttributeError`
 - 仅修复计数异常，不改变上下文阈值、计数失败策略或路由规则，本地 token 计数仍是估算
@@ -104,6 +108,8 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 上游新增 `general_settings.safeguards_classifier_model`，可调用指定模型完成服务端工具审核，已不只是透传；未配置该选项时不会启用这条模型审核路径
 
 105.1 到 108.0 新增 25 份数据库迁移，没有修改旧迁移，没有 SpendLogs DDL 或迁移时全表数据重写。包含 ManagedFileTable、Lens 等表的索引和新表，晚间切换仍需预留迁移时间。发布源码和镜像不等于生产部署，hook 也需要另行注册和挂载
+
+1.108.0 验证记录：补丁对应测试及两个 `local_` 目录共 3,014 项通过、1 项原有跳过，排除 1 项在纯上游标签同样失败的深层 schema 复制用例 `schema_nested_past_the_recursion_limit`。该用例会修改原始 `input_schema`，本次未扩大修复。lint 各项及最后重跑的类型 gate 通过，未放宽预算。独立审查 hook 的 25 项无网络测试通过，本地代理四种审核组合均返回标准 Messages 或完整 SSE，零上游调用，成功日志费用与 token 为 0；普通请求对照、401 鉴权和内部组 403 验证通过
 
 1.105.1 同步核对结论：同步 105 系列最新稳定补丁版，包含 105.0 的模型用量聚合锁争用与 Responses 桥接重复日志修复。现有生产补丁上游仍未吸收，全部保留。Anthropic 目录从 `experimental_pass_through` 改为 `pass_through`，生产补丁、自有测试与 thinking-switch 测试随之迁移。空回复缓存判定保留上游新的 call-type 规则与后台写入机制，回归测试等待后台写入后再检查缓存；两条上游缓存生命周期测试改用非空样本，仍验证原来的写入时序。deployment guardrail 同时保留我们的 `anthropic_messages` 支持和上游从 metadata 提取鉴权信息的新逻辑。旧 UI sentinel 回归测试已由上游拆分后的 `test_user_api_key_auth_request_flow.py` 中三条同类用例覆盖，不再保留重复测试。DeepSeek Anthropic 镜像条目继续与本地表一起补缺远端价格表
 
