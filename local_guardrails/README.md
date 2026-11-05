@@ -629,3 +629,45 @@ chunk 的用量提上来（`utils.py:2143`），有它就说明字节已经出�
 
 写测试时踩到的：第一版 `bool` 状态码防护是死代码（`True in {429: ...}` 本来就是 False），
 变异测试里它存活，说明没有测试能杀掉它，删掉了。
+
+
+## claude_code_review: Claude Code 审核请求分流
+
+独立的全局 pre_call callback，仅修改命中请求的模型路由，不修改 LiteLLM 核心源码
+已知模板必须在 system 中以 security monitor 身份开头，包含完整 block 输出协议，无工具，消息均为用户文本
+普通请求、用户引用审核提示词、未知协议继续原路处理，不依赖固定 max_tokens
+
+将 `claude_code_review.py` 放在 config.yaml 同目录，合并以下配置到现有配置中
+这里的模型和端点是占位，选择实际审核模型后再填写环境变量
+
+```yaml
+model_list:
+  - model_name: claude-code-reviewer
+    litellm_params:
+      model: os.environ/REVIEW_PROVIDER_MODEL
+      api_base: os.environ/REVIEW_API_BASE
+      api_key: os.environ/REVIEW_API_KEY
+
+litellm_settings:
+  callbacks:
+    - claude_code_review.callback
+```
+
+`REVIEW_PROVIDER_MODEL` 填实际的 provider/model ID；`REVIEW_API_BASE` 和 `REVIEW_API_KEY` 使用对应供应商配置
+容器环境设置 `CLAUDE_CODE_REVIEW_MODEL=claude-code-reviewer` 后启用分流
+未设置或为空时保留原请求路径；环境变量在加载模块时读取，修改后需要重启进程
+不要用占位模型启用生产分流，审核模型需要支持完整输入长度及 block 输出协议
+Docker 镜像不会自动加载此文件，上线时需要单独只读挂载到 `/app/claude_code_review.py`
+
+审核输入、输出上限和 stop_sequences 保持原样，由配置的模型作出判断，响应和 SSE 由已有 Messages 适配器返回
+取消请求内的模型路由覆盖，禁用审核请求缓存和 fallback；模型失败沿正常错误路径返回，不替换为通过
+审计字段在 `standard_logging_object.metadata.spend_logs_metadata` 下，包含 `claude_code_review=model_review` 和原请求模型
+费用和用量继续使用真实模型结果
+
+```bash
+.venv/bin/python -m pytest local_guardrails/test_claude_code_review.py -q
+```
+
+测试禁止 TCP 网络，仅在测试文件内使用假模型，分别返回允许、拒绝和错误
+覆盖识别边界、未配置时原路处理、输入保留、路由覆盖、审计字段、非流式及完整 SSE、真实用量透传
+这不代表已验证某个第三方模型的审核质量，本次没有部署生产

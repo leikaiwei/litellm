@@ -103,7 +103,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 上游新增 `general_settings.safeguards_classifier_model`，可调用指定模型完成服务端工具审核，已不只是透传；未配置该选项时不会启用这条模型审核路径
 
-105.1 到 108.0 新增 25 份数据库迁移，没有修改旧迁移，没有 SpendLogs DDL 或迁移时全表数据重写。包含 ManagedFileTable、Lens 等表的索引和新表，晚间切换仍需预留迁移时间。发布源码和镜像不等于生产部署，hook 也需要另行注册和挂载
+105.1 到 108.0 新增 25 份数据库迁移，没有修改旧迁移，没有 SpendLogs DDL 或迁移时全表数据重写。包含 ManagedFileTable、Lens 等表的索引和新表，晚间切换仍需预留迁移时间。发布源码和镜像不等于生产部署，自定义 hook 需要另行注册和挂载
 
 1.105.1 同步核对结论：同步 105 系列最新稳定补丁版，包含 105.0 的模型用量聚合锁争用与 Responses 桥接重复日志修复。现有生产补丁上游仍未吸收，全部保留。Anthropic 目录从 `experimental_pass_through` 改为 `pass_through`，生产补丁、自有测试与 thinking-switch 测试随之迁移。空回复缓存判定保留上游新的 call-type 规则与后台写入机制，回归测试等待后台写入后再检查缓存；两条上游缓存生命周期测试改用非空样本，仍验证原来的写入时序。deployment guardrail 同时保留我们的 `anthropic_messages` 支持和上游从 metadata 提取鉴权信息的新逻辑。旧 UI sentinel 回归测试已由上游拆分后的 `test_user_api_key_auth_request_flow.py` 中三条同类用例覆盖，不再保留重复测试。DeepSeek Anthropic 镜像条目继续与本地表一起补缺远端价格表
 
@@ -790,3 +790,7 @@ All these checks must pass before your PR can be merged.
 <a href="https://github.com/BerriAI/litellm/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=BerriAI/litellm" />
 </a>
+
+
+Claude Code 独立审核请求可通过 [本地审核分流 hook](local_guardrails/README.md#claude_code_review-claude-code-审核请求分流) 路由到单独配置的审核模型
+运行代码仅一个文件，不修改核心源码；未配置目标模型时保持原路处理，配置示例使用环境变量占位
