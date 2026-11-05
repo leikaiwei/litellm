@@ -36,6 +36,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: 计算镜像标签
         id: tag
@@ -64,9 +66,6 @@ jobs:
             echo "未配置 Docker Hub 凭据，仅推送 GHCR。"
           fi
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -84,23 +83,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push (GHCR)
+      - name: 构建并推送部署镜像
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
+          build-args: |
+            LITELLM_RELEASE_TAG=${{ steps.tag.outputs.value }}
           tags: |
             ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE }}:${{ steps.tag.outputs.value }}
             ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE }}:latest
-
-      - name: Build and push (Docker Hub)
-        if: steps.dockerhub.outputs.enabled == 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: |
-            ${{ env.DOCKERHUB_IMAGE }}:${{ steps.tag.outputs.value }}
-            ${{ env.DOCKERHUB_IMAGE }}:latest
+            ${{ steps.dockerhub.outputs.enabled == 'true' && format('{0}:{1}', env.DOCKERHUB_IMAGE, steps.tag.outputs.value) || '' }}
+            ${{ steps.dockerhub.outputs.enabled == 'true' && format('{0}:latest', env.DOCKERHUB_IMAGE) || '' }}

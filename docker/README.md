@@ -13,6 +13,14 @@ This guide provides instructions for building and running the LiteLLM applicatio
 > docker compose -f docker-compose.quickstart.yml up -d
 > ```
 
+## Fork 发布流程
+
+本 fork 的部署服务器使用 x86_64，`.github/workflows/docker_release_auto.yml` 只构建 `linux/amd64`，不构建 ARM64，也不启用 QEMU
+
+发布 Release 或手动运行该工作流时，使用指定标签的源码，只构建一次并推送 GHCR。配置 Docker Hub 凭据时，同一次构建也推送 Docker Hub。两个仓库均写入版本标签和 `latest`，镜像通过 `LITELLM_RELEASE_TAG` 记录发布版本
+
+补发已有版本时，在 Actions 中选择主分支上的工作流并填写原始发布标签，避免使用旧标签内的工作流。镜像发布成功后再执行服务器升级，工作流不会自动部署生产
+
 ## Prerequisites
 
 - Docker
