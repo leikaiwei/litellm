@@ -4,6 +4,7 @@ and ``_handle_logging_proxy_only_error``."""
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import datetime
 from types import MappingProxyType
 from typing import Final
@@ -64,6 +65,48 @@ def test_is_proxy_only_llm_api_truth_table(proxy_logging):
         "auth_short_circuit": True,
         "guardrail_raised_on_llm_route": True,
     }
+
+
+def test_is_proxy_only_llm_api_skips_dashboard_session_info_route_failures(proxy_logging):
+    """An expired Admin UI session key refetching dashboard info routes must not
+    write Request Log failure rows, while its LLM calls and other keys still do."""
+
+    def decide(route: str, team_id: str | None) -> bool:
+        return proxy_logging._is_proxy_only_llm_api_error(
+            original_exception=Exception("Authentication Error - Expired Key"),
+            error_type=ProxyErrorTypes.auth_error,
+            route=route,
+            team_id=team_id,
+        )
+
+    assert {
+        "dashboard_key_list": decide("/key/list", "litellm-dashboard"),
+        "dashboard_user_info": decide("/v2/user/info", "litellm-dashboard"),
+        "dashboard_model_info": decide("/v2/model/info", "litellm-dashboard"),
+        "dashboard_chat": decide("/chat/completions", "litellm-dashboard"),
+        "team_key_list": decide("/key/list", "team-1"),
+        "teamless_key_list": decide("/key/list", None),
+    } == {
+        "dashboard_key_list": False,
+        "dashboard_user_info": False,
+        "dashboard_model_info": False,
+        "dashboard_chat": True,
+        "team_key_list": True,
+        "teamless_key_list": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_call_failure_hook_skips_logging_for_dashboard_session_info_route(proxy_logging):
+    proxy_logging._handle_logging_proxy_only_error = AsyncMock()
+    await proxy_logging.post_call_failure_hook(
+        request_data={},
+        original_exception=Exception("Authentication Error - Expired Key"),
+        user_api_key_dict=UserAPIKeyAuth(team_id="litellm-dashboard", request_route="/key/list"),
+        error_type=ProxyErrorTypes.auth_error,
+        route="/key/list",
+    )
+    proxy_logging._handle_logging_proxy_only_error.assert_not_awaited()
 
 
 def test_is_proxy_only_llm_api_missing_exception_raises(proxy_logging):
@@ -358,6 +401,103 @@ async def test_post_call_failure_hook_flags_pre_routing_reject_despite_caller_mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("metadata_field", ["metadata", "litellm_metadata"])
+async def test_pre_routing_reject_logs_the_configured_deployment_over_caller_metadata(
+    proxy_logging, make_user_api_key_auth, monkeypatch, metadata_field: str
+):
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    recorded: list[dict] = []
+
+    class _RecordingLogger(CustomLogger):
+        async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+            recorded.append(kwargs)
+
+    monkeypatch.setattr(
+        proxy_server,
+        "llm_router",
+        litellm.Router(
+            model_list=[
+                {
+                    "model_name": "internal-model",
+                    "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(litellm, "callbacks", [_RecordingLogger()])
+    proxy_logging.alert_types = []
+    request_data: Final[dict[str, object]] = {
+        "model": "internal-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "litellm_call_id": "caller-routing-metadata",
+        metadata_field: {"deployment": "openai/caller-chosen", "model_group": "caller-group"},
+    }
+    logging_obj, _ = litellm.utils.function_setup(
+        original_function="acompletion", rules_obj=litellm.utils.Rules(), start_time=datetime.now(), **request_data
+    )
+
+    await proxy_logging.post_call_failure_hook(
+        request_data={**request_data, "litellm_logging_obj": logging_obj},
+        original_exception=HTTPException(status_code=400, detail="Content blocked"),
+        user_api_key_dict=make_user_api_key_auth(request_route="/chat/completions"),
+        route="/chat/completions",
+    )
+
+    assert len(recorded) == 1
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs={**recorded[0], "completion_start_time": now}, response_obj=None, start_time=now, end_time=now
+    )
+    standard_logging_object: Final = recorded[0]["standard_logging_object"]
+    assert {
+        "logged_model": standard_logging_object["model"],
+        "logged_model_group": standard_logging_object["model_group"],
+        "spend_model": payload["model"],
+        "spend_model_group": payload["model_group"],
+    } == {
+        "logged_model": "openai/gpt-4.1",
+        "logged_model_group": "internal-model",
+        "spend_model": "openai/gpt-4.1",
+        "spend_model_group": "internal-model",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("error_type", "logged_tags"), [(ProxyErrorTypes.auth_error, []), (None, ["checkout"])])
+async def test_proxy_only_failure_log_keeps_caller_tags_only_after_auth(
+    proxy_logging, monkeypatch, error_type: ProxyErrorTypes | None, logged_tags: list[str]
+):
+    from litellm.proxy import proxy_server
+
+    recorded: list[dict] = []
+
+    class _RecordingLogger(CustomLogger):
+        async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+            recorded.append(kwargs)
+
+    monkeypatch.setattr(proxy_server, "llm_router", None)
+    monkeypatch.setattr(litellm, "callbacks", [_RecordingLogger()])
+    proxy_logging.alert_types = []
+
+    await proxy_logging.post_call_failure_hook(
+        request_data={
+            "model": "internal-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"tags": ["checkout"]},
+        },
+        original_exception=HTTPException(status_code=401, detail="Invalid proxy server token passed"),
+        user_api_key_dict=UserAPIKeyAuth(request_route="/chat/completions"),
+        error_type=error_type,
+        route="/chat/completions",
+    )
+
+    assert len(recorded) == 1
+    assert recorded[0]["standard_logging_object"]["request_tags"] == logged_tags
+
+
+@pytest.mark.asyncio
 async def test_post_call_failure_hook_attribution_does_not_count_against_the_deployment(
     proxy_logging, make_user_api_key_auth, monkeypatch
 ):
@@ -529,9 +669,8 @@ async def test_post_call_failure_hook_omits_provider_when_a_deployment_does_not_
 async def test_handle_logging_proxy_only_path_attributes_with_read_only_metadata(
     proxy_logging, make_user_api_key_auth, monkeypatch
 ):
-    """With a logging object already on the request, its metadata is taken as given;
-    a read-only mapping there must not crash the stamp, and the failure handler
-    still receives the provider attribution."""
+    """With a logging object already on the request, allowlisted metadata is kept,
+    a read-only mapping must not crash the stamp, and the failure handler receives provider attribution."""
     from litellm.proxy import proxy_server
 
     monkeypatch.setattr(
@@ -550,16 +689,26 @@ async def test_handle_logging_proxy_only_path_attributes_with_read_only_metadata
     logging_obj = MagicMock()
     logging_obj.call_type = "acompletion"
     logging_obj.model_call_details = {}
+    logging_obj.litellm_params = {"metadata": {"preexisting": "logged"}}
     logging_obj.async_failure_handler = AsyncMock()
+    guardrail_info: Final = [
+        {
+            "guardrail_name": "local-block",
+            "guardrail_status": "guardrail_intervened",
+            "guardrail_cost": 0.25,
+        }
+    ]
 
     await proxy_logging._handle_logging_proxy_only_error(
         request_data={
             "litellm_logging_obj": logging_obj,
             "model": "internal-model",
             "messages": [{"role": "user", "content": "hi"}],
-            "metadata": MappingProxyType({"user_api_key_alias": "frozen"}),
+            "metadata": MappingProxyType(
+                {"tags": ["checkout"], "standard_logging_guardrail_information": guardrail_info}
+            ),
         },
-        user_api_key_dict=make_user_api_key_auth(request_route="/chat/completions"),
+        user_api_key_dict=make_user_api_key_auth(request_route="/chat/completions", key_alias="frozen"),
         route="/chat/completions",
         original_exception=HTTPException(status_code=403, detail="blocked"),
     )
@@ -568,7 +717,11 @@ async def test_handle_logging_proxy_only_path_attributes_with_read_only_metadata
     update_kwargs = logging_obj.update_environment_variables.call_args.kwargs
     assert update_kwargs["custom_llm_provider"] == "openai"
     assert update_kwargs["litellm_params"]["custom_llm_provider"] == "openai"
-    assert update_kwargs["litellm_params"]["metadata"] == {"user_api_key_alias": "frozen"}
+    assert {
+        key: update_kwargs["litellm_params"]["metadata"][key] for key in ("preexisting", "user_api_key_alias")
+    } == {"preexisting": "logged", "user_api_key_alias": "frozen"}
+    assert update_kwargs["litellm_params"]["metadata"]["tags"] == ["checkout"]
+    assert update_kwargs["litellm_params"]["metadata"]["standard_logging_guardrail_information"] == guardrail_info
 
 
 @pytest.mark.asyncio
@@ -877,6 +1030,48 @@ async def test_post_call_failure_hook_falls_back_to_body_shape_without_a_route(p
         error_type=ProxyErrorTypes.auth_error,
     )
     assert request_data["call_type"] == "acompletion"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call_type, body",
+    [
+        ("anthropic_messages", {"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+        ("aresponses", {"model": "m", "input": [{"role": "user", "content": "hi"}]}),
+        ("acompact_responses", {"model": "m", "input": [{"role": "user", "content": "hi"}]}),
+    ],
+)
+async def test_post_call_failure_hook_keeps_the_call_type_request_setup_logged(
+    proxy_logging: ProxyLogging,
+    make_user_api_key_auth: Callable[..., UserAPIKeyAuth],
+    call_type: str,
+    body: dict[str, object],
+) -> None:
+    """A request rejected after request setup already carries its endpoint's call type, so the body
+    shape must not relabel a /v1/messages rejection as a chat completion or a list-input /v1/responses
+    rejection as an embedding."""
+    from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+
+    proxy_logging.alert_types = []
+    request_data: Final = {
+        **body,
+        "litellm_logging_obj": LiteLLMLoggingObj(
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            call_type=call_type,
+            start_time=datetime.now(),
+            litellm_call_id=f"test_keeps_{call_type}",
+            function_id=f"test_keeps_{call_type}",
+        ),
+        "metadata": {},
+    }
+    await proxy_logging.post_call_failure_hook(
+        request_data=request_data,
+        original_exception=HTTPException(status_code=400, detail="tools must be a list"),
+        user_api_key_dict=make_user_api_key_auth(request_route="/v1/messages"),
+    )
+    assert request_data["call_type"] == call_type
 
 
 @pytest.mark.asyncio

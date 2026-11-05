@@ -14,8 +14,9 @@ from typing_extensions import assert_never
 
 from litellm._logging import verbose_logger
 from litellm.proxy._experimental.mcp_server.oauth_utils import TOKEN_NO_CACHE_HEADERS
-from litellm.proxy.common_utils.encrypt_decrypt_utils import (
-    _V2_GCM_PREFIX,  # pyright: ignore[reportPrivateUsage]  # reuse the encrypted credential's format discriminator
+from litellm.proxy.common_utils.encrypt_decrypt_utils import (  # noqa: F401  # legacy module exports
+    _V2_GCM_PREFIX,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
+    V2_GCM_PREFIX,  # pyright: ignore[reportPrivateUsage]  # reuse the encrypted credential's format discriminator
 )
 from litellm.types.mcp_server.mcp_server_manager import MCPServer
 
@@ -60,7 +61,6 @@ async def oauth_authorization_uses_gateway_credential(request: Request) -> bool:
     from litellm.proxy.proxy_server import (  # noqa: PLC0415  # startup owns the active auth configuration
         jwt_handler,
         master_key,
-        user_custom_auth,
     )
 
     if "x-litellm-api-key" in request.headers:
@@ -70,10 +70,26 @@ async def oauth_authorization_uses_gateway_credential(request: Request) -> bool:
         return "authorization" in request.headers
     if token.startswith("sk-") or (master_key and secrets.compare_digest(token.encode(), master_key.encode())):
         return True
-    if user_custom_auth is not None or jwt_handler.litellm_jwtauth.oidc_userinfo_enabled:
+    if custom_auth_configured() or jwt_handler.litellm_jwtauth.oidc_userinfo_enabled:
         return True
     if not JWTHandler.is_jwt(token):
-        return await _opaque_bearer_is_gateway_credential(token)
+        return is_sealed_gateway_bearer(token) or await virtual_key_may_exist(token)
+    return jwt_issuer_may_be_litellm(token)
+
+
+def custom_auth_configured() -> bool:
+    from litellm.proxy.proxy_server import (  # noqa: PLC0415  # startup owns the active auth configuration
+        user_custom_auth,
+    )
+
+    return user_custom_auth is not None
+
+
+def jwt_issuer_may_be_litellm(token: str) -> bool:
+    """False only when the JWT names an issuer LiteLLM's JWT auth is not configured to accept."""
+    from litellm.proxy.auth.handle_jwt import JWTHandler  # noqa: PLC0415  # proxy import cycle
+    from litellm.proxy.proxy_server import jwt_handler  # noqa: PLC0415  # startup owns the active auth configuration
+
     claims: Final = JWTHandler.get_unverified_claims(token)
     issuer: Final = claims.get("iss") if claims is not None else None
     global_issuer: Final = os.getenv("JWT_ISSUER")
@@ -85,13 +101,27 @@ async def oauth_authorization_uses_gateway_credential(request: Request) -> bool:
     )
 
 
-async def _opaque_bearer_is_gateway_credential(token: str) -> bool:
+def is_sealed_gateway_bearer(token: str) -> bool:
+    """True for a bearer only the gateway issues: a bridge or refresh envelope, a v2 GCM blob, or a
+    dashboard UI token. A UI token that cannot be read still counts, so a lookup fault never reads as foreign."""
     from litellm.proxy._experimental.mcp_server.outbound_credentials.envelope import (  # noqa: PLC0415  # envelope imports bridge types
         is_envelope,
         is_refresh_envelope,
     )
-    from litellm.proxy._types import hash_token  # noqa: PLC0415  # proxy import cycle
     from litellm.proxy.auth.auth_checks import ExperimentalUIJWTToken  # noqa: PLC0415  # proxy import cycle
+
+    if is_envelope(token) or is_refresh_envelope(token) or token.startswith(V2_GCM_PREFIX):
+        return True
+    try:
+        return ExperimentalUIJWTToken.get_key_object_from_ui_hash_key(token) is not None
+    except Exception as exc:  # noqa: BLE001  # an identity lookup fault must not permit cookie fallback
+        verbose_logger.debug("OAuth bearer ownership could not be checked (%s)", type(exc).__name__)
+        return True
+
+
+async def virtual_key_may_exist(token: str) -> bool:
+    """False only when the key table answers that ``token`` is not a virtual key; a lookup fault counts as held."""
+    from litellm.proxy._types import hash_token  # noqa: PLC0415  # proxy import cycle
     from litellm.proxy.auth.resolvers.exceptions import KeyNotFoundError  # noqa: PLC0415  # proxy import cycle
     from litellm.proxy.auth.resolvers.store import IdentityStore  # noqa: PLC0415  # proxy import cycle
     from litellm.proxy.proxy_server import (  # noqa: PLC0415  # startup owns the identity store dependencies
@@ -99,11 +129,7 @@ async def _opaque_bearer_is_gateway_credential(token: str) -> bool:
         user_api_key_cache,
     )
 
-    if is_envelope(token) or is_refresh_envelope(token) or token.startswith(_V2_GCM_PREFIX):
-        return True
     try:
-        if ExperimentalUIJWTToken.get_key_object_from_ui_hash_key(token) is not None:
-            return True
         await IdentityStore(prisma_client, user_api_key_cache).resolve(hashed_token=hash_token(token))
     except KeyNotFoundError:
         return False
@@ -283,10 +309,13 @@ async def _reload_active_key_by_hash(key_hash: str) -> "_ResolvedKey | _KeyResol
     return _ResolvedKey(key_hash=key_hash, key=key_obj)
 
 
-async def _reload_active_user_by_id(user_id: str) -> "_KeyResolutionFailure | None":
+async def reload_active_user_by_id(user_id: str) -> "_KeyResolutionFailure | None":
     """``None`` when the user is live, else the precise failure ``load_active_user_by_id`` found."""
     loaded: Final = await load_active_user_by_id(user_id)
     return loaded if isinstance(loaded, str) else None
+
+
+_reload_active_user_by_id: Final = reload_active_user_by_id
 
 
 UserRowSource = Literal["cache", "database"]
@@ -400,12 +429,12 @@ async def _revalidate_active_subject(identity: "EnvelopeIdentity") -> "_KeyResol
                 return "no_active_key"
             return None
         case "user_id":
-            return await _reload_active_user_by_id(identity.subject)
+            return await reload_active_user_by_id(identity.subject)
         case _:
             assert_never(identity.subject_type)
 
 
-async def _extract_user_id_from_request(request: Request) -> str | None:
+async def extract_user_id_from_request(request: Request) -> str | None:
     """Resolve the caller for identity binding without granting credential-write permission."""
     from litellm.proxy.auth.handle_jwt import JWTIdentity  # noqa: PLC0415  # proxy import cycle
 
@@ -413,6 +442,9 @@ async def _extract_user_id_from_request(request: Request) -> str | None:
     if isinstance(resolved, JWTIdentity):
         return resolved.user_id
     return _active_key_user_id(resolved) if resolved is not None else None
+
+
+_extract_user_id_from_request: Final = extract_user_id_from_request
 
 
 async def authorize_oauth_credential_request(request: Request, server_id: str) -> str | None:
@@ -448,13 +480,13 @@ async def can_store_oauth_credential(request: Request, auth: "UserAPIKeyAuth", s
     )
     from litellm.proxy.auth.route_checks import RouteChecks  # noqa: PLC0415  # proxy import cycle
     from litellm.proxy.auth.user_api_key_auth import (  # noqa: PLC0415  # proxy import cycle
-        _run_centralized_common_checks,  # pyright: ignore[reportPrivateUsage]  # reuse admission policy for the credential-write action
+        run_centralized_common_checks,  # pyright: ignore[reportPrivateUsage]  # reuse admission policy for the credential-write action
     )
 
     write_route: Final = f"/v1/mcp/server/{server_id}/oauth-user-credential"
     try:
         RouteChecks.is_virtual_key_allowed_to_call_route(route=write_route, valid_token=auth, request=request)
-        await _run_centralized_common_checks(
+        await run_centralized_common_checks(
             user_api_key_auth_obj=auth,
             request=request,
             request_data={},
@@ -646,7 +678,7 @@ class _BridgeMintReady:
     keys: "EnvelopeKeys"
 
 
-def _bridge_mint_error_response(error: _BridgeMintError) -> JSONResponse:
+def bridge_mint_error_response(error: _BridgeMintError) -> JSONResponse:
     """Map a bridge-mint failure value to its token-endpoint response: one place, RFC 6749 §5.2 shape
     (top-level ``error``, no-store headers) for every case, with a status truthful about where the
     failure is. The caller's request is 400, a transient gateway outage is 503, a gateway
@@ -731,6 +763,9 @@ def _bridge_mint_error_response(error: _BridgeMintError) -> JSONResponse:
     )
 
 
+_bridge_mint_error_response: Final = bridge_mint_error_response
+
+
 def _key_resolution_failure_to_mint_error(failure: _KeyResolutionFailure) -> _BridgeMintError:
     """Lift an identity-resolution failure into the mint taxonomy, preserving origin so the status stays
     truthful: the caller's missing credential is 400, a transient DB outage is 503, and a gateway that
@@ -759,7 +794,7 @@ def _upstream_rejection_to_mint_error(rejection: _UpstreamGrantRejection) -> _Br
             assert_never(rejection)
 
 
-async def _prepare_bridge_mint(
+async def prepare_bridge_mint(
     request: Request,
     mcp_server: MCPServer,
     bridge_identity: "_BridgeAuthorizationCode | None" = None,
@@ -820,6 +855,9 @@ async def _prepare_bridge_mint(
     return _BridgeMintReady(identity=identity, keys=keys)
 
 
+_prepare_bridge_mint: Final = prepare_bridge_mint
+
+
 @dataclass(frozen=True, slots=True)
 class _BridgeRefreshReady:
     """A validated refresh request: the identity+keys to mint the renewed pair under, the upstream refresh
@@ -854,7 +892,7 @@ def _refresh_key_failure_to_mint_error(failure: _KeyResolutionFailure) -> _Bridg
             assert_never(failure)
 
 
-async def _prepare_bridge_refresh(
+async def prepare_bridge_refresh(
     mcp_server: MCPServer, refresh_value: str | None
 ) -> "_BridgeRefreshReady | _BridgeMintError":
     """Phase 1 for the refresh_token grant, BEFORE the upstream exchange: open the client's refresh
@@ -891,7 +929,10 @@ async def _prepare_bridge_refresh(
     )
 
 
-def _finish_bridge_mint(
+_prepare_bridge_refresh: Final = prepare_bridge_refresh
+
+
+def finish_bridge_mint(
     ready: "_BridgeMintReady", mcp_server: MCPServer, token_response: object, now: datetime
 ) -> "JSONResponse | _BridgeMintError":
     """Phase 3, AFTER the upstream exchange: seal the upstream grant into the client-held access envelope
@@ -931,6 +972,9 @@ def _finish_bridge_mint(
         **({"refresh_token": refresh_envelope} if refresh_envelope is not None else {}),
     }
     return JSONResponse(body, headers=TOKEN_NO_CACHE_HEADERS)
+
+
+_finish_bridge_mint: Final = finish_bridge_mint
 
 
 def _upstream_refresh_credential(token_response: object) -> "RefreshCredential | None":

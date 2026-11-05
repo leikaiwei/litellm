@@ -1,4 +1,7 @@
+from typing import Final
+
 import httpx
+import pytest
 
 import litellm
 from litellm.llms.anthropic.pass_through.messages.transformation import (
@@ -204,7 +207,10 @@ def test_should_retry_on_deepseek_redacted_thinking_400():
         '{"error":{"message":"unknown variant `redacted_thinking`, expected one of `text`, `thinking`"}}',
     )
 
-    assert config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}) is True
+    assert (
+        config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}, request_body={"messages": []})
+        is True
+    )
 
 
 def test_should_retry_on_deepseek_thinking_must_be_passed_back_400():
@@ -227,14 +233,24 @@ def test_should_not_retry_on_unrelated_400():
     assert config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}) is False
 
 
-def test_should_retry_still_handles_signature_error():
-    config = DeepSeekAnthropicMessagesConfig()
-    error = _http_status_error(
+@pytest.mark.parametrize(
+    ("request_body", "expected"),
+    [
+        (None, True),
+        ({"thinking": {"block_binding": {"prefix_mismatch_behavior": "error"}}}, False),
+    ],
+)
+def test_should_retry_still_handles_signature_error(request_body: object, expected: bool):
+    config: Final = DeepSeekAnthropicMessagesConfig()
+    error: Final = _http_status_error(
         400,
-        "messages.1.content.0: Invalid `signature` in `thinking` block",
+        "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.",
     )
 
-    assert config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}) is True
+    assert (
+        config.should_retry_anthropic_messages_on_http_error(e=error, litellm_params={}, request_body=request_body)
+        is expected
+    )
 
 
 def test_non_400_not_retried():

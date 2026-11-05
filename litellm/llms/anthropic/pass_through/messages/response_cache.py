@@ -7,22 +7,21 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 import litellm
 from litellm._logging import verbose_logger
-from litellm.caching.caching_handler import create_cache_write_task
+from litellm.caching.caching_handler import create_cache_write_task, is_response_without_output
 from litellm.llms.anthropic.pass_through.messages.streaming_iterator import (
     AnthropicMessagesStreamingResponse,
     BaseAnthropicMessagesStreamingIterator,
-    _is_message_stop_chunk,
-    _is_provider_error_chunk,
     aclose_if_supported,
+    is_message_stop_chunk,
+    is_provider_error_chunk,
 )
+from litellm.types.caching import CACHED_STREAM_EVENTS_KEY
 
 if TYPE_CHECKING:
     from litellm.caching.caching_handler import LLMCachingHandler
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
     from litellm.types.llms.openai import AllMessageValues
     from litellm.types.utils import ModelResponseStream
-
-CACHED_STREAM_EVENTS_KEY: Final = "litellm_cached_anthropic_sse_events"
 
 _EMPTY_MAPPING: Final[Mapping[str, object]] = MappingProxyType({})
 
@@ -38,14 +37,14 @@ def _split_sse_events(stream_text: str) -> tuple[str, ...]:
 
 
 class _SSEContentBlock(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", frozen=True)
 
     type: str | None = None
     text: str | None = None
 
 
 class _SSEDelta(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", frozen=True)
 
     text: str | None = None
     thinking: str | None = None
@@ -53,7 +52,7 @@ class _SSEDelta(BaseModel):
 
 
 class _SSEEvent(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", frozen=True)
 
     type: str | None = None
     content_block: _SSEContentBlock | None = None
@@ -109,7 +108,7 @@ class AnthropicMessagesStreamCacheWriter:
         self.collected_chunks: list[bytes] = []  # mutable-ok: rebuilding a tuple per SSE chunk is quadratic
         self.persisted = False
         self._hidden_params: dict[str, object] = dict(  # mutable-ok: callers stamp cache_key in here
-            stream._hidden_params if isinstance(stream, AnthropicMessagesStreamingResponse) else _EMPTY_MAPPING
+            stream.hidden_params if isinstance(stream, AnthropicMessagesStreamingResponse) else _EMPTY_MAPPING
         )
 
     @property
@@ -154,11 +153,11 @@ class AnthropicMessagesStreamCacheWriter:
         if self.persisted or cache is None:
             return
         collected_stream: Final = b"".join(self.collected_chunks)
-        if not _is_message_stop_chunk(collected_stream) or _is_provider_error_chunk(collected_stream):
+        if not is_message_stop_chunk(collected_stream) or is_provider_error_chunk(collected_stream):
             return
         self.persisted = True
 
-        if not self.caching_handler._should_store_result_in_cache(
+        if not self.caching_handler.should_store_result_in_cache(
             original_function=self.caching_handler.original_function,
             kwargs=self.caching_handler.request_kwargs,
         ):
@@ -179,6 +178,9 @@ class AnthropicMessagesStreamCacheWriter:
         if not _stream_produced_content(events):
             return
         cached_payload: Final = {CACHED_STREAM_EVENTS_KEY: events}
+        if is_response_without_output(cached_payload):
+            verbose_logger.debug("LiteLLM Cache: not caching a stream with no content blocks")
+            return
         dual_cache: Final = self.caching_handler.dual_cache
 
         async def _write() -> None:

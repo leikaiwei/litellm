@@ -1,3 +1,4 @@
+import json
 from copy import deepcopy
 from typing import Final
 from unittest.mock import MagicMock, patch
@@ -6,12 +7,16 @@ import pytest
 
 import litellm
 from litellm.litellm_core_utils.get_model_cost_map import get_model_cost_map
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.azure.responses.o_series_transformation import (
     AzureOpenAIOSeriesResponsesAPIConfig,
 )
 from litellm.llms.azure.responses.transformation import AzureOpenAIResponsesAPIConfig
+from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
 from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
 from litellm.types.router import GenericLiteLLMParams
+from litellm.types.utils import LlmProviders
+from litellm.utils import ProviderConfigManager
 
 
 @pytest.mark.serial
@@ -651,16 +656,21 @@ def local_model_cost_map(monkeypatch: pytest.MonkeyPatch) -> None:
     litellm.add_known_models(model_cost_map=litellm.model_cost)
 
 
-def test_azure_responses_gpt6_astra_reasoning_effort_none_unlocks_temperature(local_model_cost_map: None):
-    """Foundry's gpt-6-astra accepts reasoning.effort='none' with a non-default temperature
-    while OpenAI's gpt-6-astra does not, so the gate must read the azure/ cost-map entry
-    for the bare deployment name rather than OpenAI's."""
+def test_azure_responses_reasoning_effort_none_unlocks_temperature_off_the_azure_row(
+    local_model_cost_map: None, monkeypatch: pytest.MonkeyPatch
+):
+    """The gate reads the azure/ cost-map entry for the bare deployment name rather than OpenAI's
+    twin: with OpenAI's gpt-6-sol row turned off for none, azure/gpt-6-sol's row still lets none
+    through and, only then, a non-default temperature."""
+    monkeypatch.setitem(
+        litellm.model_cost, "gpt-6-sol", {**litellm.model_cost["gpt-6-sol"], "supports_none_reasoning_effort": False}
+    )
     params = AzureOpenAIResponsesAPIConfig().map_openai_params(
         response_api_optional_params=ResponsesAPIOptionalRequestParams(
             temperature=0.2,
             reasoning={"effort": "none"},
         ),
-        model="gpt-6-astra",
+        model="gpt-6-sol",
         drop_params=False,
     )
     assert params["temperature"] == 0.2
@@ -679,6 +689,116 @@ def test_azure_responses_gpt6_astra_rejects_temperature_while_reasoning(local_mo
         )
 
 
+@pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.1-sol"])
+@pytest.mark.parametrize("level", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_azure_responses_gpt6_effort_levels_follow_the_azure_row(local_model_cost_map: None, model: str, level: str):
+    """A bare deployment name reads the azure/ row, opt-out for every level but max, so the none
+    and minimal Foundry refuses on this route (live 400s on 2026-10-01 for gpt-6-astra and 2026-10-02
+    for gpt-6.1-sol) are dropped or refused here while the max it honors goes through whatever the
+    route-blind flag says."""
+    forwarded = (
+        level == "max" or litellm.model_cost[f"azure/{model}"].get(f"supports_{level}_reasoning_effort") is not False
+    )
+    dropped = AzureOpenAIResponsesAPIConfig().map_openai_params(
+        response_api_optional_params=ResponsesAPIOptionalRequestParams(reasoning={"effort": level}),
+        model=model,
+        drop_params=True,
+    )
+    assert ("reasoning" in dropped) is forwarded
+    if forwarded:
+        kept = AzureOpenAIResponsesAPIConfig().map_openai_params(
+            response_api_optional_params=ResponsesAPIOptionalRequestParams(reasoning={"effort": level}),
+            model=model,
+            drop_params=False,
+        )
+        assert kept["reasoning"] == {"effort": level}
+    else:
+        with pytest.raises(litellm.UnsupportedParamsError):
+            AzureOpenAIResponsesAPIConfig().map_openai_params(
+                response_api_optional_params=ResponsesAPIOptionalRequestParams(reasoning={"effort": level}),
+                model=model,
+                drop_params=False,
+            )
+
+
+def test_azure_gpt6_astra_keeps_max_on_this_route_whatever_its_row_says(local_model_cost_map: None):
+    """Pinned on purpose: the row-derived test above exempts max by hand, so this one has to fail
+    if the gate ever reads the flag. A Foundry gpt-6-astra deployment answered reasoning.effort max
+    through /v1/responses with 200, the effort echoed back and reasoning tokens billed, on
+    2026-10-01, while chat refuses the same level, as OpenAI's chat does. The row keeps max off for
+    the adapter and the picker, and this gate still forwards it even under drop_params."""
+    assert litellm.model_cost["azure/gpt-6-astra"]["supports_max_reasoning_effort"] is False
+    kept = AzureOpenAIResponsesAPIConfig().map_openai_params(
+        response_api_optional_params=ResponsesAPIOptionalRequestParams(reasoning={"effort": "max"}),
+        model="gpt-6-astra",
+        drop_params=True,
+    )
+    assert kept["reasoning"] == {"effort": "max"}
+
+
+@pytest.mark.parametrize("level", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_azure_responses_effort_gate_fires_when_azure_ai_prefix_survives_provider_remap(
+    local_model_cost_map: None, level: str
+):
+    """litellm.responses(model="azure_ai/gpt-6.1-sol", api_base=<Foundry host>) is re-routed to the
+    azure provider with the prefix intact, so this config sees the prefixed name. The gate used to
+    skip every prefixed name as another provider's pass-through, and a live Foundry gpt-6.1-sol
+    answered the forwarded none and minimal with 400 on 2026-10-02 even under drop_params. The
+    prefixed name reads the azure_ai/ row and drops or refuses exactly what that row turns off."""
+    forwarded = (
+        level == "max"
+        or litellm.model_cost["azure_ai/gpt-6.1-sol"].get(f"supports_{level}_reasoning_effort") is not False
+    )
+    dropped = AzureOpenAIResponsesAPIConfig().map_openai_params(
+        response_api_optional_params=ResponsesAPIOptionalRequestParams(
+            max_output_tokens=60, reasoning={"effort": level}
+        ),
+        model="azure_ai/gpt-6.1-sol",
+        drop_params=True,
+    )
+    assert ("reasoning" in dropped) is forwarded
+    if forwarded:
+        return
+    with pytest.raises(litellm.UnsupportedParamsError):
+        AzureOpenAIResponsesAPIConfig().map_openai_params(
+            response_api_optional_params=ResponsesAPIOptionalRequestParams(
+                max_output_tokens=60, reasoning={"effort": level}
+            ),
+            model="azure_ai/gpt-6.1-sol",
+            drop_params=False,
+        )
+
+
+def test_azure_responses_prefixed_name_reads_the_foundry_row_not_the_azure_twin(
+    local_model_cost_map: None, monkeypatch: pytest.MonkeyPatch
+):
+    """The rows are made to disagree on low, a level neither real row flags, so the prefixed name
+    proving it reads azure_ai/gpt-6-sol cannot pass by reading azure/gpt-6-sol, which the bare
+    deployment name keeps reading."""
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "azure_ai/gpt-6-sol",
+        {**litellm.model_cost["azure_ai/gpt-6-sol"], "supports_low_reasoning_effort": False},
+    )
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "azure/gpt-6-sol",
+        {**litellm.model_cost["azure/gpt-6-sol"], "supports_low_reasoning_effort": True},
+    )
+    prefixed = AzureOpenAIResponsesAPIConfig().map_openai_params(
+        response_api_optional_params=ResponsesAPIOptionalRequestParams(reasoning={"effort": "low"}),
+        model="azure_ai/gpt-6-sol",
+        drop_params=True,
+    )
+    assert "reasoning" not in prefixed
+    bare = AzureOpenAIResponsesAPIConfig().map_openai_params(
+        response_api_optional_params=ResponsesAPIOptionalRequestParams(reasoning={"effort": "low"}),
+        model="gpt-6-sol",
+        drop_params=True,
+    )
+    assert bare["reasoning"] == {"effort": "low"}
+
+
 def test_azure_responses_sends_the_deployment_name_when_azure_ai_prefix_survives_provider_remap():
     request = AzureOpenAIResponsesAPIConfig().transform_responses_api_request(
         model="azure_ai/gpt-5.4-nano",
@@ -688,3 +808,255 @@ def test_azure_responses_sends_the_deployment_name_when_azure_ai_prefix_survives
         headers={},
     )
     assert request["model"] == "gpt-5.4-nano"
+
+
+@pytest.mark.asyncio
+async def test_azure_responses_api_status_error():
+    """
+    Test that 'status' field is not sent in the final request body to Azure API.
+    The status field should be filtered out from input messages before making the API call.
+    """
+    from unittest.mock import MagicMock
+    import json
+
+    request_data = {
+        "model": "computer-use-preview",
+        "input": [
+            {"content": "tell me an interesting fact", "role": "user"},
+            {
+                "id": "rs_0ab687487834d9df0068e462a1b2d88197aabbc832c9ba5316",
+                "summary": [],
+                "type": "reasoning",
+                "content": None,
+                "encrypted_content": None,
+                "status": "completed",
+            },
+            {
+                "id": "msg_0ab687487834d9df0068e462a1df188197b74b1eef05102c18",
+                "content": [
+                    {
+                        "annotations": [],
+                        "text": "very good morning",
+                        "type": "output_text",
+                        "logprobs": [],
+                    }
+                ],
+                "role": "assistant",
+                "status": "completed",
+                "type": "message",
+            },
+            {"role": "user", "content": "tell me another"},
+        ],
+        "include": [],
+        "instructions": "You are a helpful assistant.",
+        "reasoning": {"effort": "minimal"},
+        "stream": False,
+        "tools": [],
+    }
+
+    # Mock response
+    mock_response_data = {
+        "id": "resp_123",
+        "object": "response",
+        "created_at": 1234567890,
+        "model": "computer-use-preview",
+        "status": "completed",
+        "output": [
+            {
+                "id": "msg_123",
+                "role": "assistant",
+                "type": "message",
+                "status": "completed",
+                "content": [
+                    {"type": "output_text", "text": "Here's an interesting fact."}
+                ],
+            }
+        ],
+    }
+
+    captured_request_body = {}
+
+    async def mock_post(*args, **kwargs):
+        # Capture the request body
+        nonlocal captured_request_body
+        if "json" in kwargs:
+            captured_request_body = kwargs["json"]
+        elif "data" in kwargs:
+            captured_request_body = json.loads(kwargs["data"])
+
+        import httpx
+
+        # Create a proper httpx Response object
+        response_content = json.dumps(mock_response_data).encode("utf-8")
+        response = httpx.Response(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            content=response_content,
+            request=httpx.Request(method="POST", url="https://test.openai.azure.com"),
+        )
+        return response
+
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+    from unittest.mock import patch
+
+    with patch.object(AsyncHTTPHandler, "post", new=mock_post):
+        response = await litellm.aresponses(
+            model="azure/computer-use-preview",
+            truncation="auto",
+            api_version="preview",
+            api_base="https://test.openai.azure.com",
+            api_key="test-key",
+            input=request_data["input"],
+        )
+
+    # Verify that 'status' field is not present in any of the input messages
+    print(
+        "Final request body:", json.dumps(captured_request_body, indent=4, default=str)
+    )
+    assert "input" in captured_request_body, "Request body should contain 'input' field"
+
+    expected_input = [
+        {"content": "tell me an interesting fact", "role": "user"},
+        {
+            "id": "rs_0ab687487834d9df0068e462a1b2d88197aabbc832c9ba5316",
+            "summary": [],
+            "type": "reasoning",
+        },
+        {
+            "id": "msg_0ab687487834d9df0068e462a1df188197b74b1eef05102c18",
+            "content": [
+                {
+                    "annotations": [],
+                    "text": "very good morning",
+                    "type": "output_text",
+                    "logprobs": [],
+                }
+            ],
+            "role": "assistant",
+            "type": "message",
+        },
+        {"role": "user", "content": "tell me another"},
+    ]
+
+    assert captured_request_body["input"] == expected_input, (
+        f"Request body input should match expected format without 'status' field.\n"
+        f"Expected: {json.dumps(expected_input, indent=2)}\n"
+        f"Got: {json.dumps(captured_request_body['input'], indent=2)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_azure_responses_api_headers_with_llm_provider_prefix():
+    """
+    Test that Azure-specific headers like 'x-request-id' and 'apim-request-id'
+    are properly forwarded with 'llm_provider-' prefix in response._hidden_params["headers"].
+
+    Issue: https://github.com/BerriAI/litellm/issues/16538
+
+    The fix ensures that processed headers (with llm_provider- prefix) are stored
+    in response._hidden_params["headers"] instead of additional_headers, making them
+    accessible via completion.headers in the same way as the completion API.
+    """
+    import httpx
+
+    mock_response_data = {
+        "id": "resp_123",
+        "object": "response",
+        "created_at": 1234567890,
+        "model": "gpt-5-codex",
+        "status": "completed",
+        "output": [
+            {
+                "id": "msg_123",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Hello!"}],
+            }
+        ],
+    }
+
+    # Mock headers that Azure returns - exactly like in the issue
+    mock_headers = {
+        "date": "Wed, 12 Nov 2025 15:31:28 GMT",
+        "server": "uvicorn",
+        "content-type": "application/json",
+        "x-ratelimit-remaining-tokens": "5010000",
+        "x-ratelimit-limit-tokens": "5010000",
+        # These are the Azure-specific headers that should be forwarded with llm_provider- prefix
+        "x-request-id": "12086715-aca3-4006-a29f-2f1e1d552043",
+        "apim-request-id": "25664b0d-cf4b-4e10-8d27-c7272e7efd49",
+        "x-ms-region": "Sweden Central",
+    }
+
+    async def mock_post(*args, **kwargs):
+        response_content = json.dumps(mock_response_data).encode("utf-8")
+        response = httpx.Response(
+            status_code=200,
+            headers=mock_headers,
+            content=response_content,
+            request=httpx.Request(method="POST", url="https://test.openai.azure.com"),
+        )
+        return response
+
+    with patch.object(AsyncHTTPHandler, "post", new=mock_post):
+        response = await litellm.aresponses(
+            model="azure/gpt-5-codex",
+            api_version="2025-03-01-preview",
+            api_base="https://test.openai.azure.com",
+            api_key="test-key",
+            input="Hello, can you tell me a short joke?",
+        )
+
+    # Check that the response has the expected headers structure
+    assert hasattr(response, "_hidden_params"), "Response should have _hidden_params"
+    assert (
+        "additional_headers" in response._hidden_params
+    ), "Response _hidden_params should contain 'additional_headers' with the LLM provider headers"
+
+    headers = response._hidden_params["additional_headers"]
+
+    # Verify that Azure-specific headers are present with llm_provider- prefix
+    assert "llm_provider-x-request-id" in headers, (
+        f"Response should contain 'llm_provider-x-request-id' header. "
+        f"Headers: {list(headers.keys())}"
+    )
+    assert "llm_provider-apim-request-id" in headers, (
+        f"Response should contain 'llm_provider-apim-request-id' header. "
+        f"Headers: {list(headers.keys())}"
+    )
+
+    # Verify the header values match
+    assert (
+        headers["llm_provider-x-request-id"] == "12086715-aca3-4006-a29f-2f1e1d552043"
+    )
+    assert (
+        headers["llm_provider-apim-request-id"]
+        == "25664b0d-cf4b-4e10-8d27-c7272e7efd49"
+    )
+    assert headers["llm_provider-x-ms-region"] == "Sweden Central"
+
+    # Also verify openai-compatible headers are included
+    assert "x-ratelimit-limit-tokens" in headers
+    assert "x-ratelimit-remaining-tokens" in headers
+
+
+@pytest.mark.parametrize(
+    "model", ["gpt-5", "gpt-5-turbo", "GPT-5", "azure/gpt-5", "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o"]
+)
+def test_azure_gpt_models_resolve_to_responses_config_with_temperature(model: str) -> None:
+    config: Final = ProviderConfigManager.get_provider_responses_api_config(provider=LlmProviders.AZURE, model=model)
+    assert type(config) is AzureOpenAIResponsesAPIConfig
+    assert "temperature" in config.get_supported_openai_params(model)
+
+
+@pytest.mark.parametrize("model", ["o1", "o3"])
+def test_azure_o_series_resolves_to_o_series_config_without_temperature(model: str) -> None:
+    config: Final = ProviderConfigManager.get_provider_responses_api_config(provider=LlmProviders.AZURE, model=model)
+    assert type(config) is AzureOpenAIOSeriesResponsesAPIConfig
+    assert "temperature" not in config.get_supported_openai_params(model)
+
+
+def test_openai_gpt5_resolves_to_responses_config_with_temperature() -> None:
+    config: Final = ProviderConfigManager.get_provider_responses_api_config(provider=LlmProviders.OPENAI, model="gpt-5")
+    assert type(config) is OpenAIResponsesAPIConfig
+    assert "temperature" in config.get_supported_openai_params("gpt-5")

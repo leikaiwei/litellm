@@ -3,7 +3,9 @@ Translates from OpenAI's `/v1/chat/completions` to DeepSeek's `/v1/chat/completi
 """
 
 from collections.abc import Coroutine, Mapping, Sequence
-from typing import Any, Final, Literal, cast, overload
+from typing import Final, Literal, cast, overload
+
+from pydantic import InstanceOf, TypeAdapter
 
 import litellm
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
@@ -18,6 +20,9 @@ from litellm.types.llms.openai import AllMessageValues
 from litellm.utils import supports_reasoning, supports_vision
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
+
+_TOOL_ITEMS: Final = TypeAdapter(tuple[object, ...])
+_TOOL_OBJECT: Final = TypeAdapter(InstanceOf[dict[str, object]])
 
 
 class DeepSeekChatConfig(OpenAIGPTConfig):
@@ -65,21 +70,21 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         return optional_params
 
     @staticmethod
-    def _normalize_openai_tool_schemas(optional_params: dict) -> None:
-        tools = optional_params.get("tools")
+    def _normalize_openai_tool_schemas(optional_params: Mapping[str, object]) -> None:
+        tools: Final = optional_params.get("tools")
         if not isinstance(tools, list):
             return
 
-        for tool in tools:
+        for tool in _TOOL_ITEMS.validate_python(tools):
             if not isinstance(tool, dict):
                 continue
-            func = tool.get("function")
+            func = _TOOL_OBJECT.validate_python(tool).get("function")
             if not isinstance(func, dict):
                 continue
-            params = func.get("parameters")
+            params = _TOOL_OBJECT.validate_python(func).get("parameters")
             if isinstance(params, dict):
                 # DeepSeek 不支持 Anthropic custom JSON Schema 类型。
-                normalize_json_schema_custom_types_to_object(params)
+                normalize_json_schema_custom_types_to_object(_TOOL_OBJECT.validate_python(params))
 
     def _fill_reasoning_content(self, messages: list[AllMessageValues]) -> list[AllMessageValues]:
         """
@@ -114,13 +119,13 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
 
                 provider_fields = patched.get("provider_specific_fields") or {}
                 if not reasoning_content and isinstance(provider_fields, dict):
-                    reasoning_content = provider_fields.get("reasoning_content")
+                    reasoning_content = _TOOL_OBJECT.validate_python(provider_fields).get("reasoning_content")
                     reasoning_content_from_provider = bool(reasoning_content)
 
                 if reasoning_content:
                     patched["reasoning_content"] = reasoning_content
                     if reasoning_content_from_provider:
-                        cleaned = dict(provider_fields)
+                        cleaned = dict(_TOOL_OBJECT.validate_python(provider_fields))
                         cleaned.pop("reasoning_content", None)
                         patched["provider_specific_fields"] = cleaned
                 else:
@@ -141,7 +146,7 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
     @overload
     def _transform_messages(
         self, messages: list[AllMessageValues], model: str, is_async: Literal[True]
-    ) -> Coroutine[Any, Any, list[AllMessageValues]]: ...
+    ) -> Coroutine[object, object, list[AllMessageValues]]: ...
 
     @overload
     def _transform_messages(
@@ -153,7 +158,7 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
 
     def _transform_messages(
         self, messages: list[AllMessageValues], model: str, is_async: bool = False
-    ) -> list[AllMessageValues] | Coroutine[Any, Any, list[AllMessageValues]]:
+    ) -> list[AllMessageValues] | Coroutine[object, object, list[AllMessageValues]]:
         """
         DeepSeek vision models accept image_url content blocks in user
         messages (https://api-docs.deepseek.com/guides/vision), so those
@@ -350,7 +355,7 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         optional_params = self._drop_unsupported_tools(optional_params)
         if self._thinking_mode_active(model=model, optional_params=optional_params):
             messages = self._fill_reasoning_content(messages)
-        self._normalize_openai_tool_schemas(optional_params)
+        self._normalize_openai_tool_schemas(_TOOL_OBJECT.validate_python(optional_params))
         return super().transform_request(
             model=model,
             messages=messages,
@@ -374,7 +379,7 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         optional_params = self._drop_unsupported_tools(optional_params)
         if self._thinking_mode_active(model=model, optional_params=optional_params):
             messages = self._fill_reasoning_content(messages)
-        self._normalize_openai_tool_schemas(optional_params)
+        self._normalize_openai_tool_schemas(_TOOL_OBJECT.validate_python(optional_params))
         return await super().async_transform_request(
             model=model,
             messages=messages,
@@ -402,10 +407,9 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         """
         If api_base is not provided, use the default DeepSeek /chat/completions endpoint.
         """
-        if not api_base:
-            api_base = "https://api.deepseek.com/beta"
+        clean_api_base: Final = (api_base or "https://api.deepseek.com/beta").rstrip("/")
 
-        if not api_base.endswith("/chat/completions"):
-            api_base = f"{api_base}/chat/completions"
+        if not clean_api_base.endswith("/chat/completions"):
+            return f"{clean_api_base}/chat/completions"
 
-        return api_base
+        return clean_api_base

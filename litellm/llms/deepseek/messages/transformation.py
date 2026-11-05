@@ -2,11 +2,16 @@
 DeepSeek Anthropic-compatible messages transformation config.
 """
 
-from typing import Any, Final
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
+from typing import Final
 
 import httpx
+from pydantic import TypeAdapter
 
 import litellm
+from litellm.litellm_core_utils.prompt_templates.mid_conversation_system import message_field
+from litellm.llms.anthropic.common_utils import validated_object_list, validated_object_mapping
 from litellm.llms.anthropic.pass_through.messages.transformation import (
     AnthropicMessagesConfig,
 )
@@ -16,16 +21,19 @@ from litellm.llms.bedrock.common_utils import (
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.router import GenericLiteLLMParams
 
-DEEPSEEK_ANTHROPIC_API_BASE = "https://api.deepseek.com/anthropic"
-_DEEPSEEK_CUSTOM_TOOL_ALLOWED_FIELDS = {
-    "cache_control",
-    "description",
-    "input_schema",
-    "name",
-}
+DEEPSEEK_ANTHROPIC_API_BASE: Final = "https://api.deepseek.com/anthropic"
+_DEEPSEEK_CUSTOM_TOOL_ALLOWED_FIELDS: Final = frozenset(
+    {
+        "cache_control",
+        "description",
+        "input_schema",
+        "name",
+    }
+)
 
 
-_PLACEHOLDER_THINKING_BLOCK = {"type": "thinking", "thinking": " "}
+_PLACEHOLDER_THINKING_BLOCK: Final = MappingProxyType({"type": "thinking", "thinking": " "})
+_SCHEMA_ADAPTER: Final = TypeAdapter(dict[str, object])
 
 
 def _is_deepseek_thinking_block_error(error_text: str) -> bool:
@@ -42,14 +50,12 @@ def _is_deepseek_thinking_block_error(error_text: str) -> bool:
     """
     if not error_text:
         return False
-    lower = error_text.lower()
+    lower: Final = error_text.lower()
     if "redacted_thinking" in lower:
         return True
     if "unknown variant" in lower and "thinking" in lower:
         return True
-    if "must be passed back" in lower and "thinking" in lower:
-        return True
-    return False
+    return "must be passed back" in lower and "thinking" in lower
 
 
 def _repair_assistant_message_for_deepseek(message: object) -> object:
@@ -60,35 +66,35 @@ def _repair_assistant_message_for_deepseek(message: object) -> object:
         （thinking 模式下 DeepSeek 要求这类消息回传 thinking）
     非 assistant、或 content 非 list 的消息原样返回。
     """
-    if not isinstance(message, dict) or message.get("role") != "assistant":
+    fields: Final = validated_object_mapping(message)
+    if fields is None or fields.get("role") != "assistant":
         return message
-    content = message.get("content")
-    if not isinstance(content, list):
+    if not isinstance(fields.get("content"), list):
         return message
+    content: Final = validated_object_list(fields.get("content")) or ()
 
-    converted = tuple(
-        dict(_PLACEHOLDER_THINKING_BLOCK)
-        if isinstance(block, dict) and block.get("type") == "redacted_thinking"
-        else block
+    converted: Final = tuple(
+        dict(_PLACEHOLDER_THINKING_BLOCK) if message_field(block, "type") == "redacted_thinking" else block
         for block in content
     )
-    has_thinking = any(isinstance(block, dict) and block.get("type") == "thinking" for block in converted)
-    has_tool_use = any(isinstance(block, dict) and block.get("type") == "tool_use" for block in converted)
-    new_content = (
+    has_thinking: Final = any(message_field(block, "type") == "thinking" for block in converted)
+    has_tool_use: Final = any(message_field(block, "type") == "tool_use" for block in converted)
+    new_content: Final = (
         [dict(_PLACEHOLDER_THINKING_BLOCK), *converted] if has_tool_use and not has_thinking else list(converted)
     )
-    return {**message, "content": new_content}
+    return {**fields, "content": new_content}
 
 
-def _repair_thinking_blocks_for_deepseek(request_data: dict) -> None:
-    """
-    原地重建 request_data["messages"]，逐条修复 assistant 消息的 thinking 块。
-    handler 依赖对 request_data 的原地修改（返回值被丢弃）。
-    """
-    messages = request_data.get("messages")
-    if not isinstance(messages, list):
-        return
-    request_data["messages"] = [_repair_assistant_message_for_deepseek(m) for m in messages]
+def _sanitize_tool_for_deepseek(tool: object) -> object:
+    fields: Final = validated_object_mapping(tool)
+    if fields is None or fields.get("type") not in (None, "custom") or "name" not in fields:
+        return tool
+    sanitized: Final = {key: value for key, value in fields.items() if key in _DEEPSEEK_CUSTOM_TOOL_ALLOWED_FIELDS}
+    if not isinstance(sanitized.get("input_schema"), dict):
+        return sanitized
+    input_schema: Final = _SCHEMA_ADAPTER.validate_python(sanitized["input_schema"])
+    normalize_json_schema_custom_types_to_object(input_schema)
+    return {**sanitized, "input_schema": input_schema}
 
 
 class DeepSeekAnthropicMessagesConfig(AnthropicMessagesConfig):
@@ -125,7 +131,7 @@ class DeepSeekAnthropicMessagesConfig(AnthropicMessagesConfig):
         self,
         headers: dict,
         model: str,
-        messages: list[Any],
+        messages: Sequence[object],
         optional_params: dict,
         litellm_params: dict,
         api_key: str | None = None,
@@ -166,33 +172,11 @@ class DeepSeekAnthropicMessagesConfig(AnthropicMessagesConfig):
         return f"{base_url}/v1/messages"
 
     @staticmethod
-    def _sanitize_tools_for_deepseek(tools: Any) -> Any:
+    def _sanitize_tools_for_deepseek(tools: object) -> object:
+        tool_items: Final = validated_object_list(tools)
         if not isinstance(tools, list):
             return tools
-
-        sanitized_tools: Final = []
-        for tool in tools:
-            if not isinstance(tool, dict):
-                sanitized_tools.append(tool)
-                continue
-
-            tool_type = tool.get("type")
-            if isinstance(tool_type, str) and tool_type.startswith("web_search_"):
-                sanitized_tools.append(tool)
-                continue
-
-            if tool_type in (None, "custom") and "name" in tool:
-                sanitized_tool = {
-                    key: value for key, value in tool.items() if key in _DEEPSEEK_CUSTOM_TOOL_ALLOWED_FIELDS
-                }
-                input_schema = sanitized_tool.get("input_schema")
-                if isinstance(input_schema, dict):
-                    # DeepSeek 不支持 Anthropic custom JSON Schema 类型。
-                    normalize_json_schema_custom_types_to_object(input_schema)
-                sanitized_tools.append(sanitized_tool)
-            else:
-                sanitized_tools.append(tool)
-        return sanitized_tools
+        return [_sanitize_tool_for_deepseek(tool) for tool in tool_items or ()]
 
     def transform_anthropic_messages_request(
         self,
@@ -213,26 +197,38 @@ class DeepSeekAnthropicMessagesConfig(AnthropicMessagesConfig):
             anthropic_messages_request["tools"] = self._sanitize_tools_for_deepseek(anthropic_messages_request["tools"])
         return anthropic_messages_request
 
-    def should_retry_anthropic_messages_on_http_error(self, e: httpx.HTTPStatusError, litellm_params: dict) -> bool:
+    def should_retry_anthropic_messages_on_http_error(
+        self, e: httpx.HTTPStatusError, litellm_params: Mapping[str, object], request_body: object = None
+    ) -> bool:
         """
         除父类的无效签名恢复外，额外覆盖 DeepSeek 因外来 thinking 块导致的 400。
 
         fallback 到 DeepSeek 时（qwen/claude -> deepseek），assistant 历史带着另一
         模型产的 thinking 块（含 DeepSeek 不认的 redacted_thinking），或含 tool_use
-        却缺 thinking 块，DeepSeek 拒绝；修复 thinking 块后重试即可恢复。检测只能基于
-        错误文本，因为此钩子拿不到请求体。
+        却缺 thinking 块，DeepSeek 拒绝；修复 thinking 块后重试即可恢复。
+        请求体透传父类，保留调用方明确要求的 thinking 绑定错误。
         """
-        if super().should_retry_anthropic_messages_on_http_error(e=e, litellm_params=litellm_params):
+        if super().should_retry_anthropic_messages_on_http_error(
+            e=e, litellm_params=dict(litellm_params), request_body=request_body
+        ):
             return True
         return e.response.status_code == 400 and _is_deepseek_thinking_block_error(e.response.text)
 
-    def transform_anthropic_messages_request_on_http_error(self, e: httpx.HTTPStatusError, request_data: dict) -> dict:
+    def transform_anthropic_messages_request_on_http_error(
+        self,
+        e: httpx.HTTPStatusError,
+        request_data: dict[str, object],  # mutable-ok: HTTP 重试调用方丢弃返回值，要求原地修复请求
+    ) -> dict[str, object]:  # mutable-ok: 保持父类返回同一可变请求对象的接口
         """
         命中 DeepSeek thinking 块 400 时修复 assistant 历史后重试：redacted_thinking
         转为占位 thinking 块，含 tool_use 却无 thinking 块的消息前置占位 thinking 块。
         父类的签名错误场景由 super() 处理。
         """
-        request_data = super().transform_anthropic_messages_request_on_http_error(e=e, request_data=request_data)
+        super().transform_anthropic_messages_request_on_http_error(e=e, request_data=request_data)
         if e.response.status_code == 400 and _is_deepseek_thinking_block_error(e.response.text):
-            _repair_thinking_blocks_for_deepseek(request_data)
+            messages: Final = validated_object_list(request_data.get("messages"))
+            if messages is not None:
+                request_data["messages"] = [  # rebind-ok: HTTP 重试调用方丢弃返回值，要求原地修复请求
+                    _repair_assistant_message_for_deepseek(m) for m in messages
+                ]
         return request_data

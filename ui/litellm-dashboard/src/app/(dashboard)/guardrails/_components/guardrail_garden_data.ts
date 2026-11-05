@@ -1,5 +1,4 @@
 import { Providers, providerLogoMap } from "@/components/provider_info_helpers";
-import typesafeLogo from "../../../../../public/assets/logos/typesafe.png";
 import { guardrailLogoMap } from "./guardrail_info_helpers";
 
 export interface GuardrailCardInfo {
@@ -249,7 +248,7 @@ export const DECISION_MODEL_CARDS: GuardrailCardInfo[] = [
     description:
       "TypeSafe's Jev decision model answers your yes/no questions about each request, such as prompt injection or policy checks.",
     category: "decision_model",
-    logo: typesafeLogo.src,
+    logo: providerLogoMap[Providers.TypeSafe] ?? "",
     tags: ["Decision Model", "TypeSafe", "Prompt Injection"],
     providerKey: "DecisionModel",
   },
@@ -539,6 +538,16 @@ export const PARTNER_GUARDRAIL_CARDS: GuardrailCardInfo[] = [
     providerKey: "Agent365",
   },
   {
+    id: "llm_shield_proxy",
+    name: "LLM Shield Proxy",
+    description:
+      "Self-hosted PII redaction that puts the original values back into the model's response, so the provider never receives personal data while the end user still sees it.",
+    category: "partner",
+    logo: guardrailLogoMap["LLM Shield Proxy"],
+    tags: ["PII", "Data Privacy", "Compliance", "Streaming"],
+    providerKey: "LLM Shield Proxy",
+  },
+  {
     id: "conduct",
     name: "Conduct Guard",
     description:
@@ -547,6 +556,26 @@ export const PARTNER_GUARDRAIL_CARDS: GuardrailCardInfo[] = [
     logo: guardrailLogoMap["Conduct Guard"],
     tags: ["Security", "Prompt Injection", "PII", "Policy"],
     providerKey: "Conduct",
+  },
+  {
+    id: "wingback",
+    name: "Wingback",
+    description:
+      "Wingback runtime security for LiteLLM — PII detection, prompt injection, toxic content, and policy enforcement via the Wingback connectors service.",
+    category: "partner",
+    logo: guardrailLogoMap["Wingback"],
+    tags: ["Security", "PII", "Prompt Injection", "Runtime"],
+    providerKey: "Wingback",
+  },
+  {
+    id: "airia",
+    name: "Airia Guardrail",
+    description:
+      "Airia AI security and governance platform. Runtime guardrails for prompt injection, data leakage prevention, and responsible AI, enforced on every prompt and response.",
+    category: "partner",
+    logo: guardrailLogoMap["Airia Guardrail"],
+    tags: ["Security", "Prompt Injection", "PII", "Secrets", "Redaction"],
+    providerKey: "Airia",
   },
 ];
 

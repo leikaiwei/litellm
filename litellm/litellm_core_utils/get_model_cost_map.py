@@ -21,12 +21,13 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib.resources import files
+from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Protocol
 
 import httpx
-from pydantic import TypeAdapter
+from pydantic import ConfigDict, TypeAdapter
 from typing_extensions import ReadOnly, TypedDict
 
 from litellm import verbose_logger
@@ -40,6 +41,7 @@ from litellm.litellm_core_utils.fallback_generalizations import (
 
 FALLBACK_GENERALIZATIONS_KEY: Final = "fallback_generalizations"
 _CATALOG_ADAPTER: Final = TypeAdapter(dict[str, dict[str, object]])
+_BUNDLED_CATALOG_ADAPTER: Final = TypeAdapter(dict[str, object], config=ConfigDict(hide_input_in_errors=True))
 _CLI_ENTRYPOINT_NAMES: Final = frozenset({"lite", "litellm-proxy"})
 
 
@@ -83,15 +85,16 @@ class GetModelCostMap:
     @staticmethod
     def load_local_model_cost_map_with_revision() -> "ModelCostMapReloaded":
         body: Final = GetModelCostMap.read_local_model_cost_map_bytes()
-        content: Final = json.loads(body)
+        content: Final = _BUNDLED_CATALOG_ADAPTER.validate_python(json.loads(body))
         return ModelCostMapReloaded(model_cost_map=content, revision=git_blob_id(body))
 
     @staticmethod
-    def load_local_model_cost_map() -> dict:
+    def load_local_model_cost_map() -> dict[str, object]:  # mutable-ok: 调用方将结果用作可写模型注册表
         """Load the local backup model cost map bundled with the package."""
         return GetModelCostMap.load_local_model_cost_map_with_revision().model_cost_map
 
     _loaded_catalog: Mapping[str, Mapping[str, object]] = MappingProxyType({})
+    _loaded_catalog_fields: frozenset[str] = frozenset()
 
     @classmethod
     def loaded_model_cost_map(cls) -> Mapping[str, Mapping[str, object]]:
@@ -99,17 +102,25 @@ class GetModelCostMap:
         return cls._loaded_catalog
 
     @classmethod
+    def loaded_model_cost_map_fields(cls) -> frozenset[str]:
+        """Every field name that at least one entry of the loaded catalog carries."""
+        return cls._loaded_catalog_fields
+
+    @classmethod
     def _snapshot_loaded_catalog(cls, model_cost: Mapping[str, object]) -> None:
         raw: Final = _CATALOG_ADAPTER.validate_python(model_cost)
         cls._loaded_catalog = MappingProxyType({key: MappingProxyType(entry) for key, entry in raw.items()})
+        cls._loaded_catalog_fields = frozenset(chain.from_iterable(entry.keys() for entry in raw.values()))
 
     @classmethod
-    def _get_backup_model_count(cls) -> int:
+    def get_backup_model_count(cls) -> int:
         """Return the number of models in the local backup (cached int)."""
         if cls._backup_model_count < 0:
             backup: Final = cls.load_local_model_cost_map()
             cls._backup_model_count = _count_model_entries(backup)
         return cls._backup_model_count
+
+    _get_backup_model_count = get_backup_model_count
 
     @staticmethod
     def _check_is_valid_dict(fetched_map: dict) -> bool:
@@ -210,7 +221,7 @@ def mark_litellm_import_complete() -> None:
 
 @dataclass(frozen=True, slots=True)
 class ModelCostMapReloaded:
-    model_cost_map: dict  # mutable-ok: adopted as litellm.model_cost, whose consumer contract is a plain mutable dict
+    model_cost_map: dict[str, object]  # mutable-ok: litellm.model_cost 的调用方需要可写字典
     revision: str | None = None
     etag: str | None = None
 
@@ -230,8 +241,9 @@ class _FetchAttemptRetryable:
 
 
 def _parse_retry_after_seconds(response: httpx.Response) -> float | None:
-    header: Final = response.headers.get("Retry-After")
-    if header is None:
+    try:
+        header: Final = response.headers["Retry-After"]
+    except KeyError:
         return None
     try:
         seconds: Final = float(header)
@@ -243,7 +255,7 @@ def _parse_retry_after_seconds(response: httpx.Response) -> float | None:
 def _retry_wait_seconds(outcome: _FetchAttemptRetryable, attempt: int, rng: random.Random) -> float:
     if outcome.retry_after_seconds is not None:
         return min(outcome.retry_after_seconds, MODEL_COST_MAP_FETCH_MAX_WAIT_SECONDS)
-    return min(float(2**attempt) + rng.uniform(0.0, 1.0), MODEL_COST_MAP_FETCH_MAX_WAIT_SECONDS)
+    return min(2.0**attempt + rng.uniform(0.0, 1.0), MODEL_COST_MAP_FETCH_MAX_WAIT_SECONDS)
 
 
 class _AsyncGetClient(Protocol):
@@ -401,7 +413,7 @@ async def refetch_model_cost_map(
         return result
     if not GetModelCostMap.validate_model_cost_map(
         fetched_map=result.model_cost_map,
-        backup_model_count=GetModelCostMap._get_backup_model_count(),
+        backup_model_count=GetModelCostMap.get_backup_model_count(),
     ):
         return ModelCostMapReloadUnavailable(reason=f"model cost map from {url} failed integrity validation")
     _cost_map_source_info.loaded_at = datetime.now(timezone.utc)
@@ -478,22 +490,42 @@ def get_model_cost_map_loaded_at() -> "datetime | None":
     return _cost_map_source_info.loaded_at
 
 
-def _expand_model_aliases(model_cost: dict) -> dict:
+class AliasedCostEntry(dict[str, object]):
+    __slots__ = ("names", "registered_fields")
+
+    def __init__(
+        self, entry: Mapping[str, object], names: tuple[str, ...], registered_fields: frozenset[str] = frozenset()
+    ) -> None:
+        super().__init__(entry)
+        self.names: tuple[str, ...] = names
+        self.registered_fields: frozenset[str] = registered_fields
+
+
+def _alias_groups(alias_owners: Mapping[str, str]) -> Mapping[str, tuple[str, ...]]:
+    return MappingProxyType(
+        {
+            owner: (owner, *(alias for alias, alias_owner in alias_owners.items() if alias_owner == owner))
+            for owner in dict.fromkeys(alias_owners.values())
+        }
+    )
+
+
+def _expand_model_aliases(model_cost: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
     """
     Expand ``aliases`` lists in model cost entries into top-level entries.
 
-    Each alias gets a reference to the **same** dict object as the canonical
-    entry (zero memory overhead).  The ``aliases`` key is removed from the
-    entry so downstream code never sees it.
+    Each alias gets a reference to the **same** ``AliasedCostEntry`` as the
+    canonical entry, which carries every name it is served under.  The
+    ``aliases`` key is removed from the entry so downstream code never sees it.
 
     If an alias collides with an existing canonical entry the alias is
     skipped and a warning is logged.
     """
-    aliases_to_add: Final[dict[str, dict]] = {}
+    alias_owners: Final[dict[str, str]] = {}
     keys_with_aliases: Final[list[str]] = []
 
     for model_name, model_info in model_cost.items():
-        aliases: list | None = model_info.get("aliases")
+        aliases: object = model_info.get("aliases")
         if aliases is None:
             continue
         keys_with_aliases.append(model_name)
@@ -515,7 +547,7 @@ def _expand_model_aliases(model_cost: dict) -> dict:
                     model_name,
                 )
                 continue
-            if alias in aliases_to_add:
+            if alias in alias_owners:
                 verbose_logger.warning(
                     "LiteLLM model alias conflict: alias '%s' (from '%s') "
                     "was already claimed by another entry — skipping.",
@@ -523,13 +555,14 @@ def _expand_model_aliases(model_cost: dict) -> dict:
                     model_name,
                 )
                 continue
-            aliases_to_add[alias] = model_info  # same dict reference
+            alias_owners[alias] = model_name
 
     # Remove the ``aliases`` key from entries so it doesn't pollute model info
     for key in keys_with_aliases:
         model_cost[key].pop("aliases", None)
 
-    model_cost.update(aliases_to_add)
+    for owner, names in _alias_groups(alias_owners).items():
+        model_cost.update(dict.fromkeys(names, AliasedCostEntry(model_cost[owner], names)))
     return model_cost
 
 
@@ -605,7 +638,7 @@ def _retry_remote_fetch_in_background(
         _litellm_import_complete.wait()
         if not GetModelCostMap.validate_model_cost_map(
             fetched_map=result.model_cost_map,
-            backup_model_count=GetModelCostMap._get_backup_model_count(),  # pyright: ignore[reportPrivateUsage]  # integrity cache
+            backup_model_count=GetModelCostMap.get_backup_model_count(),
         ):
             verbose_logger.warning(
                 "LiteLLM: Fetched model cost map failed integrity check. Using local backup instead. url=%s",
@@ -688,7 +721,7 @@ def get_model_cost_map(
     # Validate using cached count (cheap int comparison, no file I/O)
     if not GetModelCostMap.validate_model_cost_map(
         fetched_map=content,
-        backup_model_count=GetModelCostMap._get_backup_model_count(),
+        backup_model_count=GetModelCostMap.get_backup_model_count(),
     ):
         verbose_logger.warning(
             "LiteLLM: Fetched model cost map failed integrity check. Using local backup instead. url=%s",

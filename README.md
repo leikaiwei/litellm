@@ -99,6 +99,12 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 1.103.1 同步时扩面：上游把远端加载重构成三条路径，启动时同步首拉（`get_model_cost_map`）、首拉遇瞬时错误后的后台重试（`_retry_remote_fetch_in_background`）、proxy 运行期重载（`refetch_model_cost_map`）。原补丁只挂在同步首拉上，另外两条一旦生效就会用纯远端表整体替换，把本地条目丢掉。现在三处统一走 `_finalize_remote_model_cost_map`，测试覆盖首拉与运行期重载两条入口
 - 1.104.0 同步时复核：上游在 `_finalize_loaded_model_cost_map` 里加了一份「最近一次加载的目录」快照（`loaded_model_cost_map`，供模型管理接口读）。我们的 `_finalize_remote_model_cost_map` 是先补缺再调它，所以快照里同样带着本地条目，不用改
 
+1.108.0 同步核对结论（2026-11-05）：以正式发布标签为基线，保留现有 fork 补丁。主线已合并的工具数组计数修复仍未进入该标签，继续保留回移。空回复缓存判定保留新版缓存目标追踪和 provider 排除规则；deployment guardrail 保留新版执行标记的 `finally`，继续覆盖 Messages。新增的 `_provider_reported_cost` 分支同样遵守 `always_use_local_pricing`，避免绕过本地定价。DeepSeek HTTP 错误重试 override 同步接收新版 `request_body` 参数。旧补丁按新版类型和不可变规则收敛，不调整 lint 或类型预算
+
+上游新增 `general_settings.safeguards_classifier_model`，可调用指定模型完成服务端工具审核，已不只是透传；未配置该选项时不会启用这条模型审核路径
+
+105.1 到 108.0 新增 25 份数据库迁移，没有修改旧迁移，没有 SpendLogs DDL 或迁移时全表数据重写。包含 ManagedFileTable、Lens 等表的索引和新表，晚间切换仍需预留迁移时间。发布源码和镜像不等于生产部署，hook 也需要另行注册和挂载
+
 1.105.1 同步核对结论：同步 105 系列最新稳定补丁版，包含 105.0 的模型用量聚合锁争用与 Responses 桥接重复日志修复。现有生产补丁上游仍未吸收，全部保留。Anthropic 目录从 `experimental_pass_through` 改为 `pass_through`，生产补丁、自有测试与 thinking-switch 测试随之迁移。空回复缓存判定保留上游新的 call-type 规则与后台写入机制，回归测试等待后台写入后再检查缓存；两条上游缓存生命周期测试改用非空样本，仍验证原来的写入时序。deployment guardrail 同时保留我们的 `anthropic_messages` 支持和上游从 metadata 提取鉴权信息的新逻辑。旧 UI sentinel 回归测试已由上游拆分后的 `test_user_api_key_auth_request_flow.py` 中三条同类用例覆盖，不再保留重复测试。DeepSeek Anthropic 镜像条目继续与本地表一起补缺远端价格表
 
 105 新增六份数据库迁移，没有业务数据重写；SpendLogs 仅新增可空 `billing_agent_id`，仍需在部署窗口获取表锁。数据库初始化失败现在始终退出，`ENFORCE_PRISMA_MIGRATION_CHECK=false` 不能再绕过，`--no-enforce_prisma_migration_check` 已移除。SpendLogs 手工索引改为启动后后台并发补建。构建和推送镜像不代表生产部署，生产切换须另行执行
@@ -161,6 +167,24 @@ Managing LLM calls across providers gets complicated fast — different SDKs, au
 ```shell
 uv add litellm
 ```
+
+An independent `litellm-core` distribution provides the Python SDK with the same
+`import litellm` API and runtime dependencies. It has no optional extras, CLI entry
+points, or bundled dashboard. Install one SDK distribution per environment because
+`litellm` and `litellm-core` own overlapping Python files. Use `litellm` for the
+proxy, CLI, and optional extras
+
+Build and install core from this checkout while its release integration is pending:
+
+```shell
+python scripts/build_core_distribution.py --out-dir dist/core
+python -m pip install dist/core/litellm_core-*.whl
+```
+
+The builder requires Git, `uv` and the Rust build toolchain. It reads the release version
+from the root `pyproject.toml`, leaves source files unchanged, and produces a wheel
+and a self-contained sdist in `dist/core`. Run installation in a fresh environment
+without `litellm`
 
 ```python
 from litellm import completion
@@ -396,6 +420,7 @@ Set `LITELLM_PROXY_API_BASE` and `LITELLM_PROXY_API_KEY` and every model call th
 | [Cohere Chat (`cohere_chat`)](https://docs.litellm.ai/docs/providers/cohere) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [CometAPI (`cometapi`)](https://docs.litellm.ai/docs/providers/cometapi) | ✅ | ✅ | ✅ | ✅ |  |  |  |  |  |  |
 | [CompactifAI (`compactifai`)](https://docs.litellm.ai/docs/providers/compactifai) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
+| [CoralBricks (`coralbricks`)](https://docs.litellm.ai/docs/providers/coralbricks) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Custom (`custom`)](https://docs.litellm.ai/docs/providers/custom_llm_server) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Custom OpenAI (`custom_openai`)](https://docs.litellm.ai/docs/providers/openai_compatible) | ✅ | ✅ | ✅ |  |  | ✅ | ✅ | ✅ | ✅ |  |
 | [Dashscope (`dashscope`)](https://docs.litellm.ai/docs/providers/dashscope) | ✅ | ✅ | ✅ | ✅ |  |  |  |  |  | ✅ |
@@ -461,6 +486,7 @@ Set `LITELLM_PROXY_API_BASE` and `LITELLM_PROXY_API_KEY` and every model call th
 | [Sagemaker Chat (`sagemaker_chat`)](https://docs.litellm.ai/docs/providers/aws_sagemaker) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Sail (`sail`)](https://docs.litellm.ai/docs/providers/sail) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Sambanova (`sambanova`)](https://docs.litellm.ai/docs/providers/sambanova) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
+| [ScaleDown (`scaledown`)](https://docs.litellm.ai/docs/providers/scaledown) | ✅ |  |  |  |  |  |  |  |  |  |
 | [Snowflake (`snowflake`)](https://docs.litellm.ai/docs/providers/snowflake) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Strands Decider (`strands_decider`)](https://docs.litellm.ai/docs/providers) |  |  |  |  |  |  |  |  |  |  |
 | [Text Completion Codestral (`text-completion-codestral`)](https://docs.litellm.ai/docs/providers/codestral) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
@@ -473,7 +499,7 @@ Set `LITELLM_PROXY_API_BASE` and `LITELLM_PROXY_API_KEY` and every model call th
 | [Vercel AI Gateway (`vercel_ai_gateway`)](https://docs.litellm.ai/docs/providers/vercel_ai_gateway) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [VLLM (`vllm`)](https://docs.litellm.ai/docs/providers/vllm) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Volcengine (`volcengine`)](https://docs.litellm.ai/docs/providers/volcano) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
-| [Voyage AI (`voyage`)](https://docs.litellm.ai/docs/providers/voyage) |  |  |  | ✅ |  |  |  |  |  |  |
+| [VoyageAI by MongoDB (`voyage`)](https://docs.litellm.ai/docs/providers/voyage) |  |  |  | ✅ |  |  |  |  |  |  |
 | [WandB Inference (`wandb`)](https://docs.litellm.ai/docs/providers/wandb_inference) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Watsonx Text (`watsonx_text`)](https://docs.litellm.ai/docs/providers/watsonx) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [xAI (`xai`)](https://docs.litellm.ai/docs/providers/xai) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
@@ -579,9 +605,9 @@ Provider API keys live in AWS Secrets Manager; reference ARNs via `gateway_extra
 
 #### GCP — Cloud Run + Cloud SQL + Memorystore + HTTPS LB
 
-[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.png)](https://ssh.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https%3A%2F%2Fgithub.com%2FBerriAI%2Flitellm&cloudshell_workspace=terraform%2Flitellm%2Fgcp%2Fexamples%2Fdefault&cloudshell_tutorial=TUTORIAL.md&cloudshell_image=gcr.io/ds-artifacts-cloudshell/deploystack_custom_image&shellonly=true)
+[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.png)](https://ssh.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https%3A%2F%2Fgithub.com%2FBerriAI%2Fterraform-google-litellm&cloudshell_git_branch=v1.105.0&cloudshell_workspace=examples%2Fdefault&cloudshell_tutorial=TUTORIAL.md&cloudshell_image=gcr.io/ds-artifacts-cloudshell/deploystack_custom_image&shellonly=true)
 
-Real 1-click. Opens Cloud Shell, clones this repo, and walks you through `terraform apply` via a built-in [DeployStack tutorial](./terraform/litellm/gcp/examples/default/TUTORIAL.md) — pick the project, the tutorial sets up the Artifact Registry remote repo, writes `terraform.tfvars` from your answers, and runs apply.
+Real 1-click. Opens Cloud Shell, clones the [terraform-google-litellm](https://github.com/BerriAI/terraform-google-litellm) module mirror at the latest stable release (a small download instead of the full litellm repo), and walks you through `terraform apply` via a built-in [DeployStack tutorial](./terraform/litellm/gcp/examples/default/TUTORIAL.md). Pick the project, the tutorial sets up the Artifact Registry remote repo, writes `terraform.tfvars` from your answers, and runs apply
 
 [Module page →](https://registry.terraform.io/modules/BerriAI/litellm/google/latest)
 
@@ -667,15 +693,15 @@ The Terraform modules live at [`terraform/litellm/aws/`](./terraform/litellm/aws
 
 ### Verify Docker Image Signatures
 
-All LiteLLM Docker images published to GHCR are signed with [cosign](https://docs.sigstore.dev/cosign/overview/). Every release is signed with the same key introduced in [commit `0112e53`](https://github.com/BerriAI/litellm/commit/0112e53046018d726492c814b3644b7d376029d0).
+All LiteLLM Docker images published to GHCR are signed with [cosign](https://docs.sigstore.dev/cosign/overview/). Releases are signed with the key introduced in [commit `e82a3c6`](https://github.com/BerriAI/litellm/commit/e82a3c646908ba0a6ee0beddc4310d7a6cac4065).
 
 **Verify using the pinned commit hash (recommended):**
 
-A commit hash is cryptographically immutable, so this is the strongest way to ensure you are using the original signing key:
+A commit hash is cryptographically immutable, so this is the strongest way to ensure you are using the published signing key:
 
 ```bash
 cosign verify \
-  --key https://raw.githubusercontent.com/BerriAI/litellm/0112e53046018d726492c814b3644b7d376029d0/cosign.pub \
+  --key https://raw.githubusercontent.com/BerriAI/litellm/e82a3c646908ba0a6ee0beddc4310d7a6cac4065/cosign.pub \
   ghcr.io/berriai/litellm:<release-tag>
 ```
 

@@ -78,6 +78,7 @@ GATEWAY_PATH_PREFIXES: tuple[str, ...] = (
     "/containers",
     "/v1/evals",
     "/v1/traces",
+    "/v1/logs",
     "/v1/memory",
     "/queue/chat/",
     # Google data plane (v1beta is the Google AI Studio version)
@@ -120,6 +121,8 @@ GATEWAY_PATH_PREFIXES: tuple[str, ...] = (
     # Realtime / streaming
     "/v1/realtime",
     "/realtime",
+    "/v1/live/sessions",
+    "/live/sessions",
     # Health & ops
     "/health",
     "/metrics",
