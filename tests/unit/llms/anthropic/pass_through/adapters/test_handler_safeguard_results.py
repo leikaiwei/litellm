@@ -177,6 +177,28 @@ async def test_non_stream_response_carries_a_verdict_for_the_tool_use_and_bills_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_local_allow_takes_priority_without_a_classifier_call(stream: bool) -> None:
+    backend: Final = _Backend(stream=stream)
+    router: Final = _ClassifierRouter("{}")
+    response: Final = await _call(
+        backend,
+        router,
+        stream,
+        {"safeguards_classifier_model": "classifier", "claude_code_review_always_allow": True},
+        safeguards=SAFEGUARDS,
+    )
+    if stream:
+        events: Final = _events(b"".join([chunk async for chunk in response]))
+        delta: Final = next(event["delta"] for event in events if event["type"] == "message_delta")
+        assert _available_tool_uses(delta["safeguard_results"])["call_stream"]["outcome"] == "not_flagged"
+    else:
+        assert isinstance(response, dict)
+        assert _available_tool_uses(response["safeguard_results"])["call_main"]["outcome"] == "not_flagged"
+    assert len(backend.calls) == 1 and router.calls == []
+
+
+@pytest.mark.asyncio
 async def test_stream_carries_the_verdict_inside_the_final_message_delta():
     backend: Final = _Backend(stream=True)
     router: Final = _ClassifierRouter('{"verdicts": {"call_stream": {"flagged": true, "explanation": "unrequested"}}}')
@@ -227,15 +249,21 @@ async def test_classifier_reads_the_turns_before_a_compaction_block_the_agent_mo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-async def test_no_classifier_setting_means_no_results_and_no_classifier_call(stream: bool):
+@pytest.mark.parametrize(
+    "settings", ({}, {"safeguards_classifier_model": "classifier", "claude_code_review_model_scope": "client_only"})
+)
+async def test_inactive_server_classifier_means_no_results_and_no_classifier_call(
+    stream: bool, settings: Mapping[str, object]
+) -> None:
     backend: Final = _Backend(stream=stream)
     router: Final = _ClassifierRouter("{}")
-    response: Final = await _call(backend, router, stream, {}, safeguards=SAFEGUARDS)
+    response: Final = await _call(backend, router, stream, settings, safeguards=SAFEGUARDS)
     if stream:
         events: Final = _events(b"".join([chunk async for chunk in response]))
         assert all("safeguard_results" not in event.get("delta", {}) for event in events)
     else:
         assert isinstance(response, dict) and "safeguard_results" not in response
+    assert len(backend.calls) == 1 and "safeguards" not in backend.calls[0]
     assert router.calls == []
 
 

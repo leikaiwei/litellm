@@ -1744,7 +1744,7 @@ def _tool_use_message(model: str, **extra: object) -> dict[str, object]:
     }
 
 
-def _tool_use_sse(model: str) -> bytes:
+def _tool_use_sse(model: str, safeguard_results: object = None) -> bytes:
     events: Final = (
         {"type": "message_start", "message": {**_tool_use_message(model), "content": [], "stop_reason": None}},
         {"type": "content_block_start", "index": 0, "content_block": {**_CURL_TOOL_USE, "input": {}}},
@@ -1756,7 +1756,11 @@ def _tool_use_sse(model: str) -> bytes:
         {"type": "content_block_stop", "index": 0},
         {
             "type": "message_delta",
-            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "delta": {
+                "stop_reason": "tool_use",
+                "stop_sequence": None,
+                **({"safeguard_results": safeguard_results} if safeguard_results is not None else {}),
+            },
             "usage": {"output_tokens": 4},
         },
         {"type": "message_stop"},
@@ -1824,7 +1828,7 @@ async def test_native_non_claude_messages_stream_carries_the_verdict_in_the_fina
 
 
 @pytest.mark.asyncio
-async def test_native_messages_response_keeps_the_results_its_backend_returned():
+async def test_native_messages_response_replaces_stale_results_when_classifier_is_configured():
     backend_results = [{"type": "dangerous_tool_use", "status": {"type": "unsupported"}}]
     response = await _native_messages(
         "deepseek/deepseek-chat",
@@ -1832,12 +1836,12 @@ async def test_native_messages_response_keeps_the_results_its_backend_returned()
         stream=False,
     )
 
-    assert response["safeguard_results"] == backend_results
+    assert list(response["safeguard_results"]) == _FLAGGED_CURL
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-async def test_native_claude_messages_response_is_left_to_claude_code_when_its_backend_returns_no_results(stream: bool):
+async def test_native_claude_messages_response_uses_the_configured_classifier(stream: bool):
     response = await _native_messages(
         "anthropic/claude-haiku-4-5",
         _native_upstream(stream=stream, model="claude-haiku-4-5"),
@@ -1846,9 +1850,119 @@ async def test_native_claude_messages_response_is_left_to_claude_code_when_its_b
     )
 
     if stream:
-        assert all("safeguard_results" not in event.get("delta", {}) for event in response)
+        deltas: Final = [event["delta"] for event in response if event["type"] == "message_delta"]
+        assert deltas[0]["safeguard_results"] == _FLAGGED_CURL
     else:
-        assert "safeguard_results" not in response
+        assert list(response["safeguard_results"]) == _FLAGGED_CURL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_review_hot_switch_bypasses_response_cache_and_removes_upstream_review(
+    monkeypatch: pytest.MonkeyPatch, stream: bool
+) -> None:
+    from litellm.caching.caching import Cache
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.config_resolvers import SettingsStore
+    from local_guardrails.claude_code_review import callback
+
+    settings: Final = SettingsStore("general_settings")
+    monkeypatch.setattr("litellm.proxy.proxy_server.general_settings", settings)
+    monkeypatch.setattr(litellm, "cache", Cache())
+    router: Final = _flagging_classifier_router()
+    backend_verdicts: Final = [
+        {
+            "type": "dangerous_tool_use",
+            "status": {
+                "type": "available",
+                "tool_uses": {
+                    "toolu_curl": {"type": "evaluated", "outcome": "flagged", "explanation": "provider decision"},
+                },
+            },
+        }
+    ]
+    allow_verdicts: Final = [
+        {
+            "type": "dangerous_tool_use",
+            "status": {
+                "type": "available",
+                "tool_uses": {
+                    "toolu_curl": {"type": "evaluated", "outcome": "not_flagged"},
+                },
+            },
+        }
+    ]
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        body: Final = json.loads(request.content)
+        assert body.get("safeguards") == (
+            [{"type": "dangerous_tool_use"}, {"type": "another_check"}]
+            if scope == "client_only" and not always_allow
+            else [{"type": "another_check"}]
+        )
+        if stream:
+            return httpx.Response(
+                200,
+                content=_tool_use_sse("claude-test", backend_verdicts),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(200, json=_tool_use_message("claude-test", safeguard_results=backend_verdicts))
+
+    recorded_answer: Final = MagicMock(side_effect=answer)
+    client: Final = AsyncHTTPHandler()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(recorded_answer))
+    try:
+        for scope, always_allow in (
+            ("client_only", False),
+            ("all", False),
+            ("client_only", True),
+            ("client_only", False),
+        ):
+            settings.apply_db_row(
+                "general_settings",
+                {
+                    "safeguards_classifier_model": "classifier",
+                    "claude_code_review_always_allow": always_allow,
+                    "claude_code_review_model_scope": scope,
+                },
+            )
+            data: Final = await callback.async_pre_call_hook(
+                UserAPIKeyAuth(),
+                DualCache(),
+                {
+                    "model": "anthropic/claude-test",
+                    "messages": [{"role": "user", "content": "set up the repo"}],
+                    "safeguards": [{"type": "dangerous_tool_use"}, {"type": "another_check"}],
+                    "cache": {"no-cache": False, "no-store": False},
+                },
+                "anthropic_messages",
+            )
+            assert data is not None
+            response: Final = await litellm.anthropic_messages(
+                **data,
+                max_tokens=64,
+                stream=stream,
+                api_key="unused",
+                client=client,
+                litellm_router=router,
+            )
+            expected: Final = (
+                allow_verdicts if always_allow else backend_verdicts if scope == "client_only" else _FLAGGED_CURL
+            )
+            if stream:
+                raw: Final = b"".join([chunk async for chunk in response]).decode()
+                events: Final = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+                verdicts: Final = next(
+                    event["delta"]["safeguard_results"] for event in events if event["type"] == "message_delta"
+                )
+                assert list(verdicts) == expected
+            else:
+                assert list(response["safeguard_results"]) == expected
+        assert recorded_answer.call_count == 4
+    finally:
+        router.discard()
+        await client.client.aclose()
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,5 @@
 import json
-from collections.abc import AsyncIterator, Awaitable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Iterator, Mapping
 from typing import Final
 
 import pytest
@@ -10,7 +10,9 @@ from pytest_socket import disable_socket, enable_socket
 import litellm
 from litellm.caching.dual_cache import DualCache
 from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup as LogSetup
+from litellm.llms.anthropic.pass_through.caller_model_checks import CallerModelVerdict
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.config_resolvers import SettingsStore
 from litellm.proxy.route_llm_request import (
     route_request,  # pyright: ignore[reportUnknownVariableType]  # 上游路由缺少返回类型
 )
@@ -20,6 +22,7 @@ from local_guardrails.claude_code_review import (
     ALLOW_TEXT,
     MODEL_GROUP,
     PROVIDER,
+    ClaudeCodeReviewHook,
     callback,
     is_review_request,
     provider,
@@ -36,10 +39,75 @@ _METADATA: Final = TypeAdapter(dict[str, object])
 
 
 @pytest.fixture(autouse=True)
-def no_network() -> Iterator[None]:
+def no_network(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    monkeypatch.setattr("litellm.proxy.proxy_server.general_settings", {"claude_code_review_always_allow": True})
     disable_socket(allow_unix_socket=True)
     yield
     enable_socket()
+
+
+class _ModelAccess:
+    def __init__(self, verdict: str = "allowed") -> None:
+        self.models: tuple[str, ...] = ()
+        self.verdict: Final = verdict
+
+    async def __call__(self, caller: UserAPIKeyAuth, model: str, metadata: Mapping[str, object]) -> CallerModelVerdict:
+        self.models = (*self.models, model)
+        return TypeAdapter(CallerModelVerdict).validate_python(self.verdict)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ("client_only", "all"))
+async def test_review_modes_use_current_settings_and_allow_takes_priority(scope: str) -> None:
+    store: Final = SettingsStore("general_settings")
+    access: Final = _ModelAccess()
+    hook: Final = ClaudeCodeReviewHook(settings=lambda: store, model_access=access)
+    caller: Final = UserAPIKeyAuth()
+    cache: Final = DualCache()
+    assert await hook.async_pre_call_hook(caller, cache, _request(), "anthropic_messages") is None
+    store.apply_db_row(
+        "general_settings", {"safeguards_classifier_model": "review-model", "claude_code_review_model_scope": scope}
+    )
+    model_result: Final = await hook.async_pre_call_hook(caller, cache, _request(), "anthropic_messages")
+    assert model_result is not None and model_result["model"] == "review-model"
+    assert model_result["messages"] == _request()["messages"]
+    assert model_result["system"] == _request()["system"]
+    store.apply_db_row(
+        "general_settings",
+        {
+            "safeguards_classifier_model": "review-model",
+            "claude_code_review_always_allow": True,
+            "claude_code_review_model_scope": scope,
+        },
+    )
+    allow_result: Final = await hook.async_pre_call_hook(caller, cache, _request(), "anthropic_messages")
+    assert allow_result is not None and allow_result["model"] == MODEL_GROUP
+    assert access.models == ("review-model",)
+    store.apply_db_row(
+        "general_settings", {"safeguards_classifier_model": None, "claude_code_review_always_allow": False}
+    )
+    assert await hook.async_pre_call_hook(caller, cache, _request(), "anthropic_messages") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("verdict", "status"), (("denied", 403), ("denied_for_now", 429)))
+async def test_review_model_refusal_never_returns_to_original_model(verdict: str, status: int) -> None:
+    hook: Final = ClaudeCodeReviewHook(
+        settings=lambda: {"safeguards_classifier_model": "review-model"}, model_access=_ModelAccess(verdict)
+    )
+    with pytest.raises(HTTPException) as error:
+        await hook.async_pre_call_hook(UserAPIKeyAuth(), DualCache(), _request(), "anthropic_messages")
+    assert error.value.status_code == status
+
+
+@pytest.mark.asyncio
+async def test_review_model_uses_proxy_access_checks_for_the_replacement_model() -> None:
+    hook: Final = ClaudeCodeReviewHook(settings=lambda: {"safeguards_classifier_model": "review-model"})
+    with pytest.raises(HTTPException) as error:
+        await hook.async_pre_call_hook(
+            UserAPIKeyAuth(models=["original-model"]), DualCache(), _request(), "anthropic_messages"
+        )
+    assert error.value.status_code == 403
 
 
 def _request(**overrides: object) -> dict[str, object]:

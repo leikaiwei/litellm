@@ -631,42 +631,61 @@ chunk 的用量提上来（`utils.py:2143`），有它就说明字节已经出�
 变异测试里它存活，说明没有测试能杀掉它，删掉了。
 
 
-## claude_code_review: Claude Code 审核请求本地放行
+## claude_code_review: Claude Code 两种审核模式
 
-`claude_code_review.py` 是一个独立文件，导出全局 `pre_call` callback 和本地固定响应
-provider，不修改 LiteLLM 核心源码。callback 只接管 Messages 接口里已经识别出来的
-Claude Code 独立审核请求，改走内部模型组，并关掉缓存和 fallback。本地 provider 固定返回
-`<block>no</block>`，输入和输出 token 都是 0，不调用上游模型。
+`claude_code_review.py` 提供全局 `pre_call` callback 和本地固定响应 provider。
+独立审核通过 callback 分流，原生 `safeguards` 复用 LiteLLM 的审核、鉴权和 SSE 实现。
+核心补丁只补配置字段、放行分支和原生路由接管，不另写流式协议解析器
 
-这条协议里 `<block>no</block>` 表示允许该动作。命中的审核一律允许，不评估动作风险。
-这样做是为了让开着 auto 模式的客户端不再为审核请求付费。成功日志仍走代理原有路径。
-`metadata.spend_logs_metadata` 里的 `claude_code_review=direct_allow` 表示本地放行，
-`claude_code_review_requested_model` 保留客户端原来请求的模型。
+模式和作用范围都属于 `general_settings`，对所有模型组的 Messages 请求统一生效，不按主模型名称区分。
+`claude_code_review_model_scope` 只决定指定模型模式的作用范围，不是第三种审核模式
 
-识别要求系统提示以 `You are a security monitor for autonomous AI coding agents` 开头，
-包含完整的 block 允许和阻止输出约定，没有 `<severity>`，没有工具定义，并且消息都是用户文本。
-只在对话里引用这段提示的普通请求不会命中。停止符可以缺省，也可以是 `</block>`，不看
-`max_tokens`，兼容 2026-11-05 看到的 2112 和 10240 两种请求。未知模板、severity 协议，
-以及服务端 `general_settings.safeguards_classifier_model` 那条审核，都不在这里接管，
-它们仍会走到原模型。
+| 本地放行 | 审核模型 | 模型作用范围 | 独立客户端审核 | 服务端 `safeguards` |
+|---|---|---|---|---|
+| `false` | `hoperun` | `client_only` | 转给 `hoperun` | 原样交给上游，保留上游结果 |
+| `false` | `hoperun` | `all` | 转给 `hoperun` | LiteLLM 调用 `hoperun` 审核 |
+| `true` | 任意值或未配置 | 任意值 | 本地放行 | 本地放行 |
 
-内部组从模型列表隐藏。客户端直接请求这个模型会返回 403。入口鉴权仍由代理处理。
-请求里带的 `user_config`、`model_list`、`api_base`、`api_key`、`mock_response`、
-`fallbacks` 等路由覆盖会被去掉，避免审核请求改道到外部模型。metadata 损坏或模型名不是字符串时
-仍然本地放行，不会因为解析失败退回原模型。不要用 `mock_response` 代替本地 provider。
-Messages 的 mock 响应写死了 2095 个输入 token 和 503 个输出 token，仍会按模型单价计费。
+作用范围默认 `all`，保留已有 `safeguards_classifier_model` 的启用语义。
+希望优先保留上游原生审核、只把客户端 fallback 转给指定模型时，显式设置 `client_only`。
+上游不支持审核时，LiteLLM 在 `client_only` 下不会额外发起服务端分类调用，由 Claude Code 自己回退到独立审核
+
+非原生 Anthropic 后端走 Chat Completions 或 Responses 适配器时，`client_only` 不会把原主模型再调用一次当分类器。
+这些接口不能表示 `safeguards` 时，保留原有适配行为，生成响应没有 `safeguard_results`，由 Claude Code 回退到独立审核。
+它不伪造允许结果，也不返回表示单个动作审查失败的 `unavailable` 来代替客户端回退
+
+默认未配置时保留原路由。模型模式没有另一个 true/false 开关，模型名为空或 `null` 时不接管。
+放行设为 `false` 后会恢复指定模型模式，保留模型名和作用范围即可。放行优先，不受模型作用范围限制
+
+独立审核仍要求系统提示以 `You are a security monitor for autonomous AI coding agents` 开头，
+包含完整的 `<block>yes/no</block>` 约定，没有 `<severity>`、工具定义或非用户文本消息。
+停止符可缺省或为 `</block>`，不依赖 `max_tokens`。普通对话中引用审核提示不会命中。
+未知独立审核模板和 severity 协议保留原路由，不能承诺所有未来 Claude Code 模板零费用
+
+独立审核的模型模式保留原审核提示，改走配置的模型组，先检查调用者对审核模型的权限、预算和限流。
+检查失败直接返回 403 或 429，不退回原模型。请求级路由覆盖、mock 和组级 fallback 被关闭，避免偏离指定策略。
+放行模式走隐藏内部组，固定返回 `<block>no</block>`，审核输入输出 token 和费用均为零。
+客户端不能直访内部组。审计 metadata 的 `claude_code_review` 为 `classifier_model` 或 `direct_allow`，
+`claude_code_review_requested_model` 保留原请求模型
+
+服务端模式只接管 `safeguards` 中的 `dangerous_tool_use`。本地放行或模型作用范围为 `all` 时包括原生 Claude 路由，
+这是本 fork 的全局策略，区别于上游默认交给 Claude 原生供应商审核的行为。
+服务端分类调用同样禁用跨组 fallback，指定审核模型失败时返回 unavailable，不转到其他收费模型。
+发往供应商时移除这项审核请求，其他 safeguard 请求保留。返回时替换该项结果，其他结果保留。
+工具调用不完整或 JSON 损坏时仍返回 unavailable，固定放行不会把不能执行的工具调用变成有效调用
+
+本地放行只取消审核模型调用，正常生成请求仍按原规则计费。
+带 `dangerous_tool_use` 的请求关闭响应缓存读写，即使当前两个字段都关闭，也不复用旧模式的审核结果。
+普通请求的缓存不受影响。每次审核在开始时读取配置快照，已开始生成的请求不在中途更换审核模式
 
 ### 注册与部署
 
-将文件放在配置文件同目录，例如只读挂载：
+将文件放到配置文件同目录并只读挂载，保留已有模型和 callbacks
 
 ```yaml
 volumes:
   - ./claude_code_review.py:/app/claude_code_review.py:ro
 ```
-
-把下面的条目合并进现有配置，保留已有模型和 callbacks。三样要一起配。只注册 callback、
-不注册 provider 和内部组时，命中的审核会失败，不会退回原模型。
 
 ```yaml
 model_list:
@@ -685,16 +704,55 @@ litellm_settings:
       custom_handler: claude_code_review.provider
 ```
 
-内部模型不配置 API key、API base 或外部 fallback。首次注册需要重建代理容器，不需要改
-数据库。只构建新镜像不会启用它。去掉 callback 注册后，审核请求恢复原路由。provider
-和内部组可以一起去掉。
+callback、本地 provider 和内部组必须一起注册。内部组不配 API key、API base 或外部 fallback。
+首次安装需要部署包含核心补丁的镜像并加载插件，之后通过已有管理 API 热切换。
+要使用热切换，不要在 YAML 声明这三个配置字段。LiteLLM 的 YAML 所有权规则会拒绝管理 API 修改同名字段，
+连 YAML 中写 `false` 或 `null` 也会锁定它们。原来已在 YAML 声明的字段需先移除并重载配置
+
+### 热切换
+
+用代理管理员凭据调用现有 `/config/field/update`，`LITELLM_BASE_URL` 指向自己的代理。
+以下命令只更新配置，不调用模型。首次配置建议先选择仅客户端独立审核，保留上游原生审核
+
+```bash
+curl -sS "$LITELLM_BASE_URL/config/field/update" \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H 'Content-Type: application/json' \
+  -d '{"config_type":"general_settings","field_name":"claude_code_review_model_scope","field_value":"client_only"}'
+```
+
+再配置指定审核模型，要求模型组已存在且调用者有权使用
+
+```bash
+curl -sS "$LITELLM_BASE_URL/config/field/update" \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H 'Content-Type: application/json' \
+  -d '{"config_type":"general_settings","field_name":"safeguards_classifier_model","field_value":"hoperun"}'
+```
+
+要统一服务端和客户端审核，都转给指定模型，将 `claude_code_review_model_scope` 通过相同接口改成 `all`。
+要恢复上游原生审核，将它改回 `client_only`，不需要重启
+
+切到本地放行，保留审核模型名和作用范围，方便切回
+
+```bash
+curl -sS "$LITELLM_BASE_URL/config/field/update" \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H 'Content-Type: application/json' \
+  -d '{"config_type":"general_settings","field_name":"claude_code_review_always_allow","field_value":true}'
+```
+
+切回指定模型，把上一条 `field_value` 改成 `false`。要停止接管，放行和模型字段分别设为 `false` 和 `null`，作用范围可以保留。
+停止接管不代表客户端不再审核，Claude Code 可能恢复单独的收费审核请求
+
+配置沿用现有数据库持久化、缓存失效和 worker 同步。接收更新的 worker 立即应用，其他 worker 通过配置变更通知
+和周期重载同步，不是整个集群同一时刻原子切换。周期由 `proxy_config_reload_interval_seconds` 控制。
+本地测试覆盖管理 HTTP 请求、数据库替身、SettingsStore、下一次审核的完整链路，未做真实多 worker 集群验收
 
 ### 验证
 
 ```bash
-LITELLM_LOCAL_MODEL_COST_MAP=True .venv/bin/python -m pytest local_guardrails/test_claude_code_review.py -q
+LITELLM_LOCAL_MODEL_COST_MAP=True .venv/bin/python -m pytest local_guardrails/test_claude_code_review.py tests/unit/llms/anthropic/pass_through/test_safeguards.py -q
 ```
 
-测试覆盖两种已观察到的请求、普通对话和未知模板、内部组直接访问、请求级路由覆盖、
-损坏的 metadata，以及真实 Router 和 Messages 适配器的非流式与完整 SSE。测试禁用
-TCP，审核结果不依赖外部模型。
+回归覆盖已知独立审核模板、普通请求和未知模板、内部组隔离、权限预算拒绝、请求路由覆盖、
+模式优先级及快照、原生 Claude 与适配器的非流式和 SSE，以及开启响应缓存后的上游透传、指定模型、本地放行和恢复透传热切换。
+管理端点回归在 `tests/unit/proxy/test_proxy_server_endpoints_and_startup.py`。
+全部使用本地替身或禁网测试，未调用付费模型，也未验证真实 Claude Code 客户端与生产多 worker 切换

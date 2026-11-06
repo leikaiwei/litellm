@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import accumulate, chain
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Final, Literal, Protocol, TypeAlias, TypeVar
 
 from pydantic import ConfigDict, TypeAdapter, ValidationError
 from typing_extensions import NotRequired, ReadOnly, Unpack, assert_never
@@ -59,6 +59,7 @@ CallerModelGate: TypeAlias = Callable[[str], Awaitable[CallerModelVerdict]]
 _MAPPING: Final = TypeAdapter(Mapping[str, object])
 _OBJECTS: Final = TypeAdapter(tuple[object, ...])
 _JSON_VALUE: Final = TypeAdapter(object)
+_ExistingResult: Final = TypeVar("_ExistingResult")
 
 CLASSIFIER_SYSTEM_PROMPT: Final = """You are the safety classifier for a coding agent that runs tool calls without asking the user first.
 You read the conversation so far and the tool calls the agent wants to run next, and you decide for each one
@@ -89,6 +90,7 @@ class ClassifierCallKwargs(ProxySubCallLoggingKwargs):
     model: ReadOnly[str]
     max_tokens: ReadOnly[int]
     num_retries: ReadOnly[int]
+    disable_fallbacks: ReadOnly[bool]
     litellm_metadata: ReadOnly[Mapping[str, object]]
     user: ReadOnly[NotRequired[str]]
     allowed_model_region: ReadOnly[NotRequired[str]]
@@ -147,6 +149,8 @@ class SafeguardsEvaluator:
     caller_model_verdict: CallerModelGate
     timeout_seconds: float = CLASSIFIER_TIMEOUT_SECONDS
     logging_kwargs: ProxySubCallLoggingKwargs = field(default_factory=ProxySubCallLoggingKwargs)
+    always_allow: bool = False
+    override_provider_results: bool = False
 
     async def evaluate(self, tool_uses: Sequence[PendingToolUse]) -> Sequence[SafeguardResult]:
         complete: Final = tuple(use for use in tool_uses if isinstance(use, ToolUseUnderReview))
@@ -164,6 +168,8 @@ class SafeguardsEvaluator:
     async def _verdicts_for_caller(
         self, tool_uses: Sequence[ToolUseUnderReview]
     ) -> Mapping[str, SafeguardToolUseVerdict] | ClassifierNotServed:
+        if self.always_allow:
+            return {use.id: {"type": "evaluated", "outcome": "not_flagged"} for use in tool_uses}
         caller: Final = await self.caller_model_verdict(self.classifier_model)
         match caller:
             case "allowed":
@@ -237,6 +243,7 @@ class SafeguardsEvaluator:
             "model": self.classifier_model,
             "max_tokens": CLASSIFIER_MAX_TOKENS,
             "num_retries": 0,
+            "disable_fallbacks": True,
             "litellm_metadata": self.litellm_metadata,
         }
         with_user: Final[ClassifierCallKwargs] = (
@@ -269,15 +276,38 @@ def requested_dangerous_tool_use(safeguards: object) -> Mapping[str, object] | N
 
 
 def read_classifier_model_setting() -> str | None:
-    configured: Final = proxy_general_settings().get(SAFEGUARDS_CLASSIFIER_MODEL_SETTING_KEY)
+    settings: Final = proxy_general_settings()
+    if settings.get("claude_code_review_model_scope", "all") != "all":
+        return None
+    configured: Final = settings.get(SAFEGUARDS_CLASSIFIER_MODEL_SETTING_KEY)
     return configured if isinstance(configured, str) and configured else None
 
 
+def read_always_allow_setting() -> bool:
+    return proxy_general_settings().get("claude_code_review_always_allow") is True
+
+
+def proxy_serves_safeguards(safeguards: object) -> bool:
+    return requested_dangerous_tool_use(safeguards) is not None and (
+        read_always_allow_setting() or read_classifier_model_setting() is not None
+    )
+
+
 def native_route_classifies(model: str, safeguards: object) -> bool:
-    return (
-        "claude" not in model.lower()
-        and requested_dangerous_tool_use(safeguards) is not None
-        and read_classifier_model_setting() is not None
+    return proxy_serves_safeguards(safeguards)
+
+
+def without_proxy_safeguards(params: Mapping[str, object]) -> Mapping[str, object]:
+    remaining: Final = tuple(
+        entry
+        for entry in _objects(params.get("safeguards"))
+        if (_mapping(entry) or {}).get("type") != DANGEROUS_TOOL_USE
+    )
+    return MappingProxyType(
+        {
+            **{key: value for key, value in params.items() if key != "safeguards"},
+            **({"safeguards": list(remaining)} if remaining else {}),
+        }
     )
 
 
@@ -295,7 +325,8 @@ def build_safeguards_evaluator(
     if request is None:
         return None
     classifier_model: Final = read_classifier_model_setting()
-    if classifier_model is None:
+    always_allow: Final = read_always_allow_setting()
+    if classifier_model is None and not always_allow:
         return None
     router_acompletion: Final[ClassifierAcompletion | None] = getattr(llm_router, "acompletion", None)
 
@@ -309,14 +340,16 @@ def build_safeguards_evaluator(
         )
 
     return SafeguardsEvaluator(
-        classifier_model=classifier_model,
-        classifier_context=render_classifier_context(request.get("classifier_context")),
-        transcript=render_transcript(messages),
+        classifier_model=classifier_model or "",
+        classifier_context="" if always_allow else render_classifier_context(request.get("classifier_context")),
+        transcript="" if always_allow else render_transcript(messages),
         litellm_metadata=proxy_sub_call_metadata(litellm_metadata),
         allowed_model_region=getattr(user_api_key_auth, "allowed_model_region", None),
         acompletion=router_acompletion if router_acompletion is not None else litellm.acompletion,
         caller_model_verdict=caller_verdict,
         logging_kwargs=logging_kwargs,
+        always_allow=always_allow,
+        override_provider_results=True,
     )
 
 
@@ -499,15 +532,28 @@ def _every_tool_use_unavailable(
 async def with_safeguard_results(
     response: AnthropicMessagesResponse, evaluator: SafeguardsEvaluator | None
 ) -> AnthropicMessagesResponse:
-    if evaluator is None or response.get("safeguard_results") is not None:
+    if evaluator is None or (
+        response.get("safeguard_results") is not None
+        and not (evaluator.always_allow or evaluator.override_provider_results)
+    ):
         return response
     blocks: Final = tuple(response.get("content") or ())
     cut_off_index: Final = len(blocks) - 1 if response.get("stop_reason") == "max_tokens" else None
     candidates: Final = (_pending_tool_use(block, index == cut_off_index) for index, block in enumerate(blocks))
     pending: Final = tuple(use for use in candidates if use is not None)
     results: Final = await evaluator.evaluate(pending)
-    stamped: Final[AnthropicMessagesResponse] = {**response, "safeguard_results": results}
+    stamped: Final[AnthropicMessagesResponse] = {
+        **response,
+        "safeguard_results": _replace_tool_verdicts(response.get("safeguard_results") or (), results),
+    }
     return stamped
+
+
+def _replace_tool_verdicts(
+    existing: Sequence[_ExistingResult], results: Sequence[SafeguardResult]
+) -> tuple[_ExistingResult | SafeguardResult, ...]:
+    retained: Final = tuple(entry for entry in existing if (_mapping(entry) or {}).get("type") != DANGEROUS_TOOL_USE)
+    return (*retained, *results)
 
 
 def _pending_tool_use(block: object, cut_off: bool) -> PendingToolUse | None:
@@ -565,11 +611,19 @@ class StreamedSafeguardResults:
         stop_reason: Final = delta.get("stop_reason") if delta is not None else None
         if delta is None or stop_reason is None or self._backend_answered:
             return event
-        if delta.get("safeguard_results") is not None:
+        if delta.get("safeguard_results") is not None and not (
+            self._evaluator.always_allow or self._evaluator.override_provider_results
+        ):
             self._backend_answered = True
             return event
         results: Final = await self._evaluated_once(self._evaluator, stop_reason == "max_tokens")
-        return {**event, "delta": {**delta, "safeguard_results": results}}
+        return {
+            **event,
+            "delta": {
+                **delta,
+                "safeguard_results": _replace_tool_verdicts(_objects(delta.get("safeguard_results")), results),
+            },
+        }
 
     async def _evaluated_once(self, evaluator: SafeguardsEvaluator, hit_max_tokens: bool) -> Sequence[SafeguardResult]:
         if self._results is None:

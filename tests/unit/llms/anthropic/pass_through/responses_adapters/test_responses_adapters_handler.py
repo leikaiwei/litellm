@@ -360,8 +360,12 @@ async def test_streamed_bridge_response_carries_the_verdict_in_the_final_message
     [
         ({}, {"safeguards": SAFEGUARDS}),
         ({"safeguards_classifier_model": "classifier"}, {}),
+        (
+            {"safeguards_classifier_model": "classifier", "claude_code_review_model_scope": "client_only"},
+            {"safeguards": SAFEGUARDS},
+        ),
     ],
-    ids=["no-classifier-setting", "no-safeguards-in-request"],
+    ids=["no-classifier-setting", "no-safeguards-in-request", "client-only-review"],
 )
 async def test_bridge_response_gets_no_results_without_both_the_setting_and_the_request(
     respx_mock: respx.MockRouter,

@@ -26,7 +26,6 @@ from litellm.llms.anthropic.pass_through.context_management import (
 from litellm.llms.anthropic.pass_through.safeguards import (
     SafeguardsEvaluator,
     build_safeguards_evaluator,
-    read_classifier_model_setting,
     requested_dangerous_tool_use,
     with_safeguard_results,
 )
@@ -128,7 +127,7 @@ def request_safeguards_evaluator(
     kwargs: Mapping[str, object], messages: Sequence[Mapping[str, object]]
 ) -> SafeguardsEvaluator | None:
     safeguards: Final = kwargs.get("safeguards")
-    if requested_dangerous_tool_use(safeguards) is None or read_classifier_model_setting() is None:
+    if requested_dangerous_tool_use(safeguards) is None:
         return None
     proxy_litellm_metadata, user_api_key_auth = _extract_proxy_litellm_metadata(kwargs)
     return build_safeguards_evaluator(

@@ -7,6 +7,7 @@ from typing import Final
 from unittest.mock import patch
 
 import pytest
+import respx
 
 import litellm
 from litellm.caching.dual_cache import DualCache
@@ -34,6 +35,7 @@ from litellm.llms.anthropic.pass_through.safeguards import (
 )
 from litellm.llms.anthropic.pass_through.utils import proxy_sub_call_metadata
 from litellm.proxy._types import LiteLLM_EndUserTable, Litellm_EntityType, UserAPIKeyAuth
+from litellm.proxy.config_resolvers import SettingsStore
 from litellm.proxy.hooks.model_max_budget_limiter import (
     PROXY_VirtualKeyModelMaxBudgetLimiter,
     model_budget_spend_cache_key,
@@ -175,6 +177,49 @@ async def test_evaluate_without_end_user_or_region_sends_neither_kwarg():
     await _evaluator(classifier, litellm_metadata={"user_api_key": "hashed"}).evaluate((LS,))
     assert "user" not in classifier.calls[0]
     assert "allowed_model_region" not in classifier.calls[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx(assert_all_called=False)
+async def test_configured_classifier_failure_never_calls_a_fallback_model(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
+    primary: Final = respx_mock.post("https://review-primary.test/v1/chat/completions").respond(
+        429, json={"error": {"message": "review limit", "type": "rate_limit_error"}}
+    )
+    fallback: Final = respx_mock.post("https://review-fallback.test/v1/chat/completions").respond(
+        200,
+        json={
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": '{"verdicts":{"call_ls":{"flagged":false}}}'},
+                }
+            ]
+        },
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": name,
+                "litellm_params": {"model": "openai/test-review", "api_key": "unused", "api_base": base},
+            }
+            for name, base in (
+                ("classifier", "https://review-primary.test/v1"),
+                ("expensive", "https://review-fallback.test/v1"),
+            )
+        ],
+        fallbacks=[{"classifier": ["expensive"]}],
+        num_retries=0,
+    )
+    try:
+        evaluator: Final = _evaluator(_RecordingClassifier(()), acompletion=router.acompletion)
+        assert _verdicts(await evaluator.evaluate((LS,))) == {"call_ls": {"type": "unavailable", "reason": "error"}}
+        assert primary.call_count == 1 and fallback.call_count == 0
+    finally:
+        router.discard()
 
 
 @pytest.mark.asyncio
@@ -375,6 +420,49 @@ def test_build_evaluator_is_a_no_op_without_safeguards_or_without_the_setting():
             )
             is None
         )
+
+
+@pytest.mark.asyncio
+async def test_local_allow_snapshot_ignores_model_access_and_hot_changes_until_next_request() -> None:
+    store: Final = SettingsStore("general_settings")
+    store.apply_db_row(
+        "general_settings", {"claude_code_review_always_allow": True, "safeguards_classifier_model": "unavailable"}
+    )
+    with patch("litellm.proxy.proxy_server.general_settings", store):
+        current: Final = build_safeguards_evaluator(
+            safeguards=DANGEROUS_TOOL_USE_REQUEST,
+            messages=[],
+            litellm_metadata=None,
+            user_api_key_auth=None,
+            llm_router=None,
+            logging_kwargs={},
+        )
+        store.apply_db_row("general_settings", {"claude_code_review_always_allow": False})
+        following: Final = build_safeguards_evaluator(
+            safeguards=DANGEROUS_TOOL_USE_REQUEST,
+            messages=[],
+            litellm_metadata=None,
+            user_api_key_auth=None,
+            llm_router=None,
+            logging_kwargs={},
+        )
+    assert current is not None and following is None
+    assert _verdicts(await current.evaluate((LS, CURL_SH))) == {
+        "call_ls": {"type": "evaluated", "outcome": "not_flagged"},
+        "call_curl": {"type": "evaluated", "outcome": "not_flagged"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_local_allow_does_not_approve_incomplete_tool_calls_or_invoke_classifier() -> None:
+    classifier: Final = _RecordingClassifier(())
+    gate: Final = _CallerGate("denied")
+    evaluator: Final = _evaluator(classifier, always_allow=True, caller_model_verdict=gate)
+    assert _verdicts(await evaluator.evaluate((LS, TruncatedToolUse("cut")))) == {
+        "call_ls": {"type": "evaluated", "outcome": "not_flagged"},
+        "cut": {"type": "unavailable", "reason": "truncated"},
+    }
+    assert classifier.calls == [] and gate.models == []
 
 
 @pytest.mark.asyncio
@@ -859,6 +947,34 @@ _STREAM: Final = (
     {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 9}},
     {"type": "message_stop"},
 )
+
+
+@pytest.mark.asyncio
+async def test_local_allow_replaces_only_tool_review_in_non_stream_and_stream_results() -> None:
+    classifier: Final = _RecordingClassifier(())
+    evaluator: Final = _evaluator(classifier, always_allow=True)
+    other: Final = {"type": "another_check", "status": {"type": "provider-result"}}
+    existing: Final = (*UNSUPPORTED, other)
+    response: Final = await with_safeguard_results(
+        {
+            "id": "msg_1",
+            "stop_reason": "tool_use",
+            "safeguard_results": existing,
+            "content": [{"type": "tool_use", "id": "call_ls", "name": "Bash", "input": {}}],
+        },
+        evaluator,
+    )
+    assert response["safeguard_results"][0] == other
+    assert response["safeguard_results"][1]["status"]["tool_uses"]["call_ls"]["outcome"] == "not_flagged"
+    collector: Final = StreamedSafeguardResults(evaluator)
+    for event in _STREAM[:-2]:
+        await collector.observe(event)
+    final: Final = await collector.observe(
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use", "safeguard_results": existing}}
+    )
+    assert final["delta"]["safeguard_results"][0] == other
+    assert final["delta"]["safeguard_results"][1]["status"]["tool_uses"]["call_curl"]["outcome"] == "not_flagged"
+    assert classifier.calls == []
 
 
 @pytest.mark.asyncio

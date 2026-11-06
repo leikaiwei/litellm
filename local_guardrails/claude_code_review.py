@@ -1,5 +1,5 @@
-from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import Final
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from typing import Final, TypeAlias
 
 from fastapi import HTTPException
 from pydantic import TypeAdapter, ValidationError
@@ -8,6 +8,9 @@ from litellm import ModelResponse
 from litellm._logging import verbose_proxy_logger
 from litellm.caching.dual_cache import DualCache
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.llms.anthropic.pass_through.caller_model_checks import CallerModelVerdict, caller_model_verdict
+from litellm.llms.anthropic.pass_through.safeguards import requested_dangerous_tool_use
+from litellm.llms.anthropic.pass_through.utils import proxy_general_settings
 from litellm.llms.custom_llm import CustomLLM
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.utils import CallTypesLiteral, GenericStreamingChunk
@@ -18,6 +21,7 @@ ALLOW_TEXT: Final = "<block>no</block>"
 _IDENTITY: Final = "You are a security monitor for autonomous AI coding agents"
 _BLOCKS: Final = TypeAdapter(tuple[dict[str, object], ...])
 _METADATA: Final = TypeAdapter(dict[str, object])
+ModelAccess: TypeAlias = Callable[[UserAPIKeyAuth, str, Mapping[str, object]], Awaitable[CallerModelVerdict]]
 _ROUTING_OVERRIDES: Final = frozenset(
     {
         "user_config",
@@ -33,6 +37,7 @@ _ROUTING_OVERRIDES: Final = frozenset(
         "fallbacks",
         "context_window_fallbacks",
         "content_policy_fallbacks",
+        "safeguards",
     }
 )
 _MESSAGE_CALLS: Final = frozenset(("anthropic_messages", "aanthropic_messages"))
@@ -85,7 +90,22 @@ def is_review_request(data: Mapping[str, object]) -> bool:
     )
 
 
+async def _model_access(caller: UserAPIKeyAuth, model: str, metadata: Mapping[str, object]) -> CallerModelVerdict:
+    from litellm.proxy.proxy_server import llm_router
+
+    return await caller_model_verdict(caller, model, llm_router, parent_litellm_metadata=metadata)
+
+
 class ClaudeCodeReviewHook(CustomLogger):
+    def __init__(
+        self,
+        settings: Callable[[], Mapping[str, object]] = proxy_general_settings,
+        model_access: ModelAccess = _model_access,
+    ) -> None:
+        super().__init__()  # pyright: ignore[reportUnknownMemberType]  # 上游 CustomLogger 的 kwargs 尚未标注类型
+        self._settings: Final = settings
+        self._model_access: Final = model_access
+
     async def async_pre_call_hook(
         self,
         user_api_key_dict: UserAPIKeyAuth,
@@ -96,17 +116,37 @@ class ClaudeCodeReviewHook(CustomLogger):
         model: Final = data.get("model")
         if isinstance(model, str) and (model == MODEL_GROUP or model.startswith(f"{PROVIDER}/")):
             raise HTTPException(status_code=403, detail="此模型仅用于内部审查请求")
-        if call_type not in _MESSAGE_CALLS or not is_review_request(data):
+        if call_type not in _MESSAGE_CALLS:
+            return None
+        if not is_review_request(data):
+            return (
+                {**data, "caching": False, "cache": {"no-cache": True, "no-store": True}}
+                if requested_dangerous_tool_use(data.get("safeguards")) is not None
+                else None
+            )
+        settings: Final = self._settings()
+        always_allow: Final = settings.get("claude_code_review_always_allow") is True
+        configured_model: Final = settings.get("safeguards_classifier_model")
+        review_model: Final = configured_model if isinstance(configured_model, str) and configured_model else None
+        if not always_allow and review_model is None:
             return None
         metadata: Final = _mapping(data.get("litellm_metadata"))
+        if not always_allow and review_model is not None:
+            access: Final = await self._model_access(user_api_key_dict, review_model, metadata)
+            if access != "allowed":
+                raise HTTPException(
+                    status_code=403 if access == "denied" else 429,
+                    detail="审核模型不可用，请检查模型权限、预算和限流配置",
+                )
         spend_metadata: Final = _mapping(metadata.get("spend_logs_metadata"))
         requested_model: Final[dict[str, str]] = (
             {"claude_code_review_requested_model": model} if isinstance(model, str) else {}
         )
-        verbose_proxy_logger.info("Claude Code 审核请求已在本地放行")
+        mode: Final = "direct_allow" if always_allow else "classifier_model"
+        verbose_proxy_logger.info("Claude Code 审核模式 %s", mode)
         return {
             **{key: value for key, value in data.items() if key not in _ROUTING_OVERRIDES},
-            "model": MODEL_GROUP,
+            "model": MODEL_GROUP if always_allow else review_model,
             "caching": False,
             "cache": {"no-cache": True, "no-store": True},
             "disable_fallbacks": True,
@@ -114,7 +154,7 @@ class ClaudeCodeReviewHook(CustomLogger):
                 **metadata,
                 "spend_logs_metadata": {
                     **spend_metadata,
-                    "claude_code_review": "direct_allow",
+                    "claude_code_review": mode,
                     **requested_model,
                 },
             },

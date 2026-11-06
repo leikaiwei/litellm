@@ -41,9 +41,9 @@ from ..responses_adapters.handler import LiteLLMMessagesToResponsesAPIHandler
 from ..safeguards import (
     SafeguardsEvaluator,
     native_route_classifies,
-    read_classifier_model_setting,
-    requested_dangerous_tool_use,
+    proxy_serves_safeguards,
     with_safeguard_results,
+    without_proxy_safeguards,
 )
 from .interceptors import get_messages_interceptors
 from .utils import AnthropicMessagesRequestUtils, mock_response, prepare_native_messages
@@ -158,7 +158,7 @@ def proxy_classifies_tool_uses(model: str, custom_llm_provider: str | None, kwar
     safeguards: Final = kwargs.get("safeguards")
     if _native_messages_config(model, custom_llm_provider, kwargs.get("model_info")) is not None:
         return native_route_classifies(model, safeguards)
-    return requested_dangerous_tool_use(safeguards) is not None and read_classifier_model_setting() is not None
+    return proxy_serves_safeguards(safeguards)
 
 
 ####### ENVIRONMENT VARIABLES ###################
@@ -706,7 +706,11 @@ def anthropic_messages_handler(
             ),
         ),
         anthropic_messages_provider_config=anthropic_messages_provider_config,
-        anthropic_messages_optional_request_params=dict(anthropic_messages_optional_request_params),
+        anthropic_messages_optional_request_params=(
+            dict(without_proxy_safeguards(anthropic_messages_optional_request_params))
+            if safeguards_evaluator is not None
+            else dict(anthropic_messages_optional_request_params)
+        ),
         _is_async=is_async,
         client=client,
         custom_llm_provider=custom_llm_provider,
@@ -715,7 +719,7 @@ def anthropic_messages_handler(
         api_key=api_key,
         api_base=resolved_api_base,
         stream=stream,
-        kwargs=kwargs,
+        kwargs=dict(without_proxy_safeguards(request_kwargs)) if safeguards_evaluator is not None else request_kwargs,
     )
     if safeguards_evaluator is None or not isinstance(native_response, Coroutine):
         return native_response

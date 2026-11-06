@@ -260,7 +260,13 @@ def test_vertex_claude_reaches_native() -> None:
         ("deepseek/deepseek-v4-flash", {"safeguards": DANGEROUS_TOOL_USE}, {}, False),
         ("deepseek/deepseek-v4-flash", {}, CLASSIFIER_SETTINGS, False),
         ("deepseek/deepseek-v4-flash", {"safeguards": [{"type": "other"}]}, CLASSIFIER_SETTINGS, False),
-        ("anthropic/claude-sonnet-4-5", {"safeguards": DANGEROUS_TOOL_USE}, CLASSIFIER_SETTINGS, False),
+        ("anthropic/claude-sonnet-4-5", {"safeguards": DANGEROUS_TOOL_USE}, CLASSIFIER_SETTINGS, True),
+        (
+            "anthropic/claude-sonnet-4-5",
+            {"safeguards": DANGEROUS_TOOL_USE},
+            {**CLASSIFIER_SETTINGS, "claude_code_review_model_scope": "client_only"},
+            False,
+        ),
     ),
 )
 async def test_python_keeps_the_requests_it_answers_with_safeguard_results(

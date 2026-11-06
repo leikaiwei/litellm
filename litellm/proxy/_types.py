@@ -2456,6 +2456,13 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
     """
 
     completion_model: str | None = Field(None, description="proxy level default model for all chat completion calls")
+    safeguards_classifier_model: str | None = Field(None, description="Claude Code 审核使用的模型组，空值关闭模型审核")
+    claude_code_review_model_scope: Literal["client_only", "all"] = Field(
+        "all", description="指定审核模型的作用范围，仅客户端独立审核或同时接管服务端审核"
+    )
+    claude_code_review_always_allow: bool = Field(
+        False, strict=True, description="Claude Code 审核本地放行，优先于审核模型"
+    )
     max_in_flight_requests_per_worker: int | None = Field(
         None, gt=0, description="maximum concurrent requests handled by each worker"
     )

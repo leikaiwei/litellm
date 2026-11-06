@@ -8,9 +8,16 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 宿主机日志维护：[基础日志永久保存、正文保留90天](scripts/spend_log_body_retention.md)，独立于代理镜像运行，避免官方整行保留策略删除费用和token明细
 
-**Claude Code 审核请求本地放行**：外部 [claude_code_review callback](local_guardrails/README.md#claude_code_review-claude-code-审核请求本地放行)
-- 命中已知的 Claude Code 独立审核协议后，在本地返回 `<block>no</block>`，不调用上游模型，token 和费用都是 0
-- 普通请求和未知模板仍走原模型。callback、本地 provider 和内部模型组需要一起注册，镜像升级不会自动打开
+**Claude Code 两种审核模式**：外部 [claude_code_review callback](local_guardrails/README.md#claude_code_review-claude-code-两种审核模式) 加原生 safeguards 小补丁
+- `general_settings.safeguards_classifier_model` 指定审核模型组，没有额外的模型启用开关，清空模型名即停止接管。`general_settings.claude_code_review_model_scope=client_only` 只接管已识别的客户端独立审核，保留上游服务端审核；设为 `all` 则同时接管 Messages `dangerous_tool_use`。范围默认 `all`，保留已有配置的启用语义，按需分流时应显式选择 `client_only`
+- `general_settings.claude_code_review_always_allow=true` 优先本地放行，两种协议均生效，不受范围或主模型名称限制。模型名与范围可保留，关闭放行后恢复指定模型策略。固定模式只免除审核调用费用，正常生成仍收费
+- 独立审核由 callback 分流，服务端审核复用上游 evaluator 与 SSE。接管服务端审核时包括原生 Claude 路由，移除送往供应商的该项审核请求，并替换返回的同类结果，其他 safeguards 保留
+- 补齐配置 schema 后，复用管理 API、SettingsStore 和数据库配置同步热切换，不另建管理端点或轮询服务。热配置字段不能同时由 YAML 锁定，首次安装插件仍需部署。跨 worker 为最终一致，已开始的审核保持配置快照
+- 带审核标记的请求禁用响应缓存读写，避免模式切换后复用旧结论。未知独立模板不接管。callback、本地 provider 和隐藏内部模型组一起注册，镜像升级不会自动启用
+
+两种形态按协议区分，不按客户端版本推断。[Claude Code 官方说明](https://code.claude.com/docs/en/permission-modes#server-side-classifier-review) 明确新版也可能在服务端不支持审核时回退为独立请求。`client_only` 不额外发起服务端分类调用，实际是否回退取决于客户端及上游协议支持
+
+此补丁保留上游审核协议实现，升级时重点核对 `safeguards.py`、两个 Messages handler 和配置字段。相关回归覆盖管理 HTTP 热更新、权限预算、双协议、原生与桥接路由、SSE、缓存和优先级。当前只完成本地实现和模拟验证，未部署生产或执行付费模型验收
 
 **工具数组 token 计数兼容**：`litellm_core_utils/token_counter.py`
 - 回移上游 [PR #46180](https://github.com/BerriAI/litellm/pull/46180) 的最小修复，兼容工具数组未声明 `items`、布尔及旧版元组 schema，避免计数抛出 `KeyError` 或 `AttributeError`

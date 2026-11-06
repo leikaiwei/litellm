@@ -12704,6 +12704,103 @@ async def test_update_config_general_settings_is_visible_to_the_next_read(monkey
 
 
 @pytest.mark.asyncio
+async def test_review_mode_api_updates_reach_live_hook_and_evaluator(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi.routing import APIRoute
+
+    from litellm.llms.anthropic.pass_through.safeguards import build_safeguards_evaluator
+    from litellm.proxy._types import ConfigFieldUpdate
+    from litellm.proxy.proxy_server import ProxyConfig, update_config_general_settings
+    from local_guardrails.claude_code_review import MODEL_GROUP, ClaudeCodeReviewHook
+
+    config: Final = ProxyConfig()
+    config.settings.load_yaml({})
+    fake: Final = _fake_prisma_with_config({})
+    monkeypatch.setattr(proxy_server_module, "proxy_config", config)
+    monkeypatch.setattr(proxy_server_module, "general_settings", config.settings)
+    monkeypatch.setattr(proxy_server_module, "prisma_client", fake)
+    monkeypatch.setattr(litellm, "store_audit_logs", False)
+    admin: Final = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN)
+
+    async def update(data: ConfigFieldUpdate) -> object:
+        result: Final = await update_config_general_settings(data, admin)
+        fake.db.litellm_config.find_first.return_value.param_value = dict(config.settings)
+        return result.param_value
+
+    app: Final = FastAPI(routes=[APIRoute("/config/field/update", update, methods=["POST"])])
+    hook: Final = ClaudeCodeReviewHook()
+    request: Final = {
+        "model": "main-model",
+        "system": "You are a security monitor for autonomous AI coding agents\n## Output Format\n"
+        "If the action should be allowed:\n<block>no</block>\nIf the action should be blocked:\n<block>yes</block>",
+        "messages": [{"role": "user", "content": "Review this action"}],
+    }
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        for field_name, field_value in (
+            ("safeguards_classifier_model", "review-model"),
+            ("claude_code_review_always_allow", True),
+        ):
+            saved: Final = await client.post(
+                "/config/field/update",
+                json={"config_type": "general_settings", "field_name": field_name, "field_value": field_value},
+            )
+            assert saved.status_code == 200
+            assert config.settings.source(field_name) == "db"
+        allowed: Final = await hook.async_pre_call_hook(admin, DualCache(), request, "anthropic_messages")
+        assert allowed is not None and allowed["model"] == MODEL_GROUP
+        disabled: Final = await client.post(
+            "/config/field/update",
+            json={
+                "config_type": "general_settings",
+                "field_name": "claude_code_review_always_allow",
+                "field_value": False,
+            },
+        )
+        assert disabled.status_code == 200
+        client_scope: Final = await client.post(
+            "/config/field/update",
+            json={
+                "config_type": "general_settings",
+                "field_name": "claude_code_review_model_scope",
+                "field_value": "client_only",
+            },
+        )
+        assert client_scope.status_code == 200
+        transparent: Final = build_safeguards_evaluator(
+            safeguards=[{"type": "dangerous_tool_use"}],
+            messages=[],
+            litellm_metadata=None,
+            user_api_key_auth=None,
+            llm_router=None,
+            logging_kwargs={},
+        )
+        assert transparent is None
+        scope: Final = await client.post(
+            "/config/field/update",
+            json={
+                "config_type": "general_settings",
+                "field_name": "claude_code_review_model_scope",
+                "field_value": "all",
+            },
+        )
+        assert scope.status_code == 200
+        evaluator: Final = build_safeguards_evaluator(
+            safeguards=[{"type": "dangerous_tool_use"}],
+            messages=[],
+            litellm_metadata=None,
+            user_api_key_auth=None,
+            llm_router=None,
+            logging_kwargs={},
+        )
+        assert evaluator is not None and evaluator.classifier_model == "review-model" and not evaluator.always_allow
+        removed: Final = await client.post(
+            "/config/field/update",
+            json={"config_type": "general_settings", "field_name": "safeguards_classifier_model", "field_value": None},
+        )
+        assert removed.status_code == 200
+        assert await hook.async_pre_call_hook(admin, DualCache(), request, "anthropic_messages") is None
+
+
+@pytest.mark.asyncio
 async def test_save_config_makes_a_db_owned_write_visible_to_the_next_read(monkeypatch):
     import litellm.proxy.proxy_server as proxy_server_module
     from litellm.proxy.proxy_server import ProxyConfig

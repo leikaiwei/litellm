@@ -29758,6 +29758,19 @@ export interface components {
                 [key: string]: unknown;
             } | null;
             /**
+             * Claude Code Review Always Allow
+             * @description Claude Code 审核本地放行，优先于审核模型
+             * @default false
+             */
+            claude_code_review_always_allow: boolean;
+            /**
+             * Claude Code Review Model Scope
+             * @description 指定审核模型的作用范围，仅客户端独立审核或同时接管服务端审核
+             * @default all
+             * @enum {string}
+             */
+            claude_code_review_model_scope: "client_only" | "all";
+            /**
              * Completion Model
              * @description proxy level default model for all chat completion calls
              */
@@ -30176,6 +30189,11 @@ export interface components {
              * @default 3600
              */
             responses_websocket_session_limit_seconds: number;
+            /**
+             * Safeguards Classifier Model
+             * @description Claude Code 审核使用的模型组，空值关闭模型审核
+             */
+            safeguards_classifier_model?: string | null;
             /** @description Spreads the proxy's scheduled background jobs (spend flushes, budget resets, config reloads, exports) across a window instead of firing them together on every replica. On by default; set to tune the window, pin a job, or turn it off. */
             scheduled_job_stagger?: components["schemas"]["ScheduledJobStaggerSettings"] | null;
             /**
