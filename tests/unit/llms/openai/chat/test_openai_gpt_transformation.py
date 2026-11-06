@@ -1826,6 +1826,7 @@ def test_chat_rejects_invalid_historical_function_name(name: str, legacy: bool) 
     assert error.value.param == (
         "messages[0].function_call.name" if legacy else "messages[0].tool_calls[0].function.name"
     )
+    assert error.value.param in str(error.value)
 
 
 @pytest.mark.asyncio

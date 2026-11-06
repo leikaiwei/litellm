@@ -51,7 +51,7 @@ def validate_function_name(model: str, name: object, param: str) -> None:
     raise LocalRequestValidationError(
         model=model,
         param=param,
-        message="工具名称无效，只允许字母、数字、下划线、点和连字符，请修正历史工具调用。",
+        message=f"工具名称无效（{param}），只允许字母、数字、下划线、点和连字符，请修正历史工具调用。",
     )
 
 

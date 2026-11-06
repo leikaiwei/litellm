@@ -4308,6 +4308,7 @@ def test_responses_rejects_invalid_history_function_name_locally(name: str) -> N
         )
     assert error.value.status_code == 400
     assert error.value.param == "input[0].name"
+    assert "input[0].name" in str(error.value)
 
 
 def test_responses_keeps_valid_function_name_and_call_id() -> None:

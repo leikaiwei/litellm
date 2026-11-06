@@ -21,7 +21,7 @@ This guide provides instructions for building and running the LiteLLM applicatio
 
 补发已有版本时，在 Actions 中选择主分支上的工作流并填写原始发布标签，避免使用旧标签内的工作流。镜像发布成功后再执行服务器升级，工作流不会自动部署生产
 
-### 请求准入补丁 v1.108.0-fork.patch.1
+### 请求准入补丁 v1.108.0-fork.patch.2
 
 2026-11-06 的补丁保留客户端协议与模型路由。Claude Code 可以继续使用 `/v1/messages` 调用配置为 OpenAI provider 的模型，LiteLLM 负责协议转换
 
