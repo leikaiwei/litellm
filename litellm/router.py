@@ -75,7 +75,6 @@ from litellm.constants import (
     RUNTIME_UPDATABLE_ROUTER_SETTINGS,
     SESSION_DEPLOYMENT_AFFINITY_TTL_METADATA_KEY,
 )
-from litellm.exceptions import LocalRequestValidationError
 from litellm.integrations.custom_guardrail import is_guardrail_intervention
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.otel.routing import routing_decision_attributes
@@ -7911,7 +7910,6 @@ class Router:
             disable_fallbacks is True
             or original_model_group is None
             or is_guardrail_intervention(e)
-            or isinstance(e, LocalRequestValidationError)
             or unsupported_params_without_fallback
         ):
             raise e
@@ -8331,9 +8329,7 @@ class Router:
             response = add_retry_headers_to_response(response=response, attempted_retries=0, max_retries=None)
             return response
         except Exception as e:
-            if is_guardrail_intervention(e) or isinstance(
-                e, (LocalRequestValidationError, litellm.ContextWindowExceededError)
-            ):
+            if is_guardrail_intervention(e):
                 raise
             current_attempt = None
             original_exception = e
@@ -8434,9 +8430,7 @@ class Router:
                     )
                     return response
 
-                except Exception as e:
-                    if isinstance(e, (LocalRequestValidationError, litellm.ContextWindowExceededError)):
-                        raise
+                except Exception as e:  # noqa: BLE001  # 重试统一处理各供应商异常，耗尽后仍向调用方抛出
                     # Always track the latest error so we raise the most
                     # recent exception instead of the first one.
                     original_exception = e
@@ -13232,18 +13226,10 @@ class Router:
         `tools` (Chat Completions, Responses and Anthropic Messages shapes) and the
         Anthropic Messages top-level `system` block.
         """
-        from litellm.litellm_core_utils.image_validation import invalid_inline_image_path
         from litellm.llms.anthropic.pass_through.messages.utils import (
             anthropic_system_to_openai_message,
         )
 
-        image_path: Final = invalid_inline_image_path(
-            messages if messages is not None else input, "messages" if messages is not None else "input"
-        )
-        if image_path is not None:
-            raise LocalRequestValidationError(
-                model="", message=f"图片数据损坏，请重新上传：{image_path}", param=image_path
-            )
         extras: Final = request_kwargs if request_kwargs is not None else MappingProxyType({})
         raw_instructions: Final = extras.get("instructions")
         instructions: Final = raw_instructions if isinstance(raw_instructions, str) else None
@@ -13312,9 +13298,10 @@ class Router:
     ) -> int | None:
         """Count input tokens off the event loop, so a multi-MB prompt cannot stall the proxy.
 
-        Returns None when no deployment limits its context window, or when counting fails.
-        The caller pairs this with ``skip_inline_token_count`` and rejects an uncountable
-        limited request after checking RPM, region and unsupported parameters.
+        Returns None when no deployment limits its context window, and when counting fails. The
+        caller pairs this with ``skip_inline_token_count`` so neither case puts the count back on
+        the loop: a failed count only skips the context-window check - RPM, region and
+        invalid-params checks still run for every deployment.
         """
         if messages is None and input is None:
             return None
@@ -13326,10 +13313,10 @@ class Router:
                 input=cast(str | list | None, input),  # cast-ok: forwarded to the sync counter
                 request_kwargs=request_kwargs,
             )
-        except LocalRequestValidationError:
-            raise
-        except Exception as e:  # noqa: BLE001  # the pre-call check rejects missing counts for limited requests
-            verbose_router_logger.error("上下文计数失败，将拒绝有输入上限的请求：%s", type(e).__name__)
+        except Exception as e:  # noqa: BLE001  # best-effort: an uncountable prompt must not fail the request
+            verbose_router_logger.error(
+                "litellm.router.py::_acount_pre_call_check_tokens: failed to count tokens. Got - %s", e
+            )
             return None
 
     def _resolve_pre_call_check_input_tokens(
@@ -13350,10 +13337,12 @@ class Router:
                 input=cast(str | list[object] | None, input),  # cast-ok: forwarded to the sync counter
                 request_kwargs=request_kwargs,
             )
-        except LocalRequestValidationError:
-            raise
         except Exception as e:
-            verbose_router_logger.error("上下文计数失败，将拒绝有输入上限的请求：%s", type(e).__name__)
+            verbose_router_logger.error(
+                "litellm.router.py::_pre_call_checks: failed to count tokens. "
+                "Skipping the context-window check only; RPM/region/param checks still apply. Got - %s",
+                e,
+            )
             return None
 
     @staticmethod
@@ -13570,16 +13559,6 @@ class Router:
             # Single-pass filter using set for O(1) lookups (avoids O(n^2) from repeated pops)
             _returned_deployments = [d for i, d in enumerate(_returned_deployments) if i not in excluded_indices]
 
-        if (
-            has_countable_input
-            and input_tokens is None
-            and any(limit is not None for limit in deployment_max_input_tokens)
-        ):
-            raise LocalRequestValidationError(
-                model=model,
-                message="无法计算请求的上下文长度，已停止发送上游。请检查消息、图片和工具定义后重试。",
-                param="messages" if messages is not None else "input",
-            )
         return _returned_deployments
 
     def get_model_from_alias(self, model: str) -> str | None:

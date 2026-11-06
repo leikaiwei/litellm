@@ -20,7 +20,6 @@ from litellm.litellm_core_utils.prompt_templates.common_utils import (
     cache_control_as_prompt_cache_breakpoint,
     drop_non_python_regex_patterns,
     flatten_combinators_and_drop_non_python_regex_patterns,
-    normalize_schema_integer_keywords,
     with_prompt_cache_breakpoint,
 )
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
@@ -47,7 +46,7 @@ from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
 from litellm.types.workload_identity import OPENAI_WIF_KWARGS_KEYS
 
-from ..common_utils import OpenAIError, validate_function_name
+from ..common_utils import OpenAIError
 from ..workload_identity import get_workload_identity_bearer_token, resolve_openai_workload_identity_config
 
 OPENAI_RESPONSES_API_MIN_MAX_OUTPUT_TOKENS: Final = 16
@@ -500,7 +499,6 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
         prompt_cache_options: object = None,
     ) -> tuple[str | ResponseInputParam, Sequence[ALL_RESPONSES_API_TOOL_PARAMS] | None]:
         validated_input: Final = self._validate_input_param(self._drop_bridge_minted_reasoning_items(input))
-        self._validate_function_call_names(model, validated_input)
         marked_input: Final = (
             self._input_with_prompt_cache_breakpoints(validated_input)
             if self._reads_prompt_cache_breakpoints(
@@ -529,15 +527,6 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
             model=model, tools=object_schema_tools, litellm_params=litellm_params
         )
         return self._drop_foreign_tool_call_item_ids(stripped_input), sanitized_tools
-
-    def _validate_function_call_names(self, model: str, input: str | Sequence[object]) -> None:
-        if self.custom_llm_provider not in _PROVIDERS_WITH_OPENAI_SCHEMA_VALIDATOR or isinstance(input, str):
-            return
-        for index, item in enumerate(input):
-            if not isinstance(item, dict):
-                continue
-            if (fields := cast(Mapping[str, object], item)).get("type") == "function_call":  # cast-ok: dict checked
-                validate_function_name(model, fields.get("name"), f"input[{index}].name")
 
     def _targets_openai_api(self, litellm_params: GenericLiteLLMParams) -> bool:
         host: Final = _DeploymentHost.model_validate(litellm_params)
@@ -713,7 +702,7 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
         parameters: Final = entry.get("parameters")
         nested_tools: Final = entry.get("tools")
         sanitized_parameters: Final = (
-            sanitize(normalize_schema_integer_keywords(cast(Mapping[str, object], parameters)))  # cast-ok: dict checked
+            sanitize(cast(Mapping[str, object], parameters))  # cast-ok: dict checked
             if isinstance(parameters, dict)
             else parameters
         )

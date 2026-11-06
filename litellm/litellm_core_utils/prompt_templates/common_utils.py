@@ -1368,35 +1368,6 @@ _SUBSCHEMA_MAP_KEYWORDS: Final = frozenset(
 )
 
 _MAX_SCHEMA_NESTING: Final = 1024
-_INTEGER_SCHEMA_KEYWORDS: Final = frozenset(
-    {"minItems", "maxItems", "minLength", "maxLength", "minProperties", "maxProperties", "minContains", "maxContains"}
-)
-
-
-def normalize_schema_integer_keywords(schema: Mapping[str, object]) -> Mapping[str, object]:
-    """仅规范化 schema 整数关键字，保留默认值、示例和实际小数。"""
-    rebuilt: Final[dict[int, Mapping[str, object]]] = {}  # mutable-ok: deepest-first memo preserves shared schema nodes
-    for level in reversed(tuple(islice(_schema_levels(schema), _MAX_SCHEMA_NESTING))):
-        for node in level:
-            if (normalized := _normalize_integer_schema_node(node, rebuilt)) is not node:
-                rebuilt[id(node)] = normalized
-    return rebuilt.get(id(schema), schema)
-
-
-def _normalize_integer_schema_node(
-    node: Mapping[str, object], rebuilt: Mapping[int, Mapping[str, object]]
-) -> Mapping[str, object]:
-    normalized: Final = {
-        key: int(value)
-        if key in _INTEGER_SCHEMA_KEYWORDS and isinstance(value, float) and value.is_integer()
-        else _keyword_value_rebuilt(key, value, rebuilt, _keep_regex)
-        for key, value in node.items()
-    }
-    return normalized if any(normalized[key] is not node[key] for key in node) else node
-
-
-def _keep_regex(pattern: str) -> bool:
-    return False
 
 
 def drop_non_python_regex_patterns(schema: Mapping[str, object]) -> Mapping[str, object]:
@@ -1556,14 +1527,14 @@ def tool_with_sanitized_parameters(
         parameters: Final = _schema_at(function, "parameters")
         if parameters is None:
             return tool
-        sanitized_parameters: Final = sanitize(normalize_schema_integer_keywords(parameters))
+        sanitized_parameters: Final = sanitize(parameters)
         if sanitized_parameters is parameters:
             return tool
         return {**tool, "function": {**function, "parameters": sanitized_parameters}}
     input_schema: Final = _schema_at(tool, "input_schema")
     if input_schema is None:
         return tool
-    sanitized_schema: Final = sanitize(normalize_schema_integer_keywords(input_schema))
+    sanitized_schema: Final = sanitize(input_schema)
     return tool if sanitized_schema is input_schema else {**tool, "input_schema": sanitized_schema}
 
 

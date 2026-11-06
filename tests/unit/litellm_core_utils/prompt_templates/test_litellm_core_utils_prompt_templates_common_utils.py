@@ -2362,34 +2362,3 @@ def test_strip_litellm_response_only_fields_drops_nested_tool_call_provider_fiel
     assert "provider_specific_fields" not in function
     assert function["name"] == "get_weather"
     assert function["arguments"] == '{"city": "Paris"}'
-
-
-@pytest.mark.parametrize(
-    "keyword",
-    ["minItems", "maxItems", "minLength", "maxLength", "minProperties", "maxProperties", "minContains", "maxContains"],
-)
-def test_normalize_schema_integers_preserves_data_values(keyword: str) -> None:
-    from litellm.litellm_core_utils.prompt_templates.common_utils import normalize_schema_integer_keywords
-
-    schema: Final = {
-        "properties": {"payload": {"anyOf": [{"items": {keyword: 1.0, "minimum": 1.5}}]}},
-        "default": {keyword: 1.0},
-        "examples": [{keyword: 1.0}],
-        "const": {keyword: 1.0},
-    }
-    result: Final = normalize_schema_integer_keywords(schema)
-    nested: Final = result["properties"]["payload"]["anyOf"][0]["items"]
-    assert type(nested[keyword]) is int
-    assert nested["minimum"] == 1.5
-    assert type(schema["properties"]["payload"]["anyOf"][0]["items"][keyword]) is float
-    assert result["default"] is schema["default"]
-    assert result["examples"] is schema["examples"]
-    assert result["const"] is schema["const"]
-
-
-@pytest.mark.parametrize("value", [1, True, 1.5, float("inf"), float("nan")])
-def test_normalize_schema_integers_does_not_coerce_non_integral_values(value: object) -> None:
-    from litellm.litellm_core_utils.prompt_templates.common_utils import normalize_schema_integer_keywords
-
-    schema: Final = {"minItems": value}
-    assert normalize_schema_integer_keywords(schema) is schema

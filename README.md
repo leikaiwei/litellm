@@ -2,6 +2,10 @@
 
 Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础上打了以下补丁：
 
+2026-11-06 发布范围调整，撤回 `27e276c5112` 和 `0d923ebc042` 的请求准入及错误路径补丁，保留 1.108.0 升级和此前旧补丁。`v1.108.0-fork.patch.1` 已含准入修改，`v1.108.0-fork.patch.2` 进一步包含错误路径修改，两者均不作为本次上线候选，也不移动既有标签
+
+不含这批修改的已发布镜像是 `leikaiwei/litellm:v1.108.0-fork`，发布 digest 为 `sha256:a677652db2903c8b637121e87b04a01721e236df9969e033865aba858bc0490a`。其核心运行逻辑与撤回后的版本一致，源码仅保留 Responses schema 参数的类型声明，并说明重试处理多种供应商异常所需的 BLE001 豁免，均不改变运行行为。外部 Claude Code 审核改动另存于 `f72874dd9cd`，不随该镜像启用。这里只记录源码回退及候选镜像，生产部署另行执行
+
 宿主机日志维护：[基础日志永久保存、正文保留90天](scripts/spend_log_body_retention.md)，独立于代理镜像运行，避免官方整行保留策略删除费用和token明细
 
 **Claude Code 审核请求本地放行**：外部 [claude_code_review callback](local_guardrails/README.md#claude_code_review-claude-code-审核请求本地放行)

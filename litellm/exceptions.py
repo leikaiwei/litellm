@@ -266,18 +266,6 @@ class BadRequestError(openai.BadRequestError):
         return _message
 
 
-class LocalRequestValidationError(BadRequestError):
-    """本地确定性校验失败，不允许重试或回退绕过。"""
-
-    def __init__(self, model: str, message: str, param: str | None = None) -> None:
-        super().__init__(  # pyright: ignore[reportUnknownMemberType]  # public base initializer has untyped parameters
-            message=message,
-            model=model,
-            llm_provider="router",
-            body={"code": "invalid_request_error", "param": param},
-        )
-
-
 class ImageFetchError(BadRequestError):
     def __init__(
         self,

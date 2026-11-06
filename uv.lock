@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -14,13 +14,13 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P3D"
 
 [options.exclude-newer-package]
-mlflow-skinny = "2026-10-21T03:00:00Z"
+boto3 = "2026-10-21T19:31:00Z"
+botocore = "2026-10-21T19:31:00Z"
 brotli = "2026-10-22T14:01:00Z"
 certifi = "2026-10-20T03:00:00Z"
 grpcio = "2026-10-22T15:00:00Z"
-boto3 = "2026-10-21T19:31:00Z"
-botocore = "2026-10-21T19:31:00Z"
 mlflow = "2026-10-21T03:00:00Z"
+mlflow-skinny = "2026-10-21T03:00:00Z"
 mlflow-tracing = "2026-10-21T03:00:00Z"
 pypdf = "2026-10-28T17:01:00Z"
 
@@ -4589,8 +4589,6 @@ dependencies = [
     { name = "jsonschema" },
     { name = "openai" },
     { name = "packaging" },
-    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
@@ -4898,7 +4896,6 @@ requires-dist = [
     { name = "opentelemetry-sdk", marker = "extra == 'proxy-runtime'", specifier = "==1.45.1" },
     { name = "orjson", marker = "extra == 'proxy'", specifier = ">=3.11.6,<4.0" },
     { name = "packaging", specifier = ">=24.0" },
-    { name = "pillow", specifier = ">=12.3.0,<14.0" },
     { name = "polars", marker = "extra == 'proxy'", specifier = ">=1.38.1,<2.0" },
     { name = "prisma", marker = "extra == 'extra-proxy'", specifier = ">=0.11.0,<1.0" },
     { name = "prometheus-client", marker = "extra == 'proxy-runtime'", specifier = ">=0.20.0,<1.0" },

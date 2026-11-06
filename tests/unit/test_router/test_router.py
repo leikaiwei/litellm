@@ -31,12 +31,7 @@ from litellm.caching import RedisCache, RedisClusterCache
 from litellm.caching.caching import DualCache
 from litellm.caching.in_memory_cache import DEFAULT_MAX_SIZE_IN_MEMORY, InMemoryCache
 from litellm.caching.redis_cache import _redis_circuit_breaker_guard
-from litellm.exceptions import (
-    GuardrailRaisedException,
-    LocalRequestValidationError,
-    MidStreamFallbackError,
-    ModifyResponseException,
-)
+from litellm.exceptions import GuardrailRaisedException, MidStreamFallbackError, ModifyResponseException
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.integrations.custom_logger import CustomLogger
@@ -6130,7 +6125,8 @@ def test_deployment_max_input_tokens_survives_an_unmappable_deployment(monkeypat
 
 def test_pre_call_checks_does_not_recount_inline_after_an_off_loop_failure(monkeypatch):
     """
-    An off-loop failure must reject the request without repeating work on the event loop.
+    When the off-loop count failed there is nothing left to filter on, so _pre_call_checks must
+    return the deployments unfiltered rather than repeating the count on the event loop.
     """
     router = litellm.Router(
         model_list=[
@@ -6150,16 +6146,16 @@ def test_pre_call_checks_does_not_recount_inline_after_an_off_loop_failure(monke
     deployments = [
         {"litellm_params": {"model": "gpt-3.5-turbo"}, "model_info": {"id": "d1"}},
     ]
-    with pytest.raises(LocalRequestValidationError):
-        router._pre_call_checks(
-            model="m",
-            healthy_deployments=deployments,
-            messages=[{"role": "user", "content": "hi"}],
-            input_token_count=None,
-            skip_inline_token_count=True,
-        )
+    result = router._pre_call_checks(
+        model="m",
+        healthy_deployments=deployments,
+        messages=[{"role": "user", "content": "hi"}],
+        input_token_count=None,
+        skip_inline_token_count=True,
+    )
 
     assert calls == []
+    assert len(result) == 1
 
 
 async def test_async_get_healthy_deployments_never_recounts_on_the_loop(monkeypatch):
@@ -6185,15 +6181,16 @@ async def test_async_get_healthy_deployments_never_recounts_on_the_loop(monkeypa
 
     monkeypatch.setattr(litellm, "token_counter", exploding_counter)
 
-    with pytest.raises(LocalRequestValidationError):
-        await router.async_get_healthy_deployments(
-            model="m",
-            request_kwargs={},
-            messages=[{"role": "user", "content": "hi"}],
-            input=None,
-            specific_deployment=False,
-            parent_otel_span=None,
-        )
+    result = await router.async_get_healthy_deployments(
+        model="m",
+        request_kwargs={},
+        messages=[{"role": "user", "content": "hi"}],
+        input=None,
+        specific_deployment=False,
+        parent_otel_span=None,
+    )
+
+    assert len(result) == 1
     assert len(counting_threads) == 1
     assert counting_threads[0] is not threading.current_thread()
 
@@ -26961,7 +26958,7 @@ def test_pre_call_checks_rpm_check_still_enforced_when_token_counting_fails():
         )
 
 
-def test_pre_call_checks_rejects_uncountable_input():
+def test_pre_call_checks_context_window_check_is_skipped_but_not_fatal_when_token_counting_fails():
     model_list: Final = [
         {
             "model_name": "fake-openai-endpoint",
@@ -26971,18 +26968,16 @@ def test_pre_call_checks_rejects_uncountable_input():
     ]
     router: Final = Router(model_list=model_list, enable_pre_call_checks=True, num_retries=0)
 
-    with pytest.raises(LocalRequestValidationError) as error:
-        router._pre_call_checks(
-            model="fake-openai-endpoint",
-            healthy_deployments=model_list,
-            messages=_PRE_CALL_CHECK_UNPARSEABLE_MESSAGES,
-        )
+    filtered: Final = router._pre_call_checks(
+        model="fake-openai-endpoint",
+        healthy_deployments=model_list,
+        messages=_PRE_CALL_CHECK_UNPARSEABLE_MESSAGES,
+    )
 
-    assert error.value.status_code == 400
-    assert error.value.param == "messages"
+    assert len(filtered) == 1
 
 
-def test_pre_call_checks_rejects_uncountable_input_after_param_filter(monkeypatch: pytest.MonkeyPatch):
+def test_pre_call_checks_keeps_unsupported_param_filter_when_token_counting_fails(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(litellm, "drop_params", False)
     no_json_mode_model: Final = "gpt-3.5-turbo-16k"
     assert "response_format" not in (
@@ -26998,16 +26993,17 @@ def test_pre_call_checks_rejects_uncountable_input_after_param_filter(monkeypatc
     ]
     router: Final = Router(model_list=model_list, enable_pre_call_checks=True, num_retries=0)
 
-    with pytest.raises(LocalRequestValidationError):
-        router._pre_call_checks(
-            model="fake-openai-endpoint",
-            healthy_deployments=model_list,
-            messages=_PRE_CALL_CHECK_UNPARSEABLE_MESSAGES,
-            request_kwargs={"response_format": {"type": "json_object"}},
-        )
+    filtered: Final = router._pre_call_checks(
+        model="fake-openai-endpoint",
+        healthy_deployments=model_list,
+        messages=_PRE_CALL_CHECK_UNPARSEABLE_MESSAGES,
+        request_kwargs={"response_format": {"type": "json_object"}},
+    )
+
+    assert [d["model_info"]["id"] for d in filtered] == ["gpt-4o"]
 
 
-async def test_async_get_healthy_deployments_rejects_uncountable_input_after_region_filter():
+async def test_async_get_healthy_deployments_keeps_region_check_when_token_counting_fails():
     model_list: Final = [
         {
             "model_name": "fake-openai-endpoint",
@@ -27018,15 +27014,16 @@ async def test_async_get_healthy_deployments_rejects_uncountable_input_after_reg
     ]
     router: Final = Router(model_list=model_list, enable_pre_call_checks=True, num_retries=0)
 
-    with pytest.raises(LocalRequestValidationError):
-        await router.async_get_healthy_deployments(
-            model="fake-openai-endpoint",
-            request_kwargs={"allowed_model_region": "eu"},
-            messages=_PRE_CALL_CHECK_UNPARSEABLE_MESSAGES,
-            input=None,
-            specific_deployment=False,
-            parent_otel_span=None,
-        )
+    healthy: Final = await router.async_get_healthy_deployments(
+        model="fake-openai-endpoint",
+        request_kwargs={"allowed_model_region": "eu"},
+        messages=_PRE_CALL_CHECK_UNPARSEABLE_MESSAGES,
+        input=None,
+        specific_deployment=False,
+        parent_otel_span=None,
+    )
+
+    assert [deployment["model_info"]["id"] for deployment in healthy] == ["eu-deployment"]
 
 
 @pytest.mark.parametrize(
@@ -27438,161 +27435,3 @@ async def test_responses_fallback_wrapper_disconnect_billing_keeps_the_primary_s
     wrapped.adopt_fallback_headers(fallback)
 
     assert wrapped.partial_response_on_disconnect().response.usage.output_tokens == primary_tokens + fallback_tokens
-
-
-@pytest.mark.parametrize("surface", ["chat", "messages", "responses"])
-@pytest.mark.parametrize("stream", [False, True])
-async def test_corrupt_inline_image_never_reaches_upstream_or_fallback(
-    surface: Literal["chat", "messages", "responses"], stream: bool
-) -> None:
-    router: Final = Router(
-        model_list=[
-            {
-                "model_name": name,
-                "litellm_params": {
-                    "model": "openai/gpt-6.1-sol",
-                    "api_key": "test",
-                    "api_base": "https://upstream.test/v1",
-                },
-                "model_info": {"max_input_tokens": 10000},
-            }
-            for name in ("primary", "fallback")
-        ],
-        enable_pre_call_checks=True,
-        num_retries=3,
-        retry_policy={"BadRequestErrorRetries": 3},
-        fallback_on_unsupported_params=True,
-        fallbacks=[{"primary": ["fallback"]}],
-    )
-    with respx.mock(assert_all_called=False) as upstream:
-        upstream.route().respond(500)
-        request: Final[Awaitable[object]]
-        match surface:
-            case "chat":
-                request = router.acompletion(
-                    model="primary",
-                    stream=stream,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW52YWxpZA=="}}
-                            ],
-                        }
-                    ],
-                )
-            case "messages":
-                request = router.aanthropic_messages(
-                    model="primary",
-                    stream=stream,
-                    max_tokens=10,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image",
-                                    "source": {"type": "base64", "media_type": "image/png", "data": "aW52YWxpZA=="},
-                                }
-                            ],
-                        }
-                    ],
-                )
-            case "responses":
-                request = router.aresponses(
-                    model="primary",
-                    stream=stream,
-                    input=[
-                        {
-                            "role": "user",
-                            "content": [{"type": "input_image", "image_url": "data:image/png;base64,aW52YWxpZA=="}],
-                        }
-                    ],
-                )
-        with pytest.raises(LocalRequestValidationError, match="图片数据损坏") as error:
-            await request
-        assert error.value.status_code == 400
-        assert len(upstream.calls) == 0
-
-
-async def test_uncountable_request_cannot_bypass_limit_with_retry_policy_or_fallback() -> None:
-    router: Final = Router(
-        model_list=[
-            {
-                "model_name": name,
-                "litellm_params": {
-                    "model": "openai/gpt-6.1-sol",
-                    "api_key": "test",
-                    "api_base": "https://upstream.test/v1",
-                },
-                "model_info": {"max_input_tokens": 10000},
-            }
-            for name in ("primary", "fallback")
-        ],
-        enable_pre_call_checks=True,
-        num_retries=3,
-        retry_policy={"BadRequestErrorRetries": 3},
-        fallback_on_unsupported_params=True,
-        fallbacks=[{"primary": ["fallback"]}],
-    )
-    with respx.mock(assert_all_called=False) as upstream:
-        upstream.route().respond(500)
-        with pytest.raises(LocalRequestValidationError, match="无法计算请求的上下文长度"):
-            await router.acompletion(model="primary", messages=_PRE_CALL_CHECK_UNPARSEABLE_MESSAGES)
-        assert len(upstream.calls) == 0
-
-
-@pytest.mark.parametrize("surface", ["chat", "messages", "responses"])
-async def test_oversized_request_cannot_reach_equally_limited_fallback(
-    surface: Literal["chat", "messages", "responses"],
-) -> None:
-    router: Final = Router(
-        model_list=[
-            {
-                "model_name": name,
-                "litellm_params": {
-                    "model": "openai/gpt-6.1-sol",
-                    "api_key": "test",
-                    "api_base": "https://upstream.test/v1",
-                },
-                "model_info": {"max_input_tokens": 10},
-            }
-            for name in ("primary", "fallback")
-        ],
-        enable_pre_call_checks=True,
-        num_retries=0,
-        context_window_fallbacks=[{"primary": ["fallback"]}],
-    )
-    prompt: Final = "long history " * 100
-    with respx.mock(assert_all_called=False) as upstream:
-        upstream.route().respond(500)
-        request: Final[Awaitable[object]]
-        match surface:
-            case "chat":
-                request = router.acompletion(model="primary", messages=[{"role": "user", "content": prompt}])
-            case "messages":
-                request = router.aanthropic_messages(
-                    model="primary", messages=[{"role": "user", "content": prompt}], max_tokens=1
-                )
-            case "responses":
-                request = router.aresponses(model="primary", input=prompt)
-        with pytest.raises(litellm.ContextWindowExceededError):
-            await request
-        assert len(upstream.calls) == 0
-
-
-async def test_context_window_error_is_not_retried_even_with_bad_request_retry_policy() -> None:
-    router: Final = Router(
-        model_list=[{"model_name": "limited", "litellm_params": {"model": "openai/gpt-6.1-sol", "api_key": "test"}}],
-        retry_policy={"BadRequestErrorRetries": 3},
-        num_retries=3,
-    )
-    attempts: Final = []
-
-    async def refused_request(**kwargs: object) -> None:
-        attempts.append(1)
-        raise litellm.ContextWindowExceededError(message="too large", model="limited", llm_provider="openai")
-
-    with pytest.raises(litellm.ContextWindowExceededError):
-        await router.async_function_with_retries(model="limited", original_function=refused_request, num_retries=3)
-    assert attempts == [1]

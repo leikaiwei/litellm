@@ -7,11 +7,10 @@ import hashlib
 import inspect
 import json
 import os
-import re
 import ssl
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import suppress
 from typing import TYPE_CHECKING, Final, Literal, NamedTuple, Optional, Protocol
 from urllib.parse import urlsplit
@@ -24,13 +23,12 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
 from openai.types.chat.chat_completion_chunk import ChoiceDelta
 from openai.types.completion_usage import CompletionUsage
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from aiohttp import ClientSession
 
 import litellm
-from litellm.exceptions import LocalRequestValidationError
 from litellm.litellm_core_utils.completion_timeout import CompletionTimeout
 from litellm.litellm_core_utils.token_counter import token_counter
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
@@ -40,40 +38,6 @@ from litellm.llms.custom_httpx.http_handler import (
     get_ssl_configuration,
     http2_enabled,
 )
-
-_FUNCTION_FIELDS: Final = TypeAdapter(Mapping[str, object])
-_FUNCTION_CALLS: Final = TypeAdapter(list[object])
-
-
-def validate_function_name(model: str, name: object, param: str) -> None:
-    if isinstance(name, str) and re.fullmatch(r"[a-zA-Z0-9_.-]+", name) is not None:
-        return
-    raise LocalRequestValidationError(
-        model=model,
-        param=param,
-        message=f"工具名称无效（{param}），只允许字母、数字、下划线、点和连字符，请修正历史工具调用。",
-    )
-
-
-def validate_chat_function_names(model: str, messages: Sequence[Mapping[str, object]]) -> None:
-    for message_index, message in enumerate(messages):
-        if isinstance(legacy_function := message.get("function_call"), dict):
-            validate_function_name(
-                model,
-                _FUNCTION_FIELDS.validate_python(legacy_function).get("name"),
-                f"messages[{message_index}].function_call.name",
-            )
-        if not isinstance(tool_calls := message.get("tool_calls"), list):
-            continue
-        for call_index, call in enumerate(_FUNCTION_CALLS.validate_python(tool_calls)):
-            if isinstance(call, dict) and isinstance(
-                function := _FUNCTION_FIELDS.validate_python(call).get("function"), dict
-            ):
-                validate_function_name(
-                    model,
-                    _FUNCTION_FIELDS.validate_python(function).get("name"),
-                    f"messages[{message_index}].tool_calls[{call_index}].function.name",
-                )
 
 
 def _get_client_init_params(cls: type) -> tuple[str, ...]:
