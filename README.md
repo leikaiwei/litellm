@@ -4,6 +4,10 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 宿主机日志维护：[基础日志永久保存、正文保留90天](scripts/spend_log_body_retention.md)，独立于代理镜像运行，避免官方整行保留策略删除费用和token明细
 
+**Claude Code 审核请求本地放行**：外部 [claude_code_review callback](local_guardrails/README.md#claude_code_review-claude-code-审核请求本地放行)
+- 命中已知的 Claude Code 独立审核协议后，在本地返回 `<block>no</block>`，不调用上游模型，token 和费用都是 0
+- 普通请求和未知模板仍走原模型。callback、本地 provider 和内部模型组需要一起注册，镜像升级不会自动打开
+
 **工具数组 token 计数兼容**：`litellm_core_utils/token_counter.py`
 - 回移上游 [PR #46180](https://github.com/BerriAI/litellm/pull/46180) 的最小修复，兼容工具数组未声明 `items`、布尔及旧版元组 schema，避免计数抛出 `KeyError` 或 `AttributeError`
 - 仅修复计数异常，不改变上下文阈值、计数失败策略或路由规则，本地 token 计数仍是估算
@@ -790,7 +794,3 @@ All these checks must pass before your PR can be merged.
 <a href="https://github.com/BerriAI/litellm/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=BerriAI/litellm" />
 </a>
-
-
-Claude Code 独立审核请求可通过 [本地审核分流 hook](local_guardrails/README.md#claude_code_review-claude-code-审核请求分流) 路由到单独配置的审核模型
-运行代码仅一个文件，不修改核心源码；未配置目标模型时保持原路处理，配置示例使用环境变量占位

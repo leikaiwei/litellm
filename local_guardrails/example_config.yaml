@@ -1,4 +1,12 @@
 model_list:
+  # Claude Code 审核请求的本地固定响应。不要配 api_base、api_key 或 fallback
+  - model_name: __claude_code_review_allow
+    litellm_params:
+      model: claude_code_review_allow/allow
+    model_info:
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+
   # 纯文本模型：挂 guardrail，带图请求会被改写成文本
   #
   # provider 必须写 custom_openai（或 anthropic），不要用 openai/ 前缀：
@@ -69,6 +77,11 @@ guardrails:
 
 litellm_settings:
   drop_params: true
+  callbacks:
+    - claude_code_review.callback
+  custom_provider_map:
+    - provider: claude_code_review_allow
+      custom_handler: claude_code_review.provider
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
