@@ -649,7 +649,11 @@ Rerank、音频转写和 evaluation，避免 Router 内部占位消息误触发�
 等于或超过上限的
 候选部署被排除；全部候选超限时返回 `ContextWindowExceededError`，保留已有
 `context_window_fallbacks`。例如希望在 100 万处拒绝，可把相应部署的
-`model_info.max_input_tokens` 设为 `1000000`，不需要改变供应商模型目录。本次没有修改生产阈值
+`model_info.max_input_tokens` 设为 `1000000`，不需要改变供应商模型目录
+
+2026-11-07 已在 patch.4 镜像配套 `0b852acb03f` 外部插件上启用。百万级输入上限封顶
+`1000000`，当前 DeepSeek V4.1 Flash 同源部署为 `970000`，保留其他已有较小上限。
+两个暂不使用的本地 LM Studio 模型保持原配置，未按未经核验的记忆值补写容量
 
 计数复用 LiteLLM 的 tokenizer、Anthropic system 提取和 Responses 输入转换，包含 system、
 instructions、工具定义和工具历史，不重命名工具，不修改用户消息。计数失败或全局计数关闭时，
@@ -833,3 +837,10 @@ LITELLM_LOCAL_MODEL_COST_MAP=True .venv/bin/python -m pytest local_guardrails/te
 模式优先级及快照、原生 Claude 与适配器的非流式和 SSE，以及开启响应缓存后的上游透传、指定模型、本地放行和恢复透传热切换。
 管理端点回归在 `tests/unit/proxy/test_proxy_server_endpoints_and_startup.py`。
 全部使用本地替身或禁网测试，未调用付费模型，也未验证真实 Claude Code 客户端与生产多 worker 切换
+
+生产部署记录，2026-11-07
+
+审核配置为 `client_only`、`hoperun`、固定通过 `false`，三个字段由数据库持有且可热更新。
+正式镜像在断网容器中通过审核分流、ACL、970000/1000000 两道准入检查，以及真实本地
+HTTP 超长输入和损坏图片拒绝测试。生产已读回配置、插件注册和健康状态，未发起付费模型
+请求，也未将配置验收视作真实 Claude Code 或多 worker 端到端验证

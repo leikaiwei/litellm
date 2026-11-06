@@ -4,7 +4,9 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 2026-11-06 发布范围调整，撤回 `27e276c5112` 和 `0d923ebc042` 的请求准入及错误路径补丁，保留 1.108.0 升级和此前旧补丁。`v1.108.0-fork.patch.1` 已含准入修改，`v1.108.0-fork.patch.2` 进一步包含错误路径修改，两者均不作为本次上线候选，也不移动既有标签
 
-不含这批修改的已发布镜像是 `leikaiwei/litellm:v1.108.0-fork`，发布 digest 为 `sha256:a677652db2903c8b637121e87b04a01721e236df9969e033865aba858bc0490a`。其核心运行逻辑与撤回后的版本一致，源码仅保留 Responses schema 参数的类型声明，并说明重试处理多种供应商异常所需的 BLE001 豁免，均不改变运行行为。外部 Claude Code 审核改动另存于 `f72874dd9cd`，不随该镜像启用。这里只记录源码回退及候选镜像，生产部署另行执行
+不含这批修改的已发布镜像是 `leikaiwei/litellm:v1.108.0-fork`，发布 digest 为 `sha256:a677652db2903c8b637121e87b04a01721e236df9969e033865aba858bc0490a`。其核心运行逻辑与撤回后的版本一致，源码仅保留 Responses schema 参数的类型声明，并说明重试处理多种供应商异常所需的 BLE001 豁免，均不改变运行行为。外部 Claude Code 审核改动另存于 `f72874dd9cd`，不随该镜像启用。此段记录当时的源码回退与候选镜像，当前部署见下文
+
+2026-11-07 已部署 `v1.108.0-fork.patch.4`，镜像固定为 `leikaiwei/litellm@sha256:2338a4f06e9a5e1a92e4934bf965ea4630ab7aa07ade5e2935a62850328421c0`。镜像源码为 `aad820d4d01`，外部只读挂载插件配套 `0b852acb03f`，后者补齐非聊天请求边界。生产启用 `client_only`，独立审核交给 `hoperun`，固定通过关闭。严格准入已启用，百万级输入上限封顶 `1000000`，当前 DeepSeek V4.1 Flash 同源部署为 `970000`，已有较小限额保持不变。审核三字段由数据库管理，可通过管理 API 热更新。备份和回滚入口已保留，只有主代理容器重启
 
 宿主机日志维护：[基础日志永久保存、正文保留90天](scripts/spend_log_body_retention.md)，独立于代理镜像运行，避免官方整行保留策略删除费用和token明细
 
@@ -17,7 +19,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 两种形态按协议区分，不按客户端版本推断。[Claude Code 官方说明](https://code.claude.com/docs/en/permission-modes#server-side-classifier-review) 明确新版也可能在服务端不支持审核时回退为独立请求。`client_only` 不额外发起服务端分类调用，实际是否回退取决于客户端及上游协议支持
 
-此补丁保留上游审核协议实现，升级时重点核对 `safeguards.py`、两个 Messages handler 和配置字段。相关回归覆盖管理 HTTP 热更新、权限预算、双协议、原生与桥接路由、SSE、缓存和优先级。当前只完成本地实现和模拟验证，未部署生产或执行付费模型验收
+此补丁保留上游审核协议实现，升级时重点核对 `safeguards.py`、两个 Messages handler 和配置字段。相关回归覆盖管理 HTTP 热更新、权限预算、双协议、原生与桥接路由、SSE、缓存和优先级。已随 patch.4 部署，完成断网测试及生产配置读回，未执行付费模型或真实 Claude Code 端到端验收
 
 **工具数组 token 计数兼容**：`litellm_core_utils/token_counter.py`
 - 回移上游 [PR #46180](https://github.com/BerriAI/litellm/pull/46180) 的最小修复，兼容工具数组未声明 `items`、布尔及旧版元组 schema，避免计数抛出 `KeyError` 或 `AttributeError`
@@ -27,16 +29,16 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 加密搜索结果不能仅按标题和 URL 当作完整正文，仍报告本地无法计数。未知块也不按零 token 放行。[#43371](https://github.com/BerriAI/litellm/pull/43371) 已关闭但未合并，其未知块转 JSON 方案未采用。[#47335](https://github.com/BerriAI/litellm/pull/47335) 的 `original` 图片算法仍在讨论，本次不把它当作精确计数回移。图片计数修复不替代图片有效性检查，模型 tokenizer 差异也仍存在
 
-本次在已有 `test_token_counter.py` 中验证摘要与签名分离、搜索结果嵌套计数、服务端工具的空和错误结果、加密内容不静默漏计、两协议 tool choice 等价及内嵌 auto 图片的无网络计数。升级上游时按这四个 PR 逐项核对，已有同义实现即移除回移部分。此段记录本地源码改动，不表示生产已部署
+本次在已有 `test_token_counter.py` 中验证摘要与签名分离、搜索结果嵌套计数、服务端工具的空和错误结果、加密内容不静默漏计、两协议 tool choice 等价及内嵌 auto 图片的无网络计数。升级上游时按这四个 PR 逐项核对，已有同义实现即移除回移部分。这些计数修复已随 patch.4 部署
 
-2026-11-07 发布验收发现 `patch.3` 镜像缺少 Pillow，尚未部署。该依赖此前仅属于 CI 组，现补入 `proxy-runtime` 并增加镜像内图片解码检查，避免开发环境依赖掩盖运行时缺失。`patch.3` 不作为本次上线候选，标签保持不变
+2026-11-07 发布验收发现 `patch.3` 镜像缺少 Pillow，因此未部署该镜像。该依赖此前仅属于 CI 组，现补入 `proxy-runtime` 并增加镜像内图片解码检查，避免开发环境依赖掩盖运行时缺失。`patch.3` 不作为本次上线候选，标签保持不变
 
 **请求上下文严格准入**：[request_admission callback](local_guardrails/README.md#request_admission-请求上下文准入)
 - 复用候选部署过滤与发送前 hook，不再修改 Router 核心。支持异步 Chat Completions、Messages、Responses，包含直接 deployment ID、fallback 与已有路由自动压缩后的复核。按部署或目录中的 mode 排除明确非 Chat 模型，避免 Router 为转写、重排生成的占位参数误触发准入，未知类型仍严格检查
 - 使用部署已有 `model_info.max_input_tokens`，例如设为 `1000000`，在估算值达到上限时拒绝。计数失败、计数关闭或部署无可用上限均不继续发送，损坏内嵌图片在本地返回字段路径，使用已有 tokenizer 和受限计数线程
 - 严格模式会拒绝无法本地核验的有效历史，包括服务端加密搜索结果和有状态 Responses 引用。它是可选运营策略，不改变上游默认兼容性。计数仍有模型与图片公式差异，阈值余量不能保证供应商绝不报超限。批量大图仍有 CPU 开销
 
-1.108 已含 [#44544](https://github.com/BerriAI/litellm/pull/44544)，上游有意在计数失败时继续其他筛选，并不保证阻止超长输入，因此把严格策略放到外部插件。system/tools 和 Responses 基础计数已有 [#39663](https://github.com/BerriAI/litellm/pull/39663)、[#33706](https://github.com/BerriAI/litellm/pull/33706)，本次复用现有转换。原始超长请求的离线复放可在本地拒绝，没有发出付费调用；生产阈值和插件启用状态未修改
+1.108 已含 [#44544](https://github.com/BerriAI/litellm/pull/44544)，上游有意在计数失败时继续其他筛选，并不保证阻止超长输入，因此把严格策略放到外部插件。system/tools 和 Responses 基础计数已有 [#39663](https://github.com/BerriAI/litellm/pull/39663)、[#33706](https://github.com/BerriAI/litellm/pull/33706)，本次复用现有转换。原始超长请求的离线复放可在本地拒绝，没有发出付费调用；生产已按上述限额启用。正式镜像的断网 HTTP 验收确认超长输入与损坏图片均在本地返回 400，生产只读取健康和配置，未发起付费测试
 
 历史工具名跨供应商不兼容暂不做全局重命名。[#47434](https://github.com/BerriAI/litellm/pull/47434) 和 [#42963](https://github.com/BerriAI/litellm/pull/42963) 分别涉及 guardrail 恢复和 Bedrock 长度，未确认覆盖此次同一问题。修改名称还需保证声明、调用和结果关联，以及不同目的供应商往返一致，不能用某一供应商的修复宣称通用兼容
 
