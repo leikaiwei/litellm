@@ -6,12 +6,14 @@ import math
 import struct
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from itertools import accumulate
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, cast
 
 import anyio
 import anyio.lowlevel
 import httpx
 import tiktoken
+from pydantic import TypeAdapter
 from typing_extensions import ParamSpec, TypeVar
 
 import litellm
@@ -35,6 +37,7 @@ from litellm.constants import (
     TOKEN_COUNTER_MAX_EXACT_CHARS,
 )
 from litellm.litellm_core_utils.asyncify import asyncify
+from litellm.litellm_core_utils.core_helpers import as_str_mapping
 from litellm.litellm_core_utils.tokenizer import HuggingFaceTokenizer, OpenAIEncoding
 
 if TYPE_CHECKING:
@@ -51,11 +54,12 @@ from litellm.types.llms.anthropic import (
     AnthropicMessagesTextParam,
     AnthropicMessagesToolResultParam,
     AnthropicMessagesToolUseParam,
+    AnthropicSearchResultParam,
+    CompactionBlock,
 )
 from litellm.types.llms.openai import (
     AllMessageValues,
     ChatCompletionDocumentObject,
-    ChatCompletionNamedToolChoiceParam,
     ChatCompletionRedactedThinkingBlock,
     ChatCompletionThinkingBlock,
     ChatCompletionToolParam,
@@ -257,6 +261,10 @@ def get_image_dimensions(
         _header, encoded = data.split(",", 1)
         img_data = base64.b64decode(encoded)
 
+    return _image_dimensions_from_bytes(img_data)
+
+
+def _image_dimensions_from_bytes(img_data: bytes) -> tuple[int, int]:
     img_type: Final = get_image_type(img_data)
 
     if img_type == "png":
@@ -303,8 +311,37 @@ def get_image_dimensions(
     return DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT
 
 
+def _auto_image_dimensions(data: str) -> tuple[int, int] | None:
+    """Read bounded inline image data without fetching caller-supplied URLs."""
+    if not data.startswith("data:image/"):
+        return None
+    max_bytes: Final = int(MAX_IMAGE_URL_DOWNLOAD_SIZE_MB * 1024 * 1024)
+    max_encoded_length: Final = 4 * ((max_bytes + 2) // 3)
+    # Bound allocations before splitting or decoding the data URL, including its header.
+    if max_bytes <= 0 or len(data) > max_encoded_length + 128:
+        return None
+    header, separator, encoded = data.partition(",")
+    if not separator or len(header) > 128 or not header.endswith(";base64") or len(encoded) > max_encoded_length:
+        return None
+    try:
+        image_data: Final = base64.b64decode(encoded, validate=True)
+        if len(image_data) > max_bytes or get_image_type(image_data) not in (
+            "png",
+            "gif",
+            "jpeg",
+            "webp",
+        ):
+            return None
+        width, height = _image_dimensions_from_bytes(image_data)
+    except (ValueError, TypeError, struct.error):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
 def calculate_img_tokens(
-    data,
+    data: str,
     mode: Literal["low", "high", "auto"] = "auto",
     base_tokens: int = 85,  # openai default - https://openai.com/pricing
     use_default_image_token_count: bool = False,
@@ -314,7 +351,8 @@ def calculate_img_tokens(
 
     Args:
         data (str): The URL or base64 encoded string of the image.
-        mode (Literal["low", "high", "auto"]): The mode to use for calculating the number of tokens.
+        mode (Literal["low", "high", "auto"]): Auto uses high-detail tiles for readable inline images;
+            URLs and unreadable images keep the base estimate without network I/O.
         base_tokens (int): The base number of tokens for an image.
         use_default_image_token_count (bool): When True, will NOT make a GET request to the image URL and instead return the default image dimensions.
 
@@ -324,18 +362,19 @@ def calculate_img_tokens(
     if use_default_image_token_count:
         verbose_logger.debug("Using default image token count: %s", DEFAULT_IMAGE_TOKEN_COUNT)
         return DEFAULT_IMAGE_TOKEN_COUNT
-    if mode == "low" or mode == "auto":
+    if mode == "low":
         return base_tokens
-    elif mode == "high":
-        # Run the async function using the helper
-        width, height = get_image_dimensions(
-            data=data,
-        )
-        resized_width, resized_height = resize_image_high_res(width=width, height=height)
-        tiles_needed_high_res = calculate_tiles_needed(resized_width=resized_width, resized_height=resized_height)
-        tile_tokens: Final = (base_tokens * 2) * tiles_needed_high_res
-        total_tokens: Final = base_tokens + tile_tokens
-        return total_tokens
+    if mode not in ("auto", "high"):
+        return None
+    dimensions: Final = _auto_image_dimensions(data) if mode == "auto" else get_image_dimensions(data=data)
+    if dimensions is None:
+        return base_tokens
+    width, height = dimensions
+    resized_width, resized_height = resize_image_high_res(width=width, height=height)
+    tiles_needed_high_res = calculate_tiles_needed(resized_width=resized_width, resized_height=resized_height)
+    tile_tokens: Final = (base_tokens * 2) * tiles_needed_high_res
+    total_tokens: Final = base_tokens + tile_tokens
+    return total_tokens
 
 
 TokenCounterFunction = Callable[[str], int]
@@ -413,7 +452,7 @@ def token_counter(
     messages: Sequence[AllMessageValues | Message] | None = None,
     count_response_tokens: bool | None = False,
     tools: list[ChatCompletionToolParam] | None = None,
-    tool_choice: ChatCompletionNamedToolChoiceParam | None = None,
+    tool_choice: str | Mapping[str, object] | None = None,
     use_default_image_token_count: bool | None = False,
     default_token_count: int | None = None,
 ) -> int:
@@ -573,6 +612,8 @@ def _count_messages(
                     use_default_image_token_count,
                     default_token_count,
                 )
+            elif key == "provider_specific_fields":
+                num_tokens += sum(map(params.count_function, _compaction_summaries(value)))
             elif key == "search_results" and isinstance(value, list):
                 from litellm.litellm_core_utils.prompt_templates.common_utils import (
                     extract_search_results_text,
@@ -587,10 +628,29 @@ def _count_messages(
     return num_tokens
 
 
+_OBJECT_LIST: Final = TypeAdapter(list[object])
+
+
+def _compaction_summaries(provider_specific_fields: object) -> tuple[str, ...]:
+    fields: Final = as_str_mapping(provider_specific_fields)
+    blocks: Final = fields.get("compaction_blocks") if fields is not None else None
+    block_fields: Final = (
+        tuple(map(as_str_mapping, _OBJECT_LIST.validate_python(blocks))) if isinstance(blocks, list) else ()
+    )
+    return tuple(
+        content
+        for block in block_fields
+        if block is not None
+        and block.get("type") == "compaction"
+        and isinstance(content := block.get("content"), str)
+        and content
+    )
+
+
 def _count_extra(
     count_function: TokenCounterFunction,
     tools: list[ChatCompletionToolParam] | None,
-    tool_choice: ChatCompletionNamedToolChoiceParam | None,
+    tool_choice: str | Mapping[str, object] | None,
     includes_system_message: bool,
 ) -> int:
     """Count extra tokens for function definitions and tool choices.
@@ -612,13 +672,19 @@ def _count_extra(
     # If tool_choice is 'none', add one token.
     # If it's an object, add 4 + the number of tokens in the function name.
     # If it's undefined or 'auto', don't add anything.
-    if tool_choice == "none":
-        num_tokens += 1
-    elif isinstance(tool_choice, dict):
-        num_tokens += 7
-        num_tokens += count_function(str(tool_choice["function"]["name"]))
+    num_tokens += _count_tool_choice(count_function, tool_choice)
 
     return num_tokens
+
+
+def _count_tool_choice(count_function: TokenCounterFunction, tool_choice: str | Mapping[str, object] | None) -> int:
+    match tool_choice:
+        case "none" | {"type": "none"}:
+            return 1
+        case {"function": {"name": str() as name}} | {"name": str() as name}:
+            return 7 + count_function(name)
+        case _:
+            return 0
 
 
 def _get_extrapolating_count_function(
@@ -783,6 +849,9 @@ def _validate_anthropic_content(content: Mapping[str, object]) -> type:
     mapping: Final = {
         "tool_use": AnthropicMessagesToolUseParam,
         "tool_result": AnthropicMessagesToolResultParam,
+        "server_tool_use": AnthropicMessagesToolUseParam,
+        "web_search_tool_result": AnthropicMessagesToolResultParam,
+        "search_result": AnthropicSearchResultParam,
     }
 
     expected_cls: Final = mapping.get(content_type) if isinstance(content_type, str) else None
@@ -942,6 +1011,11 @@ def _count_anthropic_content(
     return tokens
 
 
+_TEXT_FIELD_BY_BLOCK_TYPE: Final = MappingProxyType(
+    {"text": "text", "thinking": "thinking", "redacted_thinking": "thinking", "compaction": "content"}
+)
+
+
 def _count_content_list(
     count_function: TokenCounterFunction,
     content_list: str
@@ -952,6 +1026,8 @@ def _count_content_list(
         | AnthropicMessagesTextParam
         | AnthropicMessagesImageParam
         | AnthropicMessagesDocumentParam
+        | AnthropicSearchResultParam
+        | CompactionBlock
     ],
     use_default_image_token_count: bool,
     default_token_count: int | None,
@@ -962,8 +1038,10 @@ def _count_content_list(
         for c in content_list:
             if isinstance(c, str):
                 num_tokens += count_function(c)
-            elif c["type"] == "text":
-                num_tokens += count_function(str(c.get("text", "")))
+            elif c["type"] in _TEXT_FIELD_BY_BLOCK_TYPE:
+                block_text = str(c.get(_TEXT_FIELD_BY_BLOCK_TYPE[c["type"]]) or "")
+                if block_text:
+                    num_tokens += count_function(block_text)
             elif c["type"] == "image_url":
                 image_url = c.get("image_url")
                 num_tokens += _count_image_tokens(image_url, use_default_image_token_count)
@@ -986,19 +1064,13 @@ def _count_content_list(
                     count_function,
                     use_default_image_token_count,
                 )
-            elif c["type"] in ("tool_use", "tool_result"):
+            elif c["type"] in ("tool_use", "tool_result", "server_tool_use", "web_search_tool_result", "search_result"):
                 num_tokens += _count_anthropic_content(
                     c,
                     count_function,
                     use_default_image_token_count,
                     default_token_count,
                 )
-            elif c["type"] in ("thinking", "redacted_thinking"):
-                # Claude extended thinking content block
-                # Count the thinking text and skip the opaque blobs (signature, redacted data)
-                thinking_text = str(c.get("thinking", ""))
-                if thinking_text:
-                    num_tokens += count_function(thinking_text)
             elif c["type"] == "tool_reference":
                 # Anthropic tool-search reference block: a lightweight pointer to
                 # a deferred tool, e.g. {"type": "tool_reference", "tool_name": ...}.
@@ -1016,7 +1088,7 @@ def _count_content_list(
                     f"Invalid content item type: {content_type}. "
                     f"Expected str or dict with 'type' field "
                     f"(text, image_url, image, document, file, tool_use, tool_result, thinking, redacted_thinking, "
-                    f"tool_reference)."
+                    f"compaction, server_tool_use, web_search_tool_result, search_result, tool_reference)."
                 )
         return num_tokens
     except Exception as e:

@@ -30,6 +30,7 @@ import litellm.constants
 from litellm.constants import TOKEN_COUNTER_MAX_CONCURRENT_COUNTS
 from litellm.litellm_core_utils.asyncify import asyncify
 from litellm.litellm_core_utils.token_counter import (
+    _count_content_list,
     _encoding_count,
     _get_exact_count_function,
     _get_extrapolating_count_function,
@@ -50,6 +51,142 @@ from tests.unit.litellm_core_utils.messages_with_counts import (
     MESSAGES_WITH_IMAGES,
     MESSAGES_WITH_TOOLS,
 )
+
+
+@pytest.mark.parametrize("summary", ("Earlier task summary", "", None))
+def test_compaction_counts_summary_without_signature_in_both_message_shapes(summary: str | None) -> None:
+    from litellm.types.llms.anthropic import CompactionBlock
+
+    block: Final[CompactionBlock] = {"type": "compaction", "content": summary, "signature": "opaque" * 100}
+    assert _count_content_list(len, [block], True, None) == len(summary or "")
+    chat_message: Final = {
+        "role": "assistant",
+        "content": "",
+        "provider_specific_fields": {"compaction_blocks": [block]},
+    }
+    text_message: Final = {"role": "assistant", "content": summary or ""}
+    assert token_counter_new(model="token-count-fixture", messages=[chat_message]) == token_counter_new(
+        model="token-count-fixture", messages=[text_message]
+    )
+
+
+def test_search_result_counts_metadata_and_nested_text_in_tool_history() -> None:
+    from litellm.types.llms.anthropic import AnthropicMessagesToolResultParam, AnthropicSearchResultParam
+
+    result: Final[AnthropicSearchResultParam] = {
+        "type": "search_result",
+        "source": "https://example.test/source",
+        "title": "Reference",
+        "content": [{"type": "text", "text": "Substantial search result " * 20}],
+    }
+    tool_result: Final[AnthropicMessagesToolResultParam] = {
+        "type": "tool_result",
+        "tool_use_id": "call_search",
+        "content": [result],
+    }
+    expected: Final = len(result["source"]) + len(result["title"]) + len("Substantial search result " * 20)
+    assert _count_content_list(len, [result], True, None) == expected
+    assert _count_content_list(len, [tool_result], True, None) == expected
+
+
+def test_server_search_history_counts_call_and_empty_or_error_results_without_modification() -> None:
+    from anthropic.types import ServerToolUseBlockParam, WebSearchToolResultBlockParam
+
+    call: Final[ServerToolUseBlockParam] = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_test",
+        "name": "web_search",
+        "input": {"query": "example"},
+    }
+    empty: Final[WebSearchToolResultBlockParam] = {
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_test",
+        "content": [],
+    }
+    error: Final[WebSearchToolResultBlockParam] = {
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_test",
+        "content": {"type": "web_search_tool_result_error", "error_code": "unavailable"},
+    }
+    before: Final = json.dumps([call, empty, error], sort_keys=True)
+    expected: Final = len(call["name"]) + len(str(call["input"]))
+    assert _count_content_list(len, [call, empty], True, None) == expected
+    assert _count_content_list(len, [call, error], True, None) > expected
+    assert json.dumps([call, empty, error], sort_keys=True) == before
+
+
+def test_encrypted_search_payload_is_not_silently_counted_as_metadata_only() -> None:
+    from anthropic.types import WebSearchToolResultBlockParam
+
+    result: Final[WebSearchToolResultBlockParam] = {
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_test",
+        "content": [
+            {
+                "type": "web_search_result",
+                "url": "https://example.test",
+                "title": "Result",
+                "encrypted_content": "opaque",
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="web_search_result"):
+        _count_content_list(len, [result], True, None)
+
+
+@pytest.mark.parametrize(
+    "choice", ({"type": "auto"}, {"type": "any"}, {"type": "tool", "name": "lookup"}, {"type": "none"})
+)
+def test_anthropic_tool_choice_counts_like_equivalent_openai_choice(choice: dict[str, str]) -> None:
+    equivalent: Final = {"function": {"name": choice["name"]}} if "name" in choice else choice["type"]
+    messages: Final = [{"role": "user", "content": "Use a tool"}]
+    assert token_counter_new(model="token-count-fixture", messages=messages, tool_choice=choice) == token_counter_new(
+        model="token-count-fixture", messages=messages, tool_choice=equivalent
+    )
+
+
+def test_inline_auto_image_counts_tiles_without_fetching_a_url() -> None:
+    from unittest.mock import patch
+
+    png_header: Final = b"\x89PNG\r\n\x1a\n" + bytes(8) + (1024).to_bytes(4, "big") * 2
+    data_url: Final = "data:image/png;base64," + base64.b64encode(png_header).decode()
+    with patch("litellm.litellm_core_utils.token_counter.safe_get", side_effect=AssertionError("network forbidden")):
+        inline: Final = calculate_img_tokens(data_url, mode="auto")
+        assert inline == calculate_img_tokens(data_url, mode="high")
+        assert inline > calculate_img_tokens(data_url, mode="low")
+        assert calculate_img_tokens("https://example.test/image.png", mode="auto") == calculate_img_tokens(
+            data_url, mode="low"
+        )
+
+
+def test_server_tool_counting_works_without_optional_anthropic_sdk() -> None:
+    script: Final = """
+import importlib.abc
+import sys
+class NoAnthropic(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == 'anthropic' or fullname.startswith('anthropic.'):
+            raise ModuleNotFoundError(fullname)
+sys.meta_path.insert(0, NoAnthropic())
+import litellm
+assert litellm.__file__ == sys.argv[1], (litellm.__file__, sys.argv[1])
+count = litellm.token_counter(model='token-count-fixture', messages=[{
+    'role': 'assistant',
+    'content': [{'type': 'server_tool_use', 'id': 'srv_1', 'name': 'web_search', 'input': {'query': 'example'}}]
+}])
+assert count > 0
+print('counted')
+"""
+    result: Final = subprocess.run(
+        [sys.executable, "-I", "-c", script, litellm.__file__],
+        env={**os.environ, "LITELLM_LOCAL_MODEL_COST_MAP": "True"},
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "counted"
 
 
 def token_counter_both_assert_same(**args):

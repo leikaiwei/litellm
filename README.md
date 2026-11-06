@@ -16,6 +16,12 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 - 回移上游 [PR #46180](https://github.com/BerriAI/litellm/pull/46180) 的最小修复，兼容工具数组未声明 `items`、布尔及旧版元组 schema，避免计数抛出 `KeyError` 或 `AttributeError`
 - 仅修复计数异常，不改变上下文阈值、计数失败策略或路由规则，本地 token 计数仍是估算
 
+2026-11-07 补充合法历史计数兼容，局部回移已合并的 [#44784](https://github.com/BerriAI/litellm/pull/44784) 压缩摘要、[#48699](https://github.com/BerriAI/litellm/pull/48699) 搜索结果、[#48624](https://github.com/BerriAI/litellm/pull/48624) Anthropic 工具选择和 [#48526](https://github.com/BerriAI/litellm/pull/48526) 内嵌 auto 图片尺寸计数。只取 tokenizer 及必要类型，不回移这些 PR 的其他端点或路由变更。另按 Anthropic SDK 的格式核对后，复用已有 tool use/result 字段计数 `server_tool_use` 及空或错误的 `web_search_tool_result`，不改变原始请求，也不为基础安装新增 Anthropic SDK 依赖
+
+加密搜索结果不能仅按标题和 URL 当作完整正文，仍报告本地无法计数。未知块也不按零 token 放行。[#43371](https://github.com/BerriAI/litellm/pull/43371) 已关闭但未合并，其未知块转 JSON 方案未采用。[#47335](https://github.com/BerriAI/litellm/pull/47335) 的 `original` 图片算法仍在讨论，本次不把它当作精确计数回移。图片计数修复不替代图片有效性检查，模型 tokenizer 差异也仍存在
+
+本次在已有 `test_token_counter.py` 中验证摘要与签名分离、搜索结果嵌套计数、服务端工具的空和错误结果、加密内容不静默漏计、两协议 tool choice 等价及内嵌 auto 图片的无网络计数。升级上游时按这四个 PR 逐项核对，已有同义实现即移除回移部分。此段记录本地源码改动，不表示生产已部署
+
 **PostgreSQL 空字节修复** — `proxy/utils.py`
 - 清洗 spend logs 中的 `\x00` 空字节，避免 PostgreSQL jsonb 写入失败（22P05）
 
