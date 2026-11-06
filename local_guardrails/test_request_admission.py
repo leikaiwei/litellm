@@ -4,6 +4,7 @@ import json
 from collections.abc import Iterator, Mapping
 from io import BytesIO
 from typing import Final, cast
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from PIL import Image
@@ -335,6 +336,72 @@ async def test_selected_deployment_path_checks_limits_and_skips_unrelated_calls(
         await _HOOK.async_pre_call_deployment_hook(request, CallTypes.acompletion)
     assert await _HOOK.async_pre_call_deployment_hook(request, CallTypes.aembedding) is None
     assert await _HOOK.async_filter_deployments("group", [_deployment(100)], None, {"query": "embedding"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "mode"),
+    (
+        ("aembedding", "embedding"),
+        ("aembedding_batch", "embedding"),
+        ("arerank", "rerank"),
+        ("arerank", "evaluation"),
+        ("atranscription", "audio_transcription"),
+        ("atranscription", "catalog"),
+    ),
+)
+async def test_real_router_non_chat_calls_skip_chat_admission(
+    operation: str, mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(litellm, "callbacks", [_HOOK])
+    backend: Final = AsyncMock(return_value={"proof": "backend reached"})
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "nonchat",
+                "litellm_params": {
+                    "model": "openai/whisper-1" if mode == "catalog" else "openai/noncatalog-nonchat",
+                    "api_key": "mock-only",
+                },
+                "model_info": {} if mode == "catalog" else {"mode": mode},
+            }
+        ],
+        num_retries=0,
+        enable_pre_call_checks=True,
+    )
+    target: Final = "aembedding" if operation == "aembedding_batch" else operation
+    try:
+        with patch.object(litellm, target, backend):
+            if target == "aembedding":
+                await router.aembedding(  # pyright: ignore[reportUnknownMemberType]  # 旧参数未标注
+                    model="nonchat", input=["hello", "world"] if operation == "aembedding_batch" else "hello"
+                )
+            elif target == "arerank":
+                await router.arerank(  # pyright: ignore[reportUnknownMemberType]  # 旧参数未标注
+                    model="nonchat", query="hello", documents=["world"]
+                )
+            else:
+                await router.atranscription(  # pyright: ignore[reportUnknownMemberType]  # 旧参数未标注
+                    model="nonchat", file=BytesIO(b"RIFFmock")
+                )
+        assert backend.await_count == 1
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+async def test_client_mode_cannot_bypass_chat_admission() -> None:
+    with pytest.raises(litellm.ContextWindowExceededError):
+        await _filter(_messages("long history " * 100), limit=20, mode="embedding", model_info={"mode": "embedding"})
+    with pytest.raises(litellm.ContextWindowExceededError):
+        await _HOOK.async_pre_call_deployment_hook(
+            {
+                "model": _MODEL,
+                "messages": _messages("long history " * 100),
+                "model_info": {"mode": "embedding", "max_input_tokens": 20},
+            },
+            CallTypes.acompletion,
+        )
 
 
 class RecordingProvider(CustomLLM):

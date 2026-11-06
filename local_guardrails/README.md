@@ -638,6 +638,11 @@ chunk 的用量提上来（`utils.py:2143`），有它就说明字节已经出�
 fallback。注册后对 Chat Completions、Anthropic Messages 和 Responses 生效，不依赖客户端
 请求的模型名称。同步 SDK、批处理上传、Embedding 和文件上传不属于这条检测路径
 
+候选筛选根据部署自身 `model_info.mode` 或模型目录排除明确的非 Chat 类型，包括 Embedding、
+Rerank、音频转写和 evaluation，避免 Router 内部占位消息误触发检查。自定义非 Chat 部署应
+明确配置 mode；未知 mode 仍严格检查。客户端请求中的 mode 不作为豁免依据，最终部署检查
+继续按实际调用类型执行
+
 输入上限优先使用部署已有 `model_info.max_input_tokens`，未声明时查现有模型目录。没有可解析
 正数上限的自定义模型被排除，所有候选都缺上限时返回配置错误，首次启用前应补齐该字段。
 唯一例外是内部固定响应 provider `claude_code_review_allow/allow`，不按价格为零豁免普通模型。

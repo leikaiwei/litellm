@@ -32,6 +32,25 @@ _OBJECT: Final = TypeAdapter(dict[str, object])
 _ITEMS: Final = TypeAdapter(tuple[object, ...])
 _MESSAGES: Final = TypeAdapter(tuple[dict[str, object], ...])
 _TOOL_CHOICE: Final = TypeAdapter[str | dict[str, object] | None](str | dict[str, object] | None)
+_NON_CHAT_MODES: Final = frozenset(
+    (
+        "embedding",
+        "rerank",
+        "audio_transcription",
+        "audio_speech",
+        "evaluation",
+        "image_edit",
+        "image_generation",
+        "moderation",
+        "realtime",
+        "search",
+        "vector_store",
+        "video_generation",
+        "extraction",
+        "guardrail",
+        "ocr",
+    )
+)
 _CALLS: Final = frozenset(
     (
         CallTypes.completion,
@@ -61,6 +80,21 @@ class Candidate:
 
 def _mapping(value: object) -> dict[str, object]:
     return _OBJECT.validate_python(value) if isinstance(value, Mapping) else {}
+
+
+def _is_non_chat(deployment: Mapping[str, object]) -> bool:
+    info: Final = _mapping(deployment.get("model_info"))
+    mode: Final = info.get("mode")
+    if isinstance(mode, str):
+        return mode in _NON_CHAT_MODES
+    params: Final = _mapping(deployment.get("litellm_params"))
+    model: Final = info.get("base_model") or params.get("base_model") or params.get("model")
+    if not isinstance(model, str):
+        return False
+    try:
+        return litellm.get_model_info(model=model).get("mode") in _NON_CHAT_MODES
+    except Exception:  # noqa: BLE001  # 未知目录模型保持严格检查
+        return False
 
 
 def _candidate(deployment: dict[str, object]) -> Candidate:
@@ -314,8 +348,12 @@ class RequestAdmission(CustomLogger):
         data: Final = {**(request_kwargs or {}), **({"messages": messages} if messages is not None else {})}
         if "messages" not in data and "input" not in data:
             return healthy_deployments
-        candidates: Final = tuple(_candidate(deployment) for deployment in healthy_deployments)
-        return await offload_token_count(_admit)(data, candidates, model, compaction_pending(data))
+        checked: Final = tuple(deployment for deployment in healthy_deployments if not _is_non_chat(deployment))
+        if not checked:
+            return healthy_deployments
+        candidates: Final = tuple(_candidate(deployment) for deployment in checked)
+        admitted: Final = await offload_token_count(_admit)(data, candidates, model, compaction_pending(data))
+        return [deployment for deployment in healthy_deployments if deployment not in checked or deployment in admitted]
 
     async def async_pre_call_deployment_hook(
         self, kwargs: dict[str, object], call_type: CallTypes | None

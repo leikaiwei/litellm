@@ -32,7 +32,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 2026-11-07 发布验收发现 `patch.3` 镜像缺少 Pillow，尚未部署。该依赖此前仅属于 CI 组，现补入 `proxy-runtime` 并增加镜像内图片解码检查，避免开发环境依赖掩盖运行时缺失。`patch.3` 不作为本次上线候选，标签保持不变
 
 **请求上下文严格准入**：[request_admission callback](local_guardrails/README.md#request_admission-请求上下文准入)
-- 复用候选部署过滤与发送前 hook，不再修改 Router 核心。支持异步 Chat Completions、Messages、Responses，包含直接 deployment ID、fallback 与已有路由自动压缩后的复核
+- 复用候选部署过滤与发送前 hook，不再修改 Router 核心。支持异步 Chat Completions、Messages、Responses，包含直接 deployment ID、fallback 与已有路由自动压缩后的复核。按部署或目录中的 mode 排除明确非 Chat 模型，避免 Router 为转写、重排生成的占位参数误触发准入，未知类型仍严格检查
 - 使用部署已有 `model_info.max_input_tokens`，例如设为 `1000000`，在估算值达到上限时拒绝。计数失败、计数关闭或部署无可用上限均不继续发送，损坏内嵌图片在本地返回字段路径，使用已有 tokenizer 和受限计数线程
 - 严格模式会拒绝无法本地核验的有效历史，包括服务端加密搜索结果和有状态 Responses 引用。它是可选运营策略，不改变上游默认兼容性。计数仍有模型与图片公式差异，阈值余量不能保证供应商绝不报超限。批量大图仍有 CPU 开销
 
