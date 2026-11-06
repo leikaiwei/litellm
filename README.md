@@ -29,6 +29,8 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 本次在已有 `test_token_counter.py` 中验证摘要与签名分离、搜索结果嵌套计数、服务端工具的空和错误结果、加密内容不静默漏计、两协议 tool choice 等价及内嵌 auto 图片的无网络计数。升级上游时按这四个 PR 逐项核对，已有同义实现即移除回移部分。此段记录本地源码改动，不表示生产已部署
 
+2026-11-07 发布验收发现 `patch.3` 镜像缺少 Pillow，尚未部署。该依赖此前仅属于 CI 组，现补入 `proxy-runtime` 并增加镜像内图片解码检查，避免开发环境依赖掩盖运行时缺失。`patch.3` 不作为本次上线候选，标签保持不变
+
 **请求上下文严格准入**：[request_admission callback](local_guardrails/README.md#request_admission-请求上下文准入)
 - 复用候选部署过滤与发送前 hook，不再修改 Router 核心。支持异步 Chat Completions、Messages、Responses，包含直接 deployment ID、fallback 与已有路由自动压缩后的复核
 - 使用部署已有 `model_info.max_input_tokens`，例如设为 `1000000`，在估算值达到上限时拒绝。计数失败、计数关闭或部署无可用上限均不继续发送，损坏内嵌图片在本地返回字段路径，使用已有 tokenizer 和受限计数线程

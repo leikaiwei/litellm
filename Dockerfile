@@ -182,5 +182,7 @@ RUN find /app/.venv -type f -path "*/tornado/test/*" -delete && \
 
 EXPOSE 4000/tcp
 
+RUN python -c "from io import BytesIO; from PIL import Image; b = BytesIO(); Image.new('RGB', (1, 1)).save(b, 'PNG'); b.seek(0); Image.open(b).verify()"
+
 ENTRYPOINT ["docker/prod_entrypoint.sh"]
 CMD ["--port", "4000"]
