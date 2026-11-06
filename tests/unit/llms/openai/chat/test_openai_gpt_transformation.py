@@ -1793,3 +1793,52 @@ class TestToolSchemaCombinatorFlatteningForOpenAI:
         )
 
         assert request["tools"][0] is tool
+
+
+def test_chat_normalizes_integer_tool_constraints_before_sending() -> None:
+    schema: Final = {"type": "object", "properties": {"files": {"type": "array", "minItems": 1.0}}}
+    request: Final = OpenAIGPTConfig().transform_request(
+        model="gpt-6.1-sol",
+        messages=[{"role": "user", "content": "hi"}],
+        optional_params={"tools": [{"type": "function", "function": {"name": "upload_file", "parameters": schema}}]},
+        litellm_params={"custom_llm_provider": "openai", "api_base": "http://localhost:8000/v1"},
+        headers={},
+    )
+    assert type(request["tools"][0]["function"]["parameters"]["properties"]["files"]["minItems"]) is int
+    assert type(schema["properties"]["files"]["minItems"]) is float
+
+
+@pytest.mark.parametrize("name", ["mcp__absorb_initial__ agent_explore", "tool/name", "", "name\n"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_chat_rejects_invalid_historical_function_name(name: str, legacy: bool) -> None:
+    from litellm.exceptions import LocalRequestValidationError
+
+    function: Final = {"name": name, "arguments": "{}"}
+    message: Final = {"role": "assistant", **(
+        {"function_call": function} if legacy else {"tool_calls": [{"type": "function", "id": "call_1", "function": function}]}
+    )}
+    with pytest.raises(LocalRequestValidationError) as error:
+        OpenAIGPTConfig().transform_request(
+            model="gpt-6.1-sol", messages=[message], optional_params={},
+            litellm_params={"custom_llm_provider": "openai", "api_base": "https://upstream.test/v1"}, headers={},
+        )
+    assert error.value.status_code == 400
+    assert error.value.param == (
+        "messages[0].function_call.name" if legacy else "messages[0].tool_calls[0].function.name"
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_async_rejects_invalid_historical_function_name() -> None:
+    from litellm.exceptions import LocalRequestValidationError
+
+    with pytest.raises(LocalRequestValidationError) as error:
+        await OpenAIGPTConfig().async_transform_request(
+            model="gpt-6.1-sol",
+            messages=[{"role": "assistant", "tool_calls": [{
+                "type": "function", "id": "call_1", "function": {"name": "bad name", "arguments": "{}"},
+            }]}],
+            optional_params={}, litellm_params={"custom_llm_provider": "openai"}, headers={},
+        )
+    assert error.value.status_code == 400
+    assert error.value.param == "messages[0].tool_calls[0].function.name"

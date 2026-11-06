@@ -21,6 +21,20 @@ This guide provides instructions for building and running the LiteLLM applicatio
 
 补发已有版本时，在 Actions 中选择主分支上的工作流并填写原始发布标签，避免使用旧标签内的工作流。镜像发布成功后再执行服务器升级，工作流不会自动部署生产
 
+### 请求准入补丁 v1.108.0-fork.patch.1
+
+2026-11-06 的补丁保留客户端协议与模型路由。Claude Code 可以继续使用 `/v1/messages` 调用配置为 OpenAI provider 的模型，LiteLLM 负责协议转换
+
+启用 `enable_pre_call_checks` 且部署有输入上限时，计数异常会明确返回本地 400，不再放行。内嵌 PNG/JPEG/WebP/GIF 会校验文件结构和像素解码，损坏图片返回具体字段路径，不下载远端图片 URL。上述校验在计数工作线程执行。本地确定性校验失败不重试，也不通过 fallback 绕过
+
+工具 JSON Schema 的整数约束（例如 `minItems: 1.0`）规范成整数 `1`，只遍历 schema 节点，不修改 `default`、`examples`、`const` 或真实小数。GPT Chat/Responses 的非法历史工具名称在发往上游前返回 400，保留错误字段路径，不擅自改名而破坏调用与结果的对应关系
+
+部署设置需要单独保留。Gemini 各部署及完整可达 fallback 链使用不超过 `model_info.max_input_tokens: 1000000` 的限制，其他模型保留各自更小的输入限制。动态路由无法解析实际窗口时，100 万只作为网关绝对上限，仍可能先触及供应商更小的窗口。仅对不支持 Responses `metadata` 的兼容上游设置 `additional_drop_params: [metadata]`，不应全局删除 Anthropic `metadata.user_id` 或本地日志 metadata
+
+本地 token 数仍是估算，100 万是保守准入阈值，不保证与供应商计数完全一致。补丁不会增加供应商容量或账号配额，也不能修复远端 URL 指向的图片。服务端真正的上下文压缩仍先压缩、再验证
+
+发布前回归覆盖三入口（Chat Completions、Anthropic Messages、Responses）的超限与坏图，以及 Claude Code 到 GPT 的格式转换。通过本地受控上游验证拒绝请求的上游调用次数为零，再发布新标签。生产部署使用新标签或其 digest，保留旧镜像与数据库配置备份用于回滚
+
 ## Prerequisites
 
 - Docker

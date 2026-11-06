@@ -59,7 +59,7 @@ from litellm.types.utils import (
 )
 from litellm.utils import convert_to_model_response_object
 
-from ..common_utils import OpenAIError
+from ..common_utils import OpenAIError, validate_chat_function_names
 from ..workload_identity import get_workload_identity_bearer_token, resolve_openai_workload_identity_config
 
 if TYPE_CHECKING:
@@ -482,6 +482,8 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
         from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
 
         custom_llm_provider: Final = _litellm_params_str(litellm_params, "custom_llm_provider")
+        if custom_llm_provider in {"openai", "azure"}:
+            validate_chat_function_names(model, messages)
         api_base: Final = _litellm_params_str(litellm_params, "api_base")
         reads_breakpoints: Final = AnthropicCacheControlHook.targets_openai_prompt_cache_breakpoint(
             model, custom_llm_provider, api_base, prompt_cache_options
