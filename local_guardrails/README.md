@@ -631,6 +631,78 @@ chunk 的用量提上来（`utils.py:2143`），有它就说明字节已经出�
 变异测试里它存活，说明没有测试能杀掉它，删掉了。
 
 
+## request_admission 请求上下文准入
+
+`request_admission.py` 使用现有 `CustomLogger` 扩展点，不修改 Router 源码。它在异步候选部署
+筛选时检查输入长度，并在选定部署、向上游发送之前再次检查，覆盖直接指定 deployment ID 和
+fallback。注册后对 Chat Completions、Anthropic Messages 和 Responses 生效，不依赖客户端
+请求的模型名称。同步 SDK、批处理上传、Embedding 和文件上传不属于这条检测路径
+
+输入上限优先使用部署已有 `model_info.max_input_tokens`，未声明时查现有模型目录。没有可解析
+正数上限的自定义模型被排除，所有候选都缺上限时返回配置错误，首次启用前应补齐该字段。
+唯一例外是内部固定响应 provider `claude_code_review_allow/allow`，不按价格为零豁免普通模型。
+等于或超过上限的
+候选部署被排除；全部候选超限时返回 `ContextWindowExceededError`，保留已有
+`context_window_fallbacks`。例如希望在 100 万处拒绝，可把相应部署的
+`model_info.max_input_tokens` 设为 `1000000`，不需要改变供应商模型目录。本次没有修改生产阈值
+
+计数复用 LiteLLM 的 tokenizer、Anthropic system 提取和 Responses 输入转换，包含 system、
+instructions、工具定义和工具历史，不重命名工具，不修改用户消息。计数失败或全局计数关闭时，
+返回明确的本地无法核验提示，建议 `/compact` 或开启新会话，不再把未知长度的请求继续发给
+上游。服务端搜索的加密结果等有效但不可本地计数的历史，也可能被此严格策略拒绝，不能把它
+解释成用户请求格式非法
+
+内嵌图片在受限后台线程里复用 Pillow 校验结构和压缩像素。解码前按现有
+`MAX_IMAGE_URL_DOWNLOAD_SIZE_MB` 限制分配，解码后遵守 Pillow 像素上限。返回错误时包含
+字段路径，不包含图片或请求正文。需要现有 `proxy` extra 中的 Pillow，不向 SDK 核心依赖新增
+包，也不在请求时下载远端图片
+
+图片大小和像素限制按单张应用，不是整条请求的累计图片预算。大量图片仍会增加解码 CPU 成本，
+候选筛选和最终部署校验都会执行；线程池只限制并发，不消除总处理时间
+
+计数副本中的远端图片使用已有 high-detail tile 上界估算，实际请求和 detail 参数保持原样；
+本地图片继续使用已有尺寸计数。这仍是估算，不是所有供应商的精确视觉 token 公式。
+Responses 的 `previous_response_id`、`conversation`、`item_reference`、加密推理历史，以及
+共享转换器无法读取的输入项会返回无法核验提示，要求完整可读历史或无状态新会话。启用前必须
+确认客户端能接受这项有状态 Responses 限制；不会把这些有效协议项称为非法格式。工具参数中
+同名普通 JSON 字段不受此限制。远端文件等供应商持有的内容仍无法仅靠当前请求完整还原。
+模型 tokenizer 不一致、后端模板及供应商额外注入也可能造成计数误差，
+保守输入上限只能留出余量，不能证明上游绝不会报超限
+
+已有复杂路由自动压缩处于 pending 时，候选筛选只校验图片，把长度复核留给压缩完成后的
+deployment hook。该路径有真实 Router 离线回归，不会新增自动压缩调用。Messages 的客户端
+`context_management` 等其他压缩机制可能发生在更晚的 provider 转换阶段，这类请求仍按当前
+完整输入严格检查，必要时先由客户端压缩。单字段超大文本是否抽样沿用
+`TOKEN_COUNTER_MAX_EXACT_CHARS`，没有添加固定倍率或独立 tokenizer
+
+tokenizer 首次加载遵循 LiteLLM 既有配置。若部署要求禁止 Hugging Face 下载，可使用
+`litellm_settings.disable_hf_tokenizer_download: true`，但这会让相关模型回落到通用 tokenizer，
+需要接受估算精度变化。本插件不临时改动进程级 tokenizer 开关，也不发起付费计数或生成请求
+
+### 注册
+
+将文件放到配置同目录，或只读挂载到 `/app/request_admission.py`，合并进已有 callbacks
+
+```yaml
+litellm_settings:
+  callbacks:
+    - request_admission.callback
+```
+
+首次注册和移除需要重新加载服务配置。模型输入限额仍走已有模型管理配置，不需要改插件。
+该插件不会随镜像构建自动启用。多模型候选只对不同 tokenizer 模型分别计数，最终发出前还会
+复核实际部署，因此对大请求有额外 CPU 开销，使用 LiteLLM 既有计数线程并发限制控制负载
+
+### 验证
+
+```bash
+LITELLM_LOCAL_MODEL_COST_MAP=True .venv/bin/python -m pytest local_guardrails/test_request_admission.py -q
+```
+
+测试禁止 TCP，覆盖三协议图片、上下文边界、system/tools 计数、合法服务端工具历史、计数失败、
+模型候选过滤、直接 deployment ID、上下文 fallback，以及已有自动压缩后发送的真实 Router
+流程。模拟 provider 验证被拒请求没有到达后端，不代表真实供应商精确计数已经通过验收
+
 ## claude_code_review: Claude Code 两种审核模式
 
 `claude_code_review.py` 提供全局 `pre_call` callback 和本地固定响应 provider。

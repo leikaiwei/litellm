@@ -29,6 +29,15 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 本次在已有 `test_token_counter.py` 中验证摘要与签名分离、搜索结果嵌套计数、服务端工具的空和错误结果、加密内容不静默漏计、两协议 tool choice 等价及内嵌 auto 图片的无网络计数。升级上游时按这四个 PR 逐项核对，已有同义实现即移除回移部分。此段记录本地源码改动，不表示生产已部署
 
+**请求上下文严格准入**：[request_admission callback](local_guardrails/README.md#request_admission-请求上下文准入)
+- 复用候选部署过滤与发送前 hook，不再修改 Router 核心。支持异步 Chat Completions、Messages、Responses，包含直接 deployment ID、fallback 与已有路由自动压缩后的复核
+- 使用部署已有 `model_info.max_input_tokens`，例如设为 `1000000`，在估算值达到上限时拒绝。计数失败、计数关闭或部署无可用上限均不继续发送，损坏内嵌图片在本地返回字段路径，使用已有 tokenizer 和受限计数线程
+- 严格模式会拒绝无法本地核验的有效历史，包括服务端加密搜索结果和有状态 Responses 引用。它是可选运营策略，不改变上游默认兼容性。计数仍有模型与图片公式差异，阈值余量不能保证供应商绝不报超限。批量大图仍有 CPU 开销
+
+1.108 已含 [#44544](https://github.com/BerriAI/litellm/pull/44544)，上游有意在计数失败时继续其他筛选，并不保证阻止超长输入，因此把严格策略放到外部插件。system/tools 和 Responses 基础计数已有 [#39663](https://github.com/BerriAI/litellm/pull/39663)、[#33706](https://github.com/BerriAI/litellm/pull/33706)，本次复用现有转换。原始超长请求的离线复放可在本地拒绝，没有发出付费调用；生产阈值和插件启用状态未修改
+
+历史工具名跨供应商不兼容暂不做全局重命名。[#47434](https://github.com/BerriAI/litellm/pull/47434) 和 [#42963](https://github.com/BerriAI/litellm/pull/42963) 分别涉及 guardrail 恢复和 Bedrock 长度，未确认覆盖此次同一问题。修改名称还需保证声明、调用和结果关联，以及不同目的供应商往返一致，不能用某一供应商的修复宣称通用兼容
+
 **PostgreSQL 空字节修复** — `proxy/utils.py`
 - 清洗 spend logs 中的 `\x00` 空字节，避免 PostgreSQL jsonb 写入失败（22P05）
 
