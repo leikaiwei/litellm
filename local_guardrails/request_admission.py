@@ -379,6 +379,18 @@ def _opus_body(data: Mapping[str, object], model: str, call_type: CallTypes) -> 
     )
 
 
+def _original_count_headers(data: Mapping[str, object]) -> dict[str, str]:
+    def headers(source: str) -> dict[str, str]:
+        incoming: Final = _mapping(_mapping(data.get(source)).get("headers"))
+        return {
+            key.lower(): value
+            for key, value in incoming.items()
+            if key.lower() in ("user-agent", "x-app", "anthropic-beta") and isinstance(value, str)
+        }
+
+    return {**headers("metadata"), **headers("litellm_metadata"), **headers("proxy_server_request")}
+
+
 async def _count_opus(data: Mapping[str, object], call_type: CallTypes) -> int:
     credential_name: Final = data.get("litellm_credential_name")
     credentials: Final = (
@@ -404,6 +416,7 @@ async def _count_opus(data: Mapping[str, object], call_type: CallTypes) -> int:
         caller_betas: Final = tuple(
             str(value) for key, value in caller_headers.items() if key.lower() == "anthropic-beta"
         )
+        original_headers: Final = _original_count_headers(params)
         per_turn_betas: Final = (
             (ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER,)
             if messages_carry_output_config(_JSON_MESSAGES.validate_python(body.get("messages")))
@@ -413,9 +426,11 @@ async def _count_opus(data: Mapping[str, object], call_type: CallTypes) -> int:
         count_headers: Final = _HEADERS.validate_python(
             config._finalize_messages_headers(  # pyright: ignore[reportUnknownMemberType, reportPrivateUsage]  # 复用功能头
                 headers={
+                    **{key: value for key, value in original_headers.items() if key != "anthropic-beta"},
                     **auth,
                     "anthropic-beta": merge_anthropic_beta_headers(
-                        auth.get("anthropic-beta"), (*caller_betas, *per_turn_betas)
+                        auth.get("anthropic-beta"),
+                        (*caller_betas, original_headers.get("anthropic-beta", ""), *per_turn_betas),
                     ),
                 },
                 optional_params=body,

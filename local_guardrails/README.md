@@ -744,15 +744,29 @@ Opus 请求，不回退本地估算。错误只显示异常类型，不回显上
 上游计数准入，不能把合成请求验收结果当成真实业务已恢复的证据
 
 后续本地候选修复已修改 LiteLLM 核心，需新构建，不能只替换插件。相关回归 778 项通过，
-随后补充原生 extra_body 回归，准入测试总计 93 项通过。原生 Messages 生成路径忽略
+随后补充原生 extra_body 和原始客户端头回归，准入测试总计 101 项通过。原生 Messages 生成路径忽略
 extra_body，计数保持相同语义，不将它拍平覆盖顶层参数。两份实际失败请求在本地真实 Router
 和受控 HTTP 传输下，计数与生成
 的全部计数输入字段一致。该结果尚不等于真实 CPA 验收通过
 
-CPA v8.0.61 会在计数路径重建基础 beta，并过滤部分由自身管理的调用方功能头，造成保留
-display updates 等字段却丢失所需 beta。必须同时修正 CPA 的字段与功能头一致性。计数和
-生成的 CPA 系统提示注入仍有差异，上游 count_tokens 本身也不是最终 usage 的严格等值保证，
-不能仅以计数返回 200 声称精确准入。[官方计数说明](https://platform.claude.com/docs/en/build-with-claude/token-counting)
+CPA v8.0.61 对未识别为原生客户端的计数请求重建基础 beta，导致 display updates 等字段的
+功能头丢失；它已有原生 Claude Code 透传机制。保留真实客户端的 User-Agent、X-App 和
+原始 beta 后，两份实际失败请求在未修改的 CPA 上均返回 200，计数为 52176 和 171941。
+因此当前 Claude Code 场景无需修改 CPA 源码或全局配置，也不需要新增 CPA 插件。不得伪造
+缺失的客户端身份，也不得将客户端 Authorization、x-api-key 或 Cookie 转发到上游
+
+候选计数插件仅从原始 proxy_server_request.headers、litellm_metadata.headers 或
+metadata.headers 读取上述三个白名单头，生成请求头保持不变。缺失原始身份时不合成 CLI
+标识，计数失败仍拒绝发送。未识别为原生 Claude Code 的客户端仍受 CPA 现有兼容范围限制
+
+候选核心镜像与新插件已在隔离 HTTP 代理连接未修改的生产 CPA 验收。两份实际请求数据及
+原始客户端头回放分别完成普通生成和流式生成，均返回 Opus；中间插入的请求上游计数
+1217342，返回超限拒绝，随后正常请求继续成功。这里只限制了验证请求的输出长度，没有
+执行返回的客户端工具调用。生产尚未重新上线，CPA 自定义构建与源码补丁路线已停止
+
+CPA 计数仍会移除 context_management 等字段，计数与生成的系统提示注入也有差异。上游
+count_tokens 本身不是最终 usage 的严格等值保证，不能仅以返回 200 声称精确准入。
+[官方计数说明](https://platform.claude.com/docs/en/build-with-claude/token-counting)
 
 ### 注册
 

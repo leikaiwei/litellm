@@ -753,6 +753,71 @@ async def test_opus_malformed_count_is_rejected_without_local_fallback(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ("metadata", "litellm_metadata", "proxy_server_request", None))
+@pytest.mark.parametrize("api_key", ("test-key", "sk-ant-oat-fixture-token"))
+async def test_opus_count_carries_only_original_client_identity_without_changing_generation(
+    monkeypatch: pytest.MonkeyPatch, source: str | None, api_key: str
+) -> None:
+    transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
+    client: Final = _install_count_transport(monkeypatch, transport)
+    deployment: Final = _opus_deployment()
+    params: Final = TypeAdapter(dict[str, object]).validate_python(deployment["litellm_params"])
+    router: Final = litellm.Router(
+        model_list=[{**deployment, "litellm_params": {**params, "api_key": api_key}}], num_retries=0
+    )
+    inbound: Final = {
+        "User-Agent": "claude-cli/2.1.319 (fixture)",
+        "X-App": "cli",
+        "Anthropic-Beta": "fixture-original-feature",
+        "Authorization": "Bearer inbound-secret",
+        "X-Api-Key": "inbound-secret",
+        "Cookie": "session=inbound-secret",
+        "X-Private-Header": "inbound-secret",
+    }
+    carried: Final = {source: {"headers": inbound}} if source is not None else {}
+
+    async def request() -> None:
+        await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
+            model="opus-fixture",
+            messages=_messages(),
+            max_tokens=100,
+            thinking={"type": "adaptive", "display": "updates"},
+            extra_headers={"anthropic-beta": "fixture-caller-feature"},
+            **carried,  # pyright: ignore[reportArgumentType]  # 测试只提供原始请求上下文
+        )
+
+    try:
+        monkeypatch.setattr(litellm, "callbacks", [])
+        await request()
+        monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
+        await request()
+        assert tuple(item.url.path for item in transport.requests) == (
+            "/v1/messages", "/v1/messages/count_tokens", "/v1/messages"
+        )
+        baseline, counted, generated = transport.requests
+        assert generated.headers == baseline.headers
+        assert counted.headers.get("authorization") == baseline.headers.get("authorization")
+        assert counted.headers.get("x-api-key") == baseline.headers.get("x-api-key")
+        assert "inbound-secret" not in json.dumps(dict(counted.headers))
+        assert "cookie" not in counted.headers
+        assert "x-private-header" not in counted.headers
+        assert set(baseline.headers["anthropic-beta"].split(",")) <= set(
+            counted.headers["anthropic-beta"].split(",")
+        )
+        if source is None:
+            assert counted.headers.get("user-agent") != inbound["User-Agent"]
+            assert "x-app" not in counted.headers
+            assert "fixture-original-feature" not in counted.headers["anthropic-beta"].split(",")
+        else:
+            assert counted.headers["user-agent"] == inbound["User-Agent"]
+            assert counted.headers["x-app"] == inbound["X-App"]
+            assert "fixture-original-feature" in counted.headers["anthropic-beta"].split(",")
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("route", ("messages", "chat", "responses"))
 @pytest.mark.parametrize("failure", (False, True))
 async def test_real_router_opus_uses_one_provider_count_and_never_sends_rejected_inference(
