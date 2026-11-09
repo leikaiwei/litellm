@@ -13,7 +13,7 @@ from PIL import Image
 from pydantic import JsonValue, TypeAdapter
 
 import litellm
-from litellm.constants import MAX_IMAGE_URL_DOWNLOAD_SIZE_MB
+from litellm.constants import DEFAULT_CHAT_COMPLETION_PARAM_VALUES, MAX_IMAGE_URL_DOWNLOAD_SIZE_MB
 from litellm.exceptions import MalformedRequestFieldError
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
@@ -42,6 +42,9 @@ from litellm.router_strategy.complexity_router.context_compaction import compact
 from litellm.types.llms.anthropic import ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
 from litellm.types.utils import CallTypes
+from litellm.utils import (
+    get_optional_params,  # pyright: ignore[reportUnknownVariableType]  # 上游参数转换器仍包含裸类型
+)
 
 _OBJECT: Final = TypeAdapter(dict[str, object])
 _JSON_OBJECT: Final = TypeAdapter(dict[str, JsonValue])
@@ -333,43 +336,26 @@ def _is_counted_claude(model: str) -> bool:
 
 def _claude_body(data: Mapping[str, object], model: str, call_type: CallTypes) -> dict[str, JsonValue]:
     if call_type in (CallTypes.anthropic_messages, CallTypes.aanthropic_messages):
-        return prepare_native_request_body(data, model)
-    fields: Final = {**data, **_mapping(data.get("extra_body"))}
+        return _JSON_OBJECT.validate_python(prepare_native_request_body(data, model))
     config: Final = AnthropicConfig()
-    chat_options: Final = {
-        key: fields[key]
-        for key in (
-            "tools",
-            "tool_choice",
-            "parallel_tool_calls",
-            "response_format",
-            "reasoning_effort",
-            "web_search_options",
-            "thinking",
-            "context_management",
-            "cache_control",
-            "speed",
-        )
-        if key in fields
-    }
-    native_options: Final = {
-        key: fields[key]
-        for key in COUNT_TOKEN_OPTION_NAMES
-        if key in fields and key not in ("thinking", "tool_choice", "context_management", "cache_control", "speed")
+    keys: Final = frozenset(DEFAULT_CHAT_COMPLETION_PARAM_VALUES) | frozenset(COUNT_TOKEN_OPTION_NAMES)
+    request_options: Final = {
+        key: copy.deepcopy(value)
+        for key, value in data.items()
+        if key in keys and key not in ("model", "custom_llm_provider", "messages", "metadata")
     }
     options: Final = _JSON_OBJECT.validate_python(
-        config.map_openai_params(  # pyright: ignore[reportUnknownMemberType]  # 上游转换器仍返回裸 dict，出口验证类型
-            non_default_params=copy.deepcopy(chat_options),
-            optional_params=copy.deepcopy(native_options),
+        get_optional_params(
             model=model,
-            drop_params=fields.get("drop_params") is True,
+            custom_llm_provider="anthropic",
+            **request_options,  # pyright: ignore[reportArgumentType]  # 共享参数转换器负责校验输入，出口验证类型
         )
     )
     return _JSON_OBJECT.validate_python(
         config.transform_request(  # pyright: ignore[reportUnknownMemberType]  # 上游转换器仍返回裸 dict，出口验证类型
             model=model,
             messages=cast(  # cast-ok: 共享消息转换器返回 Chat 形状，供应商转换器继续校验
-                list[AllMessageValues], copy.deepcopy(list(_messages(fields)))
+                list[AllMessageValues], copy.deepcopy(list(_messages(data)))
             ),
             optional_params=options,
             litellm_params={
@@ -423,9 +409,10 @@ async def _count_claude(data: Mapping[str, object], call_type: CallTypes) -> int
             str(value) for key, value in caller_headers.items() if key.lower() == "anthropic-beta"
         )
         original_headers: Final = _original_count_headers(params)
+        messages: Final = _JSON_MESSAGES.validate_python(body.get("messages"))
         per_turn_betas: Final = (
             (ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER,)
-            if messages_carry_output_config(_JSON_MESSAGES.validate_python(body.get("messages")))
+            if messages_carry_output_config(messages)
             else ()
         )
         config: Final = AnthropicMessagesConfig()
@@ -440,12 +427,12 @@ async def _count_claude(data: Mapping[str, object], call_type: CallTypes) -> int
                     ),
                 },
                 optional_params=body,
-                messages=list[object](_JSON_MESSAGES.validate_python(body.get("messages"))),
+                messages=list[object](messages),
             )
         )
         response: Final = await AnthropicCountTokensHandler().handle_count_tokens_request(
             model=model,
-            messages=_JSON_MESSAGES.validate_python(body.get("messages")),
+            messages=messages,
             auth_header={key: value for key, value in count_headers.items() if key.lower() != "content-type"},
             api_base=base,
             timeout=30,

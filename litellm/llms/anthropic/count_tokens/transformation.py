@@ -125,6 +125,8 @@ class AnthropicCountTokensConfig:
         system-role messages is counted through ``system``, the only place count_tokens accepts it.
         """
         options: Final[Mapping[str, JsonValue]] = optional_params or MappingProxyType({})
+        output_format: Final = options.get("output_format")
+        output_config: Final = options.get("output_config")
         counted_messages, counted_system = _lift_leading_system(messages, system)
         return _COUNT_REQUEST.validate_python(
             MappingProxyType(
@@ -141,7 +143,21 @@ class AnthropicCountTokensConfig:
                         }
                     ),
                     **MappingProxyType(
-                        {key: value for key, value in options.items() if key in COUNT_TOKEN_OPTION_NAMES}
+                        {
+                            key: value
+                            for key, value in options.items()
+                            if key in COUNT_TOKEN_OPTION_NAMES and key != "output_format"
+                        }
+                    ),
+                    **MappingProxyType(
+                        {
+                            "output_config": {
+                                **(output_config if isinstance(output_config, dict) else {}),
+                                "format": output_format,
+                            }
+                        }
+                        if output_format is not None
+                        else {}
                     ),
                 }
             )

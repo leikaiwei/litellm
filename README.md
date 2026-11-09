@@ -42,6 +42,16 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 历史工具名跨供应商不兼容暂不做全局重命名。[#47434](https://github.com/BerriAI/litellm/pull/47434) 和 [#42963](https://github.com/BerriAI/litellm/pull/42963) 分别涉及 guardrail 恢复和 Bedrock 长度，未确认覆盖此次同一问题。修改名称还需保证声明、调用和结果关联，以及不同目的供应商往返一致，不能用某一供应商的修复宣称通用兼容
 
+**2026-11-09 待发布补丁，Claude 上游计数与加密历史兼容**
+
+Opus、Sonnet、Haiku 按实际部署调用现有 Anthropic `count_tokens` 处理器，使用该部署的凭据和输入上限，计数失败不退回本地估算。原生 Messages 与缓存预测共用请求转换，Chat 复用生成路径的参数转换，包含 `additional_drop_params` 和输出预算对 thinking 的影响。保留真实客户端 User-Agent、X-App 和功能 beta，只发送一个 Content-Type，不转发客户端鉴权头，也不伪造客户端身份。无需修改 CPA，现有路由与 fallback 保持原配置
+
+计数参数包含上下文管理、工具、结构化输出等输入。参考已合并的 [#47363](https://github.com/BerriAI/litellm/pull/47363)，计数时将旧版 `output_format` 归一到 `output_config.format`，保留其他输出配置，避免计数接口拒绝生成接口接受的格式。该 PR 的 Responses 转换复用、[#44784](https://github.com/BerriAI/litellm/pull/44784) 的压缩历史计数以及 [#46815](https://github.com/BerriAI/litellm/pull/46815) 的计数错误传播均可参考，但不能直接替代发送前准入。2026-11-09 核对上游 main，尚无完整同义实现，升级时需逐项核对再删除本地差异。仍未合并的 [#49764](https://github.com/BerriAI/litellm/pull/49764) 放宽非 OpenAI 估算阈值，与本插件的严格限额策略不同，不回移
+
+Responses 正常的加密 reasoning、compaction 历史改为保留并交给上游校验，本地继续检查可读正文、摘要、指令与工具。密文不按字符数估算，也不宣称已完整计数。`previous_response_id`、`conversation`、`item_reference` 和未知输入项仍受原有无法核验策略限制。这是上述严格准入的明确例外，详细行为与验证记录见 [插件说明](local_guardrails/README.md#request_admission-请求上下文准入)
+
+本批尚未上线，生产仍为 patch.4 和回滚后的旧准入插件。曾两次仅更新插件后因实际客户端字段兼容问题回滚，不能把当时短文本验收当作发布依据。晚间 review 又修复了 Chat 计数参数漂移和旧版结构化输出计数问题，需从最终提交重新构建核心镜像并配套最新外置插件，禁止直接复用早先的候选镜像、暂存插件或 manifest。已有真实回放覆盖主渠道三系列生成及超限拒绝，两个备用渠道的生成权限故障在关闭插件时也存在，不能宣称所有渠道均正常
+
 **PostgreSQL 空字节修复** — `proxy/utils.py`
 - 清洗 spend logs 中的 `\x00` 空字节，避免 PostgreSQL jsonb 写入失败（22P05）
 

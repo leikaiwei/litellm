@@ -1113,6 +1113,14 @@ async def test_rejected_claude_request_does_not_cool_down_the_next_request(
         ({"mcp_servers": [{"type": "url", "name": "fixture", "url": "https://mcp.invalid"}]}, False),
         ({"cache_control": {"type": "ephemeral"}}, False),
         ({"compaction": {"type": "summarize", "instructions": "Keep important details"}}, False),
+        ({"thinking": {"type": "adaptive"}, "additional_drop_params": ["thinking"]}, False),
+        (
+            {
+                "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+                "additional_drop_params": ["context_management"],
+            },
+            False,
+        ),
     ),
 )
 @pytest.mark.parametrize("route", ("messages", "chat"))
@@ -1140,6 +1148,59 @@ async def test_opus_count_matches_final_inference_options(
                 max_tokens=8192,
                 **options,  # pyright: ignore[reportArgumentType]  # 测试只提供原生参数，不覆盖 stream
             )
+        assert tuple(request.url.path for request in transport.requests) == (
+            "/v1/messages/count_tokens", "/v1/messages"
+        )
+        counted: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[0].content)
+        sent: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[1].content)
+        expected: Final = {
+            key: value for key, value in sent.items() if key not in ("max_tokens", "stream", "output_format")
+        }
+        assert counted == (
+            {**expected, "output_config": {"format": sent["output_format"]}}
+            if "output_format" in sent
+            else expected
+        )
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget_parameter", ("max_tokens", "max_completion_tokens"))
+@pytest.mark.parametrize("budget", (1000, 1500))
+async def test_chat_count_matches_inference_with_legacy_thinking_budget_and_dropped_tools(
+    monkeypatch: pytest.MonkeyPatch, budget_parameter: str, budget: int
+) -> None:
+    model: Final = "claude-sonnet-admission-fixture"
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {
+            model: {
+                "max_input_tokens": 100000,
+                "max_output_tokens": 8192,
+                "litellm_provider": "anthropic",
+                "mode": "chat",
+                "supports_function_calling": True,
+                "supports_reasoning": True,
+                "supports_adaptive_thinking": False,
+            }
+        },
+    )
+    transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
+    client: Final = _install_count_transport(monkeypatch, transport)
+    monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
+    router: Final = litellm.Router(model_list=[_claude_deployment(model=model)], num_retries=0)
+    try:
+        await router.acompletion(  # pyright: ignore[reportUnknownMemberType, reportCallIssue]  # 上游参数化路由预算
+            model="claude-fixture",
+            messages=_messages(),
+            thinking={"type": "adaptive"},
+            tools=[{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+            additional_drop_params=["tools"],
+            **{budget_parameter: budget},  # pyright: ignore[reportArgumentType]  # 参数化输出预算字段
+        )
         assert tuple(request.url.path for request in transport.requests) == (
             "/v1/messages/count_tokens", "/v1/messages"
         )

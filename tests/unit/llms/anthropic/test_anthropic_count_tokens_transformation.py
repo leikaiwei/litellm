@@ -125,11 +125,14 @@ def test_transform_basic_request():
     }
 
 
-def test_count_preserves_supported_context_parameters_without_generation_options() -> None:
+@pytest.mark.parametrize("output_config", [None, {"effort": "high", "format": {"type": "text"}}])
+def test_count_preserves_supported_context_parameters_without_generation_options(
+    output_config: dict[str, JsonValue] | None,
+) -> None:
     options: Final[dict[str, JsonValue]] = {
         "thinking": {"type": "adaptive", "display": "updates"},
         "tool_choice": {"type": "auto"},
-        "output_config": {"effort": "high"},
+        **({"output_config": output_config} if output_config is not None else {}),
         "output_format": {"type": "json_schema", "schema": {"type": "object"}},
         "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
         "compaction": {"type": "summarize", "instructions": "Retain decisions"},
@@ -144,7 +147,13 @@ def test_count_preserves_supported_context_parameters_without_generation_options
         messages=messages,
         optional_params={**options, "max_tokens": 100, "stream": True, "temperature": 1},
     )
-    assert result == {"model": "claude-opus-5-5", "messages": messages, **options}
+    # 2026-11-09 核对上游 https://github.com/BerriAI/litellm/pull/47363，计数使用 GA 格式
+    assert result == {
+        "model": "claude-opus-5-5",
+        "messages": messages,
+        **{key: value for key, value in options.items() if key not in ("output_format", "output_config")},
+        "output_config": {**(output_config or {}), "format": options["output_format"]},
+    }
     assert (messages, options) == before
 
 

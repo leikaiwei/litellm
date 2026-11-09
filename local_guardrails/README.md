@@ -706,6 +706,19 @@ tokenizer 首次加载遵循 LiteLLM 既有配置。若部署要求禁止 Huggin
 
 ### Opus、Sonnet、Haiku 上游计数
 
+2026-11-09 晚间 review 补充两项修复，Chat 计数改用生成路径的参数转换，遵守
+`additional_drop_params`，并保留输出预算参与 thinking 转换。按上游已合并的
+[#47363](https://github.com/BerriAI/litellm/pull/47363)，旧版 `output_format` 仅在计数时
+归一为 `output_config.format`，保留 effort 等其他配置。前者避免把生成已删除的字段送去
+计数，后者避免计数接口拒绝合法结构化输出。需重新构建核心镜像并配套最终插件，下面的
+旧候选镜像和历史测试记录不代表这次修复已发布，服务器旧暂存插件和 manifest 不可直接用于上线
+
+晚间修复后，全部外部插件及相关核心回归合计 786 项通过，新增用例已验证旧实现失败、新实现通过。
+以今天改动前的 `cd630e62698` 为基线运行完整 `scripts/pre_commit_lint.sh` 通过，五项 lint gate
+均未超出基线，插件单独 basedpyright 为零错误。当前插件 SHA256 为
+`99b7ba1cd607f1387ee60128d46d5868e57f4cca55c0875e5dddd63ad6a0ab82`。
+这些是本地源码验收结果，修复后的正式镜像尚未构建，也未执行新镜像真实上游验收或生产切换
+
 三个 Claude 系列候选不再以本地 tokenizer 的估算值判断是否可发送。候选阶段保留图片校验和输入上限检查，
 选定部署后调用该部署上游的 `/v1/messages/count_tokens`，等于或超过输入上限即拒绝。
 识别依据是部署的模型或 base_model 的 `claude-opus-`、`claude-sonnet-`、`claude-haiku-` 前缀，

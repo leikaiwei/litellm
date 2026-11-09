@@ -1,5 +1,6 @@
 from collections.abc import Iterable, Mapping, Sequence
 from functools import lru_cache, reduce
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, cast, get_type_hints
 
 from pydantic import JsonValue, TypeAdapter
@@ -182,7 +183,7 @@ def anthropic_messages_optional_param_keys() -> frozenset[str]:
     return frozenset(get_type_hints(AnthropicMessagesRequestOptionalParams).keys())
 
 
-def prepare_native_request_body(request: Mapping[str, object], model: str) -> dict[str, JsonValue]:
+def prepare_native_request_body(request: Mapping[str, object], model: str) -> Mapping[str, JsonValue]:
     from litellm.llms.anthropic.pass_through.messages.transformation import AnthropicMessagesConfig
 
     keys: Final = anthropic_messages_optional_param_keys() | frozenset(
@@ -217,7 +218,7 @@ def prepare_native_request_body(request: Mapping[str, object], model: str) -> di
         dict(options),
     )
     config: Final = AnthropicMessagesConfig()
-    return _NATIVE_BODY.validate_python(
+    body: Final = _NATIVE_BODY.validate_python(
         config.transform_anthropic_messages_request(  # pyright: ignore[reportUnknownMemberType]  # 旧转换器出口校验类型
             model=model,
             messages=_NATIVE_MESSAGES.validate_python(strip_provider_specific_fields_from_anthropic_messages(messages)),
@@ -226,6 +227,7 @@ def prepare_native_request_body(request: Mapping[str, object], model: str) -> di
             headers={},
         )
     )
+    return MappingProxyType(body)
 
 
 class AnthropicMessagesRequestUtils:
