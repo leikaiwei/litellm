@@ -326,9 +326,9 @@ def _is_opus(candidate: Candidate) -> bool:
 
 
 def _opus_body(data: Mapping[str, object], model: str, call_type: CallTypes) -> dict[str, JsonValue]:
-    fields: Final = {**data, **_mapping(data.get("extra_body"))}
     if call_type in (CallTypes.anthropic_messages, CallTypes.aanthropic_messages):
-        return prepare_native_request_body(fields, model)
+        return prepare_native_request_body(data, model)
+    fields: Final = {**data, **_mapping(data.get("extra_body"))}
     config: Final = AnthropicConfig()
     chat_options: Final = {
         key: fields[key]

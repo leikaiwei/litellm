@@ -974,6 +974,42 @@ async def test_opus_container_is_rejected_before_count_or_inference(
     (
         {"thinking": {"type": "adaptive", "display": "updates"}},
         {"context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}},
+    ),
+)
+async def test_native_opus_extra_body_does_not_override_the_effective_request(
+    monkeypatch: pytest.MonkeyPatch, extra: dict[str, object]
+) -> None:
+    transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
+    client: Final = _install_count_transport(monkeypatch, transport)
+    monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
+    router: Final = litellm.Router(model_list=[_opus_deployment()], num_retries=0)
+    before: Final = copy.deepcopy(extra)
+    try:
+        await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
+            model="opus-fixture",
+            messages=_messages(),
+            max_tokens=8192,
+            thinking={"type": "adaptive", "display": "omitted"},
+            extra_body=extra,
+        )
+        assert tuple(request.url.path for request in transport.requests) == (
+            "/v1/messages/count_tokens", "/v1/messages"
+        )
+        counted: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[0].content)
+        sent: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[1].content)
+        assert counted == {key: value for key, value in sent.items() if key not in ("max_tokens", "stream")}
+        assert extra == before
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra",
+    (
+        {"thinking": {"type": "adaptive", "display": "updates"}},
+        {"context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}},
         {"output_format": {"type": "json_schema", "schema": {"type": "object"}}},
         {"mcp_servers": [{"type": "url", "name": "fixture", "url": "https://mcp.invalid"}]},
     ),
