@@ -655,7 +655,7 @@ Rerank、音频转写和 evaluation，避免 Router 内部占位消息误触发�
 `1000000`，当前 DeepSeek V4.1 Flash 同源部署为 `970000`，保留其他已有较小上限。
 两个暂不使用的本地 LM Studio 模型保持原配置，未按未经核验的记忆值补写容量
 
-非 Opus 部署计数复用 LiteLLM 的 tokenizer、Anthropic system 提取和 Responses 输入转换，包含 system、
+未启用下述 Claude 上游计数的部署复用 LiteLLM 的 tokenizer、Anthropic system 提取和 Responses 输入转换，包含 system、
 instructions、工具定义和工具历史，不重命名工具，不修改用户消息。计数失败或全局计数关闭时，
 返回明确的本地无法核验提示，建议 `/compact` 或开启新会话，不再把未知长度的请求继续发给
 上游。Responses 的正常加密推理和加密压缩历史除外，这类内容按下述规则保留并交由上游校验
@@ -704,12 +704,14 @@ tokenizer 首次加载遵循 LiteLLM 既有配置。若部署要求禁止 Huggin
 `litellm_settings.disable_hf_tokenizer_download: true`，但这会让相关模型回落到通用 tokenizer，
 需要接受估算精度变化。本插件不临时改动进程级 tokenizer 开关，也不发起模型生成请求
 
-### Opus 上游计数
+### Opus、Sonnet、Haiku 上游计数
 
-Opus 候选不再以本地 tokenizer 的估算值判断是否可发送。候选阶段保留图片校验和输入上限检查，
+三个 Claude 系列候选不再以本地 tokenizer 的估算值判断是否可发送。候选阶段保留图片校验和输入上限检查，
 选定部署后调用该部署上游的 `/v1/messages/count_tokens`，等于或超过输入上限即拒绝。
-识别依据是部署的模型或 base_model，不是客户端组名，Opus 组中的其他后端仍沿用原有检查。
-当前支持 Anthropic 协议 Opus 上游，其他协议的 Opus 部署拒绝发送，避免误用计数端点
+识别依据是部署的模型或 base_model 的 `claude-opus-`、`claude-sonnet-`、`claude-haiku-` 前缀，
+不是客户端组名。同组其他后端仍沿用原有检查，不因组名包含 Claude 而调用 Anthropic 计数。
+覆盖这三个系列的各个部署渠道，使用选中部署自身的凭据、api_base 和输入上限，不只绑定某个
+CPA 地址。实际出站模型仍须是这三个系列且 provider 为 Anthropic，其他协议拒绝发送，避免误用计数端点
 
 计数直接复用现有 `AnthropicCountTokensHandler`，不经 Router 重选部署，也不调用会回退本地的
 `acount_tokens()`。命名凭据在副本中按 LiteLLM 原有优先级合并，实际请求不变。Messages 保留
@@ -721,16 +723,27 @@ speed 和 compaction，不静默漏掉这些字段。官方计数接口接受但
 计数请求保留客户端和鉴权 beta，并复用 Messages 的功能头推导。消息携带 `output_config`
 时还加入现有 `mid-conversation-output-config` beta，避免合法的逐轮配置被计数端点拒绝。
 Responses 在外层检查图片和隐藏历史，再由现有 Chat 桥接后的 deployment hook 计数，避免
-对转换前后请求重复调用。声明原生 `/v1/responses` 透传的 Opus 部署会被拒绝，除非显式启用
+对转换前后请求重复调用。声明原生 `/v1/responses` 透传的上述 Claude 部署会被拒绝，除非显式启用
 `use_chat_completions_api`，确保必经 Chat 检查。服务端上下文编辑仍按编辑前的完整输入检查
 
-非空 container 会被明确拒绝，避免漏计隐藏上下文。Opus Chat 非空 extra_body 同样拒绝，
+非空 container 会被明确拒绝，避免漏计隐藏上下文。上述 Claude Chat 非空 extra_body 同样拒绝，
 因为当前生成路径将其嵌套发送，无法与计数拍平语义保持一致；应改用原生 Messages 或顶层
 受支持参数。失败均不回退本地估算
 
 计数最多等待 30 秒，鉴权失败、超时、上游错误或缺少有效的正整数 `input_tokens` 都拒绝当前
-Opus 请求，不回退本地估算。错误只显示异常类型，不回显上游正文或凭据。供应商计数也有延迟、
+Claude 请求，不回退本地估算。错误只显示异常类型，不回显上游正文或凭据。供应商计数也有延迟、
 限流和可用性成本；中转是否真正调用官方计数取决于供应商实现。原有 Router fallback 策略不变
+
+计数请求由计数处理器统一添加单个 `Content-Type: application/json`，移除功能头准备阶段
+产生的同名大小写变体，避免重复类型头让严格的 JSON 网关返回 422。User-Agent、X-App
+和功能 beta 透传同样覆盖这三个系列的计数请求，正式生成请求头仍沿用原有行为
+
+2026-11-09 本地扩展验证覆盖五个启用部署，计数接口均成功。主上游的三个系列普通生成均
+返回 HTTP 200，Sonnet、Haiku 的流式响应也正常结束。两个备用部署生成时报模型或订阅权限
+错误，关闭准入插件同样复现，因此不能宣称所有渠道的生成服务正常；本轮未改变生产路由。
+223 项相关测试、ruff 和 basedpyright 通过，覆盖三系列的客户端头、计数与生成内容一致、
+计数失败拒绝、失败请求隔离和 Responses 桥接。这项扩展只修改外部插件，不增加核心镜像改动，
+等待用户安排维护窗口部署，需使用本次最新插件
 
 当前生产已撤回上游计数插件，恢复旧版准入检查。下述两次上线记录均不是当前生产状态。
 后续修复须同时验证 LiteLLM 的输入转换与 CPA 的计数兼容性，不能仅凭短文本或合成请求

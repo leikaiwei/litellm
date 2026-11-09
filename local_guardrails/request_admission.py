@@ -327,11 +327,11 @@ def _raise_context(model: str, counts: Sequence[tuple[Candidate, int]]) -> None:
     )
 
 
-def _is_opus(candidate: Candidate) -> bool:
-    return candidate.model.removeprefix("anthropic/").startswith("claude-opus-")
+def _is_counted_claude(model: str) -> bool:
+    return model.removeprefix("anthropic/").startswith(("claude-opus-", "claude-sonnet-", "claude-haiku-"))
 
 
-def _opus_body(data: Mapping[str, object], model: str, call_type: CallTypes) -> dict[str, JsonValue]:
+def _claude_body(data: Mapping[str, object], model: str, call_type: CallTypes) -> dict[str, JsonValue]:
     if call_type in (CallTypes.anthropic_messages, CallTypes.aanthropic_messages):
         return prepare_native_request_body(data, model)
     fields: Final = {**data, **_mapping(data.get("extra_body"))}
@@ -397,7 +397,7 @@ def _original_count_headers(data: Mapping[str, object]) -> dict[str, str]:
     return {**headers("metadata"), **headers("litellm_metadata"), **headers("proxy_server_request")}
 
 
-async def _count_opus(data: Mapping[str, object], call_type: CallTypes) -> int:
+async def _count_claude(data: Mapping[str, object], call_type: CallTypes) -> int:
     credential_name: Final = data.get("litellm_credential_name")
     credentials: Final = (
         CredentialAccessor.get_credential_values(credential_name) if isinstance(credential_name, str) else {}
@@ -405,8 +405,8 @@ async def _count_opus(data: Mapping[str, object], call_type: CallTypes) -> int:
     params: Final = {**credentials, **data}
     model: Final = str(params.get("model", "")).removeprefix("anthropic/")
     provider: Final = params.get("custom_llm_provider")
-    if provider not in (None, "anthropic") or not model.startswith("claude-opus-"):
-        raise ValueError("Opus 部署不是可核验的 Anthropic 上游")
+    if provider not in (None, "anthropic") or not _is_counted_claude(model):
+        raise ValueError("Claude 部署不是可核验的 Anthropic 上游")
     base: Final = _OPTIONAL_STRING.validate_python(params.get("api_base"))
     async with asyncio.timeout(30):
         auth: Final = await AnthropicModelInfo.aget_auth_header(
@@ -416,8 +416,8 @@ async def _count_opus(data: Mapping[str, object], call_type: CallTypes) -> int:
             allow_workload_identity=True,
         )
         if auth is None:
-            raise ValueError("Opus 上游计数缺少凭据")
-        body: Final = await offload_token_count(_opus_body)(params, model, call_type)
+            raise ValueError("Claude 上游计数缺少凭据")
+        body: Final = await offload_token_count(_claude_body)(params, model, call_type)
         caller_headers: Final = {**_mapping(params.get("headers")), **_mapping(params.get("extra_headers"))}
         caller_betas: Final = tuple(
             str(value) for key, value in caller_headers.items() if key.lower() == "anthropic-beta"
@@ -446,7 +446,7 @@ async def _count_opus(data: Mapping[str, object], call_type: CallTypes) -> int:
         response: Final = await AnthropicCountTokensHandler().handle_count_tokens_request(
             model=model,
             messages=_JSON_MESSAGES.validate_python(body.get("messages")),
-            auth_header=count_headers,
+            auth_header={key: value for key, value in count_headers.items() if key.lower() != "content-type"},
             api_base=base,
             timeout=30,
             tools=_JSON_MESSAGES.validate_python(body["tools"]) if body.get("tools") is not None else None,
@@ -455,7 +455,7 @@ async def _count_opus(data: Mapping[str, object], call_type: CallTypes) -> int:
         )
     count: Final = response.get("input_tokens")
     if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
-        raise ValueError("Opus 上游未返回有效 input_tokens")
+        raise ValueError("Claude 上游未返回有效 input_tokens")
     return count
 
 
@@ -475,7 +475,7 @@ def _admit(
     if pending_compaction:
         return [candidate.deployment for candidate in bounded]
     models: Final = frozenset(
-        candidate.model for candidate in bounded if candidate.limit is not None and not _is_opus(candidate)
+        candidate.model for candidate in bounded if candidate.limit is not None and not _is_counted_claude(candidate.model)
     )
     counts: Final = {counted_model: _count(data, counted_model) for counted_model in models}
     for count in counts.values():
@@ -486,7 +486,7 @@ def _admit(
         candidate.deployment
         for candidate in bounded
         if candidate.local_response
-        or _is_opus(candidate)
+        or _is_counted_claude(candidate.model)
         or (candidate.limit is not None and cast(int, counts[candidate.model]) < candidate.limit)
     ]
     if candidates and not allowed:
@@ -495,9 +495,9 @@ def _admit(
 
 
 class RequestAdmission(CustomLogger):
-    def __init__(self, opus_counter: Callable[[Mapping[str, object], CallTypes], Awaitable[int]] = _count_opus) -> None:
+    def __init__(self, claude_counter: Callable[[Mapping[str, object], CallTypes], Awaitable[int]] = _count_claude) -> None:
         super().__init__()  # pyright: ignore[reportUnknownMemberType]  # 上游 callback 构造器的 kwargs 尚未注解
-        self._opus_counter = opus_counter
+        self._claude_counter = claude_counter
 
     async def async_filter_deployments(
         self,
@@ -526,16 +526,16 @@ class RequestAdmission(CustomLogger):
         deployment: Final = {"litellm_params": kwargs, "model_info": kwargs.get("model_info")}
         candidate: Final = _candidate(deployment)
         await offload_token_count(_admit)(kwargs, (candidate,), model if isinstance(model, str) else "")
-        if not _is_opus(candidate):
+        if not _is_counted_claude(candidate.model):
             return None
         if kwargs.get("container") or _mapping(kwargs.get("extra_body")).get("container"):
             _raise_invalid(
-                AdmissionProblem("container", "Opus 上游计数不支持 container，无法核验隐藏上下文", False),
+                AdmissionProblem("container", "Claude 上游计数不支持 container，无法核验隐藏上下文", False),
                 candidate.model,
             )
         if call_type in (CallTypes.completion, CallTypes.acompletion) and kwargs.get("extra_body"):
             _raise_invalid(
-                AdmissionProblem("extra_body", "Opus Chat 无法核验 extra_body，请使用 Messages 或顶层参数", False),
+                AdmissionProblem("extra_body", "Claude Chat 无法核验 extra_body，请使用 Messages 或顶层参数", False),
                 candidate.model,
             )
         problem: Final = (
@@ -549,27 +549,27 @@ class RequestAdmission(CustomLogger):
             if (
                 kwargs.get("custom_llm_provider") not in (None, "anthropic")
                 or not isinstance(model, str)
-                or not model.removeprefix("anthropic/").startswith("claude-opus-")
+                or not _is_counted_claude(model)
                 or (native and kwargs.get("use_chat_completions_api") is not True)
             ):
                 _raise_invalid(
-                    AdmissionProblem("input", "Opus 原生 Responses 无法核验，请使用 Messages 或 Chat 桥接", False),
+                    AdmissionProblem("input", "Claude 原生 Responses 无法核验，请使用 Messages 或 Chat 桥接", False),
                     candidate.model,
                 )
             return None
         try:
-            count: Final = await self._opus_counter(kwargs, call_type)
+            count: Final = await self._claude_counter(kwargs, call_type)
         except Exception as error:
             _raise_invalid(
                 AdmissionProblem(
-                    "count_tokens", f"Opus 上游计数失败（{type(error).__name__}），请求未发送，请稍后重试", False
+                    "count_tokens", f"Claude 上游计数失败（{type(error).__name__}），请求未发送，请稍后重试", False
                 ),
                 candidate.model,
             )
             return None
         if candidate.limit is not None and count >= candidate.limit:
             raise litellm.ContextWindowExceededError(
-                message=f"Opus 上游计数 {count} tokens，达到输入上限 {candidate.limit}。请先 /compact 或开启新会话",
+                message=f"Claude 上游计数 {count} tokens，达到输入上限 {candidate.limit}。请先 /compact 或开启新会话",
                 model=candidate.model,
                 llm_provider="anthropic",
             )

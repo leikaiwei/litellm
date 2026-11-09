@@ -687,44 +687,47 @@ async def test_existing_router_compaction_runs_before_final_admission(
 
 
 _OPUS: Final = "claude-opus-5-5"
+_CLAUDE_MODELS: Final = (_OPUS, "claude-sonnet-5-5", "claude-haiku-5-5")
 
 
-def _opus_deployment(limit: int = 100) -> dict[str, object]:
+def _claude_deployment(limit: int = 100, model: str = _OPUS) -> dict[str, object]:
     return {
-        "model_name": "opus-fixture",
-        "litellm_params": {"model": f"anthropic/{_OPUS}", "api_key": "test-key", "api_base": "https://counter.invalid"},
-        "model_info": {"id": "opus-fixture", "max_input_tokens": limit},
+        "model_name": "claude-fixture",
+        "litellm_params": {"model": f"anthropic/{model}", "api_key": "test-key", "api_base": "https://counter.invalid"},
+        "model_info": {"id": "claude-fixture", "max_input_tokens": limit},
     }
 
 
 @pytest.mark.asyncio
-async def test_opus_filters_defer_counting_and_selected_deployment_uses_provider_limit() -> None:
+@pytest.mark.parametrize("model", _CLAUDE_MODELS)
+async def test_claude_filters_defer_counting_and_selected_deployment_uses_provider_limit(model: str) -> None:
     counter: Final = AsyncMock(return_value=100)
-    hook: Final = RequestAdmission(opus_counter=counter)
-    deployment: Final = _opus_deployment()
+    hook: Final = RequestAdmission(claude_counter=counter)
+    deployment: Final = _claude_deployment(model=model)
     messages: Final = _messages()
-    assert await hook.async_filter_deployments("opus-fixture", [deployment], messages) == [deployment]
+    assert await hook.async_filter_deployments("claude-fixture", [deployment], messages) == [deployment]
     counter.assert_not_awaited()
     with pytest.raises(litellm.ContextWindowExceededError, match="上游计数 100"):
         await hook.async_pre_call_deployment_hook(
-            {"model": _OPUS, "messages": messages, "model_info": {"max_input_tokens": 100}}, CallTypes.acompletion
+            {"model": model, "messages": messages, "model_info": {"max_input_tokens": 100}}, CallTypes.acompletion
         )
     assert counter.await_count == 1
     assert (
         await hook.async_pre_call_deployment_hook(
-            {"model": _OPUS, "messages": messages, "model_info": {"max_input_tokens": 101}}, CallTypes.acompletion
+            {"model": model, "messages": messages, "model_info": {"max_input_tokens": 101}}, CallTypes.acompletion
         )
         is None
     )
 
 
 @pytest.mark.asyncio
-async def test_opus_counter_failure_is_closed_and_other_models_keep_local_counting() -> None:
+@pytest.mark.parametrize("model", _CLAUDE_MODELS)
+async def test_claude_counter_failure_is_closed_and_other_models_keep_local_counting(model: str) -> None:
     counter: Final = AsyncMock(side_effect=TimeoutError("private-upstream-marker"))
-    hook: Final = RequestAdmission(opus_counter=counter)
+    hook: Final = RequestAdmission(claude_counter=counter)
     with pytest.raises(litellm.BadRequestError, match="上游计数失败") as error:
         await hook.async_pre_call_deployment_hook(
-            {"model": _OPUS, "messages": _messages(), "model_info": {"max_input_tokens": 100}}, CallTypes.acompletion
+            {"model": model, "messages": _messages(), "model_info": {"max_input_tokens": 100}}, CallTypes.acompletion
         )
     assert "private-upstream-marker" not in str(error.value)
     assert (
@@ -733,7 +736,7 @@ async def test_opus_counter_failure_is_closed_and_other_models_keep_local_counti
         )
         is None
     )
-    assert await hook.async_filter_deployments(_OPUS, [_deployment(100, _OPUS)], _messages())
+    assert await hook.async_filter_deployments(model, [_deployment(100, model)], _messages())
     assert counter.await_count == 1
 
 
@@ -753,7 +756,7 @@ class CountTransport:
                     "id": "msg_fixture",
                     "type": "message",
                     "role": "assistant",
-                    "model": _OPUS,
+                    "model": json.loads(request.content)["model"],
                     "content": [{"type": "text", "text": "Accepted"}],
                     "stop_reason": "end_turn",
                     "stop_sequence": None,
@@ -761,6 +764,8 @@ class CountTransport:
                 },
             )
         assert request.url.path == "/v1/messages/count_tokens"
+        if request.headers.get("content-type") != "application/json":
+            return httpx.Response(422, json={"error": "请求必须使用单个 application/json 类型头"})
         return httpx.Response(self.status, json=self.result)
 
 
@@ -883,12 +888,13 @@ async def test_opus_malformed_count_is_rejected_without_local_fallback(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ("metadata", "litellm_metadata", "proxy_server_request", None))
 @pytest.mark.parametrize("api_key", ("test-key", "sk-ant-oat-fixture-token"))
-async def test_opus_count_carries_only_original_client_identity_without_changing_generation(
-    monkeypatch: pytest.MonkeyPatch, source: str | None, api_key: str
+@pytest.mark.parametrize("model", _CLAUDE_MODELS)
+async def test_claude_count_carries_only_original_client_identity_without_changing_generation(
+    monkeypatch: pytest.MonkeyPatch, model: str, source: str | None, api_key: str
 ) -> None:
     transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
     client: Final = _install_count_transport(monkeypatch, transport)
-    deployment: Final = _opus_deployment()
+    deployment: Final = _claude_deployment(model=model)
     params: Final = TypeAdapter(dict[str, object]).validate_python(deployment["litellm_params"])
     router: Final = litellm.Router(
         model_list=[{**deployment, "litellm_params": {**params, "api_key": api_key}}], num_retries=0
@@ -906,7 +912,7 @@ async def test_opus_count_carries_only_original_client_identity_without_changing
 
     async def request() -> None:
         await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
-            model="opus-fixture",
+            model="claude-fixture",
             messages=_messages(),
             max_tokens=100,
             thinking={"type": "adaptive", "display": "updates"},
@@ -948,28 +954,29 @@ async def test_opus_count_carries_only_original_client_identity_without_changing
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ("messages", "chat", "responses"))
 @pytest.mark.parametrize("failure", (False, True))
-async def test_real_router_opus_uses_one_provider_count_and_never_sends_rejected_inference(
-    monkeypatch: pytest.MonkeyPatch, route: str, failure: bool
+@pytest.mark.parametrize("model", _CLAUDE_MODELS)
+async def test_real_router_claude_uses_one_provider_count_and_never_sends_rejected_inference(
+    monkeypatch: pytest.MonkeyPatch, model: str, route: str, failure: bool
 ) -> None:
     transport: Final = CountTransport(
         {"error": "count unavailable"} if failure else {"input_tokens": 100}, 503 if failure else 200
     )
     client: Final = _install_count_transport(monkeypatch, transport)
     monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
-    router: Final = litellm.Router(model_list=[_opus_deployment()], num_retries=0)
+    router: Final = litellm.Router(model_list=[_claude_deployment(model=model)], num_retries=0)
     try:
         with pytest.raises(litellm.BadRequestError if failure else litellm.ContextWindowExceededError):
             if route == "messages":
                 await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由方法参数未标注
-                    model="opus-fixture", messages=_messages(), max_tokens=10
+                    model="claude-fixture", messages=_messages(), max_tokens=10
                 )
             elif route == "chat":
                 await router.acompletion(  # pyright: ignore[reportUnknownMemberType]  # 上游路由方法参数未标注
-                    model="opus-fixture", messages=_messages(), max_tokens=10
+                    model="claude-fixture", messages=_messages(), max_tokens=10
                 )
             else:
                 await router.aresponses(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由方法参数未标注
-                    model="opus-fixture",
+                    model="claude-fixture",
                     input=[
                         {"type": "reasoning", "summary": [], "encrypted_content": "opaque-history"},
                         {"role": "user", "content": "Hello"},
@@ -984,18 +991,19 @@ async def test_real_router_opus_uses_one_provider_count_and_never_sends_rejected
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ("chat", "responses", "messages"))
-async def test_real_router_opus_count_and_inference_use_the_same_transformed_body(
-    monkeypatch: pytest.MonkeyPatch, route: str
+@pytest.mark.parametrize("model", _CLAUDE_MODELS)
+async def test_real_router_claude_count_and_inference_use_the_same_transformed_body(
+    monkeypatch: pytest.MonkeyPatch, model: str, route: str
 ) -> None:
     transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
     client: Final = _install_count_transport(monkeypatch, transport)
     monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
-    router: Final = litellm.Router(model_list=[_opus_deployment()], num_retries=0)
+    router: Final = litellm.Router(model_list=[_claude_deployment(model=model)], num_retries=0)
     schema: Final = {"type": "object", "properties": {"query": {"type": "string"}}}
     try:
         if route == "chat":
             response: Final = await router.acompletion(  # pyright: ignore[reportUnknownMemberType]  # 上游路由方法参数未标注
-                model="opus-fixture",
+                model="claude-fixture",
                 messages=[{"role": "system", "content": "System instructions"}, *_messages()],
                 tools=[
                     {
@@ -1008,7 +1016,7 @@ async def test_real_router_opus_count_and_inference_use_the_same_transformed_bod
             assert _answer(response) == "Accepted"
         elif route == "messages":
             await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由方法参数未标注
-                model="opus-fixture",
+                model="claude-fixture",
                 messages=[
                     {"role": "user", "content": "Hello"},
                     {"role": "assistant", "content": "Hello"},
@@ -1024,7 +1032,7 @@ async def test_real_router_opus_count_and_inference_use_the_same_transformed_bod
             )
         else:
             await router.aresponses(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由方法参数未标注
-                model="opus-fixture",
+                model="claude-fixture",
                 input="Hello",
                 instructions="System instructions",
                 tools=[{"type": "function", "name": "lookup", "description": "Look up records", "parameters": schema}],
@@ -1039,6 +1047,7 @@ async def test_real_router_opus_count_and_inference_use_the_same_transformed_bod
         assert {key: counted[key] for key in ("model", "system", "messages", "tools")} == {
             key: sent[key] for key in ("model", "system", "messages", "tools")
         }
+        assert counted["model"] == sent["model"] == model
         if route == "messages":
             assert counted["thinking"] == sent["thinking"]
             assert counted["output_config"] == sent["output_config"]
@@ -1056,25 +1065,26 @@ async def test_real_router_opus_count_and_inference_use_the_same_transformed_bod
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", (False, True))
 @pytest.mark.parametrize("route", ("chat", "messages"))
-async def test_rejected_opus_request_does_not_cool_down_the_next_request(
-    monkeypatch: pytest.MonkeyPatch, failure: bool, route: str
+@pytest.mark.parametrize("model", _CLAUDE_MODELS)
+async def test_rejected_claude_request_does_not_cool_down_the_next_request(
+    monkeypatch: pytest.MonkeyPatch, model: str, failure: bool, route: str
 ) -> None:
     counter: Final = AsyncMock(side_effect=[TimeoutError("fixture") if failure else 100, 75])
     transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
     client: Final = _install_count_transport(monkeypatch, transport)
-    monkeypatch.setattr(litellm, "callbacks", [RequestAdmission(opus_counter=counter)])
+    monkeypatch.setattr(litellm, "callbacks", [RequestAdmission(claude_counter=counter)])
     router: Final = litellm.Router(
-        model_list=[_opus_deployment()], num_retries=0, allowed_fails=0, cooldown_time=60
+        model_list=[_claude_deployment(model=model)], num_retries=0, allowed_fails=0, cooldown_time=60
     )
 
     async def request() -> None:
         if route == "messages":
             await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由
-                model="opus-fixture", messages=_messages(), max_tokens=10
+                model="claude-fixture", messages=_messages(), max_tokens=10
             )
         else:
             await router.acompletion(  # pyright: ignore[reportUnknownMemberType]  # 上游路由参数未标注
-                model="opus-fixture", messages=_messages(), max_tokens=10
+                model="claude-fixture", messages=_messages(), max_tokens=10
             )
 
     try:
@@ -1113,11 +1123,11 @@ async def test_opus_count_matches_final_inference_options(
     client: Final = _install_count_transport(monkeypatch, transport)
     monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
     monkeypatch.setattr(litellm, "reasoning_auto_summary", auto_summary)
-    router: Final = litellm.Router(model_list=[_opus_deployment()], num_retries=0)
+    router: Final = litellm.Router(model_list=[_claude_deployment()], num_retries=0)
     try:
         if route == "messages":
             await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
-                model="opus-fixture",
+                model="claude-fixture",
                 messages=_messages(),
                 max_tokens=8192,
                 system="Policy",
@@ -1125,7 +1135,7 @@ async def test_opus_count_matches_final_inference_options(
             )
         else:
             await router.acompletion(  # pyright: ignore[reportUnknownMemberType, reportCallIssue]  # 参数化原生参数
-                model="opus-fixture",
+                model="claude-fixture",
                 messages=[{"role": "system", "content": "Policy"}, *_messages()],
                 max_tokens=8192,
                 **options,  # pyright: ignore[reportArgumentType]  # 测试只提供原生参数，不覆盖 stream
@@ -1180,11 +1190,11 @@ async def test_native_opus_extra_body_does_not_override_the_effective_request(
     transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
     client: Final = _install_count_transport(monkeypatch, transport)
     monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
-    router: Final = litellm.Router(model_list=[_opus_deployment()], num_retries=0)
+    router: Final = litellm.Router(model_list=[_claude_deployment()], num_retries=0)
     before: Final = copy.deepcopy(extra)
     try:
         await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
-            model="opus-fixture",
+            model="claude-fixture",
             messages=_messages(),
             max_tokens=8192,
             thinking={"type": "adaptive", "display": "omitted"},
@@ -1218,11 +1228,11 @@ async def test_chat_opus_extra_body_cannot_be_counted_as_flattened_native_input(
     transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
     client: Final = _install_count_transport(monkeypatch, transport)
     monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
-    router: Final = litellm.Router(model_list=[_opus_deployment()], num_retries=0)
+    router: Final = litellm.Router(model_list=[_claude_deployment()], num_retries=0)
     try:
         with pytest.raises(litellm.BadRequestError, match="无法核验 extra_body"):
             await router.acompletion(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
-                model="opus-fixture", messages=_messages(), max_tokens=100, extra_body=extra
+                model="claude-fixture", messages=_messages(), max_tokens=100, extra_body=extra
             )
         assert transport.requests == ()
     finally:
@@ -1232,21 +1242,22 @@ async def test_chat_opus_extra_body_cannot_be_counted_as_flattened_native_input(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("force_chat", (False, True))
-async def test_native_responses_cannot_bypass_opus_count_but_explicit_chat_bridge_can_run(
-    monkeypatch: pytest.MonkeyPatch, force_chat: bool
+@pytest.mark.parametrize("model", _CLAUDE_MODELS)
+async def test_native_responses_cannot_bypass_claude_count_but_explicit_chat_bridge_can_run(
+    monkeypatch: pytest.MonkeyPatch, model: str, force_chat: bool
 ) -> None:
     transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
     client: Final = _install_count_transport(monkeypatch, transport)
     monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
     deployment: Final = {
-        **_opus_deployment(),
-        "model_info": {"id": "opus-fixture", "max_input_tokens": 100, "supported_endpoints": ["/v1/responses"]},
+        **_claude_deployment(model=model),
+        "model_info": {"id": "claude-fixture", "max_input_tokens": 100, "supported_endpoints": ["/v1/responses"]},
     }
     router: Final = litellm.Router(model_list=[deployment], num_retries=0)
     try:
         if force_chat:
             await router.aresponses(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由方法参数未标注
-                model="opus-fixture",
+                model="claude-fixture",
                 input="Hello",
                 max_output_tokens=10,
                 use_chat_completions_api=True,
@@ -1258,7 +1269,7 @@ async def test_native_responses_cannot_bypass_opus_count_but_explicit_chat_bridg
         else:
             with pytest.raises(litellm.BadRequestError, match="原生 Responses 无法核验"):
                 await router.aresponses(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由方法参数未标注
-                    model="opus-fixture",
+                    model="claude-fixture",
                     input="Hello",
                     max_output_tokens=10,
                 )
@@ -1270,15 +1281,16 @@ async def test_native_responses_cannot_bypass_opus_count_but_explicit_chat_bridg
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overrides", ({"custom_llm_provider": "openai"}, {"model": "custom-opus-alias"}))
-async def test_opus_base_model_cannot_defer_an_unverified_responses_backend(overrides: dict[str, object]) -> None:
+@pytest.mark.parametrize("model", _CLAUDE_MODELS)
+async def test_claude_base_model_cannot_defer_an_unverified_responses_backend(model: str, overrides: dict[str, object]) -> None:
     counter: Final = AsyncMock(return_value=75)
-    hook: Final = RequestAdmission(opus_counter=counter)
+    hook: Final = RequestAdmission(claude_counter=counter)
     with pytest.raises(litellm.BadRequestError, match="原生 Responses 无法核验"):
         await hook.async_pre_call_deployment_hook(
             {
-                "model": _OPUS,
+                "model": model,
                 "input": "Hello",
-                "model_info": {"base_model": _OPUS, "max_input_tokens": 100},
+                "model_info": {"base_model": model, "max_input_tokens": 100},
                 **overrides,
             },
             CallTypes.aresponses,
