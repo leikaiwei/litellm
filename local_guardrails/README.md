@@ -655,7 +655,7 @@ Rerank、音频转写和 evaluation，避免 Router 内部占位消息误触发�
 `1000000`，当前 DeepSeek V4.1 Flash 同源部署为 `970000`，保留其他已有较小上限。
 两个暂不使用的本地 LM Studio 模型保持原配置，未按未经核验的记忆值补写容量
 
-计数复用 LiteLLM 的 tokenizer、Anthropic system 提取和 Responses 输入转换，包含 system、
+非 Opus 部署计数复用 LiteLLM 的 tokenizer、Anthropic system 提取和 Responses 输入转换，包含 system、
 instructions、工具定义和工具历史，不重命名工具，不修改用户消息。计数失败或全局计数关闭时，
 返回明确的本地无法核验提示，建议 `/compact` 或开启新会话，不再把未知长度的请求继续发给
 上游。服务端搜索的加密结果等有效但不可本地计数的历史，也可能被此严格策略拒绝，不能把它
@@ -686,7 +686,33 @@ deployment hook。该路径有真实 Router 离线回归，不会新增自动压
 
 tokenizer 首次加载遵循 LiteLLM 既有配置。若部署要求禁止 Hugging Face 下载，可使用
 `litellm_settings.disable_hf_tokenizer_download: true`，但这会让相关模型回落到通用 tokenizer，
-需要接受估算精度变化。本插件不临时改动进程级 tokenizer 开关，也不发起付费计数或生成请求
+需要接受估算精度变化。本插件不临时改动进程级 tokenizer 开关，也不发起模型生成请求
+
+### Opus 上游计数（本地待部署）
+
+Opus 候选不再以本地 tokenizer 的估算值判断是否可发送。候选阶段保留图片校验和输入上限检查，
+选定部署后调用该部署上游的 `/v1/messages/count_tokens`，等于或超过输入上限即拒绝。
+识别依据是部署的模型或 base_model，不是客户端组名，Opus 组中的其他后端仍沿用原有检查。
+当前支持 Anthropic 协议 Opus 上游，其他协议的 Opus 部署拒绝发送，避免误用计数端点
+
+计数直接复用现有 `AnthropicCountTokensHandler`，不经 Router 重选部署，也不调用会回退本地的
+`acount_tokens()`。命名凭据在副本中按 LiteLLM 原有优先级合并，实际请求不变。Messages 保留
+system、tools、thinking、tool_choice 和 output_config；Chat 复用现有 Anthropic 请求转换器。
+Responses 在外层检查图片和隐藏历史，再由现有 Chat 桥接后的 deployment hook 计数，避免
+对转换前后请求重复调用。声明原生 `/v1/responses` 透传的 Opus 部署会被拒绝，除非显式启用
+`use_chat_completions_api`，确保必经 Chat 检查。服务端上下文编辑仍按编辑前的完整输入检查
+
+计数最多等待 30 秒，鉴权失败、超时、上游错误或缺少有效的正整数 `input_tokens` 都拒绝当前
+Opus 请求，不回退本地估算。错误只显示异常类型，不回显上游正文或凭据。供应商计数也有延迟、
+限流和可用性成本；中转是否真正调用官方计数取决于供应商实现。原有 Router fallback 策略不变
+
+这次只更新外部挂载的 `request_admission.py`，沿用现有 patch.4 镜像，不需要新建镜像或修改
+模型限额。部署时需备份旧插件、核验新文件哈希并重启主代理加载；回滚恢复旧插件再重启。
+此改动目前仅本地验证，尚未部署生产
+
+本地验证通过全部 569 项外部插件回归，其中准入测试 60 项，ruff 和 basedpyright 通过。
+新增测试使用真实 Router 和模拟 HTTP 传输，覆盖三种接口的拒绝路径、Chat/Responses 计数与
+推理内容一致、命名凭据、无效计数和原生 Responses 透传防漏检，没有发送真实推理请求
 
 ### 注册
 

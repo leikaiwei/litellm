@@ -1,6 +1,8 @@
+import asyncio
 import base64
 import binascii
-from collections.abc import Iterator, Mapping, Sequence
+import copy
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Final, cast
@@ -8,18 +10,23 @@ from typing import Final, cast
 from openai.types.responses.response_create_params import ResponseInputParam
 from opentelemetry.trace import Span
 from PIL import Image
-from pydantic import TypeAdapter
+from pydantic import JsonValue, TypeAdapter
 
 import litellm
 from litellm.constants import MAX_IMAGE_URL_DOWNLOAD_SIZE_MB
 from litellm.exceptions import MalformedRequestFieldError
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.token_counter import (
     calculate_img_tokens,
     high_detail_image_token_upper_bound,
     offload_token_count,
     token_counter,  # pyright: ignore[reportUnknownVariableType]  # 上游 custom_tokenizer 包含裸 dict
 )
+from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
+from litellm.llms.anthropic.count_tokens.transformation import COUNT_TOKEN_OPTION_NAMES
 from litellm.llms.anthropic.pass_through.messages.utils import anthropic_system_to_openai_message
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig as ResponsesConfig,
@@ -29,6 +36,9 @@ from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
 from litellm.types.utils import CallTypes
 
 _OBJECT: Final = TypeAdapter(dict[str, object])
+_JSON_OBJECT: Final = TypeAdapter(dict[str, JsonValue])
+_JSON_MESSAGES: Final = TypeAdapter(list[dict[str, JsonValue]])
+_OPTIONAL_STRING: Final = TypeAdapter[str | None](str | None)
 _ITEMS: Final = TypeAdapter(tuple[object, ...])
 _MESSAGES: Final = TypeAdapter(tuple[dict[str, object], ...])
 _TOOL_CHOICE: Final = TypeAdapter[str | dict[str, object] | None](str | dict[str, object] | None)
@@ -302,6 +312,95 @@ def _raise_context(model: str, counts: Sequence[tuple[Candidate, int]]) -> None:
     )
 
 
+def _is_opus(candidate: Candidate) -> bool:
+    return candidate.model.removeprefix("anthropic/").startswith("claude-opus-")
+
+
+def _opus_body(data: Mapping[str, object], model: str, call_type: CallTypes) -> dict[str, JsonValue]:
+    fields: Final = {**data, **_mapping(data.get("extra_body"))}
+    if call_type in (CallTypes.anthropic_messages, CallTypes.aanthropic_messages):
+        return _JSON_OBJECT.validate_python(
+            {key: fields[key] for key in ("messages", "system", "tools", *COUNT_TOKEN_OPTION_NAMES) if key in fields}
+        )
+    config: Final = AnthropicConfig()
+    chat_options: Final = {
+        key: fields[key]
+        for key in (
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "response_format",
+            "reasoning_effort",
+            "web_search_options",
+        )
+        if key in fields
+    }
+    native_options: Final = {key: fields[key] for key in ("thinking", "output_config") if key in fields}
+    options: Final = _JSON_OBJECT.validate_python(
+        config.map_openai_params(  # pyright: ignore[reportUnknownMemberType]  # 上游转换器仍返回裸 dict，出口验证类型
+            non_default_params=copy.deepcopy(chat_options),
+            optional_params=copy.deepcopy(native_options),
+            model=model,
+            drop_params=fields.get("drop_params") is True,
+        )
+    )
+    return _JSON_OBJECT.validate_python(
+        config.transform_request(  # pyright: ignore[reportUnknownMemberType]  # 上游转换器仍返回裸 dict，出口验证类型
+            model=model,
+            messages=cast(  # cast-ok: 共享消息转换器返回 Chat 形状，供应商转换器继续校验
+                list[AllMessageValues], copy.deepcopy(list(_messages(fields)))
+            ),
+            optional_params=options,
+            litellm_params={
+                **data,
+                **{
+                    key: copy.deepcopy(data[key])
+                    for key in ("metadata", "litellm_metadata", "model_info")
+                    if key in data
+                },
+            },
+            headers={},
+        )
+    )
+
+
+async def _count_opus(data: Mapping[str, object], call_type: CallTypes) -> int:
+    credential_name: Final = data.get("litellm_credential_name")
+    credentials: Final = (
+        CredentialAccessor.get_credential_values(credential_name) if isinstance(credential_name, str) else {}
+    )
+    params: Final = {**credentials, **data}
+    model: Final = str(params.get("model", "")).removeprefix("anthropic/")
+    provider: Final = params.get("custom_llm_provider")
+    if provider not in (None, "anthropic") or not model.startswith("claude-opus-"):
+        raise ValueError("Opus 部署不是可核验的 Anthropic 上游")
+    base: Final = _OPTIONAL_STRING.validate_python(params.get("api_base"))
+    async with asyncio.timeout(30):
+        auth: Final = await AnthropicModelInfo.aget_auth_header(
+            api_key=_OPTIONAL_STRING.validate_python(params.get("api_key")) or litellm.anthropic_key or litellm.api_key,
+            api_base=base,
+            litellm_params=params,
+            allow_workload_identity=True,
+        )
+        if auth is None:
+            raise ValueError("Opus 上游计数缺少凭据")
+        body: Final = await offload_token_count(_opus_body)(params, model, call_type)
+        response: Final = await AnthropicCountTokensHandler().handle_count_tokens_request(
+            model=model,
+            messages=_JSON_MESSAGES.validate_python(body.get("messages")),
+            auth_header=auth,
+            api_base=base,
+            timeout=30,
+            tools=_JSON_MESSAGES.validate_python(body["tools"]) if body.get("tools") is not None else None,
+            system=body.get("system"),
+            optional_params={key: body[key] for key in COUNT_TOKEN_OPTION_NAMES if key in body},
+        )
+    count: Final = response.get("input_tokens")
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        raise ValueError("Opus 上游未返回有效 input_tokens")
+    return count
+
+
 def _admit(
     data: Mapping[str, object], candidates: Sequence[Candidate], model: str, pending_compaction: bool = False
 ) -> list[dict[str, object]]:
@@ -317,18 +416,19 @@ def _admit(
         )
     if pending_compaction:
         return [candidate.deployment for candidate in bounded]
-    models: Final = frozenset(candidate.model for candidate in bounded if candidate.limit is not None)
+    models: Final = frozenset(
+        candidate.model for candidate in bounded if candidate.limit is not None and not _is_opus(candidate)
+    )
     counts: Final = {counted_model: _count(data, counted_model) for counted_model in models}
     for count in counts.values():
         if isinstance(count, AdmissionProblem):
             _raise_invalid(count, model)
-    measured: Final = tuple(
-        (candidate, counts[candidate.model]) for candidate in bounded if candidate.limit is not None
-    )
+    measured: Final = tuple((candidate, counts[candidate.model]) for candidate in bounded if candidate.model in counts)
     allowed: Final = [
         candidate.deployment
         for candidate in bounded
         if candidate.local_response
+        or _is_opus(candidate)
         or (candidate.limit is not None and cast(int, counts[candidate.model]) < candidate.limit)
     ]
     if candidates and not allowed:
@@ -337,6 +437,10 @@ def _admit(
 
 
 class RequestAdmission(CustomLogger):
+    def __init__(self, opus_counter: Callable[[Mapping[str, object], CallTypes], Awaitable[int]] = _count_opus) -> None:
+        super().__init__()  # pyright: ignore[reportUnknownMemberType]  # 上游 callback 构造器的 kwargs 尚未注解
+        self._opus_counter = opus_counter
+
     async def async_filter_deployments(
         self,
         model: str,
@@ -358,12 +462,49 @@ class RequestAdmission(CustomLogger):
     async def async_pre_call_deployment_hook(
         self, kwargs: dict[str, object], call_type: CallTypes | None
     ) -> dict[str, object] | None:
-        if call_type not in _CALLS or ("messages" not in kwargs and "input" not in kwargs):
+        if call_type is None or call_type not in _CALLS or ("messages" not in kwargs and "input" not in kwargs):
             return None
         model: Final = kwargs.get("model")
         deployment: Final = {"litellm_params": kwargs, "model_info": kwargs.get("model_info")}
         candidate: Final = _candidate(deployment)
         await offload_token_count(_admit)(kwargs, (candidate,), model if isinstance(model, str) else "")
+        if not _is_opus(candidate):
+            return None
+        problem: Final = (
+            _responses_problem(kwargs) if call_type in (CallTypes.responses, CallTypes.aresponses) else None
+        )
+        if problem is not None:
+            _raise_invalid(problem, candidate.model)
+        if call_type in (CallTypes.responses, CallTypes.aresponses):
+            endpoints: Final = _mapping(kwargs.get("model_info")).get("supported_endpoints")
+            native: Final = isinstance(endpoints, (list, tuple)) and "/v1/responses" in endpoints
+            if (
+                kwargs.get("custom_llm_provider") not in (None, "anthropic")
+                or not isinstance(model, str)
+                or not model.removeprefix("anthropic/").startswith("claude-opus-")
+                or (native and kwargs.get("use_chat_completions_api") is not True)
+            ):
+                _raise_invalid(
+                    AdmissionProblem("input", "Opus 原生 Responses 无法核验，请使用 Messages 或 Chat 桥接", False),
+                    candidate.model,
+                )
+            return None
+        try:
+            count: Final = await self._opus_counter(kwargs, call_type)
+        except Exception as error:
+            _raise_invalid(
+                AdmissionProblem(
+                    "count_tokens", f"Opus 上游计数失败（{type(error).__name__}），请求未发送，请稍后重试", False
+                ),
+                candidate.model,
+            )
+            return None
+        if candidate.limit is not None and count >= candidate.limit:
+            raise litellm.ContextWindowExceededError(
+                message=f"Opus 上游计数 {count} tokens，达到输入上限 {candidate.limit}。请先 /compact 或开启新会话",
+                model=candidate.model,
+                llm_provider="anthropic",
+            )
         return None
 
 
