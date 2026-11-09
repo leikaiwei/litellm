@@ -227,6 +227,12 @@ def _responses_problem(data: Mapping[str, object]) -> AdmissionProblem | None:
     if isinstance(raw_input, str):
         return None
     for index, item in enumerate(_MESSAGES.validate_python(raw_input)):
+        if (
+            item.get("type") in ("reasoning", "compaction")
+            and isinstance(encrypted := item.get("encrypted_content"), str)
+            and encrypted
+        ):
+            continue
         if item.get("type") == "item_reference" or item.get("encrypted_content") is not None:
             return AdmissionProblem(
                 f"input[{index}]", "无法本地核验引用或加密历史，请提供完整可读历史或开启新会话", False

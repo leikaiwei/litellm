@@ -658,8 +658,7 @@ Rerank、音频转写和 evaluation，避免 Router 内部占位消息误触发�
 非 Opus 部署计数复用 LiteLLM 的 tokenizer、Anthropic system 提取和 Responses 输入转换，包含 system、
 instructions、工具定义和工具历史，不重命名工具，不修改用户消息。计数失败或全局计数关闭时，
 返回明确的本地无法核验提示，建议 `/compact` 或开启新会话，不再把未知长度的请求继续发给
-上游。服务端搜索的加密结果等有效但不可本地计数的历史，也可能被此严格策略拒绝，不能把它
-解释成用户请求格式非法
+上游。Responses 的正常加密推理和加密压缩历史除外，这类内容按下述规则保留并交由上游校验
 
 内嵌图片在受限后台线程里复用 Pillow 校验结构和压缩像素。解码前按现有
 `MAX_IMAGE_URL_DOWNLOAD_SIZE_MB` 限制分配，解码后遵守 Pillow 像素上限。返回错误时包含
@@ -671,12 +670,29 @@ instructions、工具定义和工具历史，不重命名工具，不修改用�
 
 计数副本中的远端图片使用已有 high-detail tile 上界估算，实际请求和 detail 参数保持原样；
 本地图片继续使用已有尺寸计数。这仍是估算，不是所有供应商的精确视觉 token 公式。
-Responses 的 `previous_response_id`、`conversation`、`item_reference`、加密推理历史，以及
-共享转换器无法读取的输入项会返回无法核验提示，要求完整可读历史或无状态新会话。启用前必须
+Responses 的 `reasoning`、`compaction` 输入项携带非空字符串 `encrypted_content` 时，不再因
+密文不可本地读取而拒绝。仍通过共享转换器检查可读正文、推理摘要、系统指令、工具定义和工具
+历史，原始密文与请求保持不变。此时本地计数只覆盖可读部分，不代表完整上下文长度，密文的
+有效性和实际上下文上限由上游最终校验，不能用密文字符数代替 token 数。Messages 中的
+`redacted_thinking` 转入 Responses 后同样适用。协议依据见
+[OpenAI 推理历史](https://developers.openai.com/api/docs/guides/reasoning)和
+[加密压缩历史](https://developers.openai.com/api/docs/guides/compaction)，核对日期 2026-11-09
+
+Responses 的 `previous_response_id`、`conversation`、`item_reference`，以及
+共享转换器无法读取的未知输入项仍返回无法核验提示，要求完整可读历史或无状态新会话。启用前必须
 确认客户端能接受这项有状态 Responses 限制；不会把这些有效协议项称为非法格式。工具参数中
 同名普通 JSON 字段不受此限制。远端文件等供应商持有的内容仍无法仅靠当前请求完整还原。
 模型 tokenizer 不一致、后端模板及供应商额外注入也可能造成计数误差，
 保守输入上限只能留出余量，不能证明上游绝不会报超限
+
+2026-11-09 加密历史兼容修复仅在本地验证，等待维护窗口与 Opus 计数修复一同部署。
+该修复只更新外部准入插件，不额外修改 LiteLLM 核心或 CPA。Opus 仍使用上游计数，计数失败
+仍拒绝请求，不因本项兼容修复退回本地估算
+
+本机隔离代理重放同一份失败请求，普通和流式调用真实上游均返回 HTTP 200，实际模型均为
+`gpt-6.1-terra`。普通响应输入 26065 tokens，输出限制 32 tokens；流式收到 `message_stop`
+且没有错误事件。169 项相关测试通过，覆盖加密历史转发、可读内容超限和 Opus 计数失败拒绝。
+部署时需使用本次提交的外部插件，不能继续使用此前已暂存的旧候选插件
 
 已有复杂路由自动压缩处于 pending 时，候选筛选只校验图片，把长度复核留给压缩完成后的
 deployment hook。该路径有真实 Router 离线回归，不会新增自动压缩调用。Messages 的客户端

@@ -14,6 +14,7 @@ from pytest_socket import disable_socket, enable_socket
 
 import litellm
 from litellm import ModelResponse
+from litellm.litellm_core_utils.prompt_templates.common_utils import encrypted_reasoning_signature
 from litellm.litellm_core_utils.token_counter import high_detail_image_token_upper_bound
 from litellm.llms.anthropic.chat import handler as chat_handler
 from litellm.llms.anthropic.count_tokens import handler as count_handler
@@ -135,16 +136,9 @@ _UNVERIFIABLE_RESPONSES: Final[tuple[dict[str, object], ...]] = (
     {"conversation": "conversation-id"},
     {"input": [{"type": "item_reference", "id": "message-id"}]},
     {"input": [{"type": "future_unknown", "private_value": "not-counted " * 100}]},
-    {"input": [{"type": "reasoning", "summary": [], "encrypted_content": "opaque"}]},
-    {
-        "input": [
-            {
-                "type": "reasoning",
-                "summary": [{"type": "summary_text", "text": "Short summary"}],
-                "encrypted_content": "opaque",
-            }
-        ]
-    },
+    {"input": [{"type": "future_unknown", "encrypted_content": "opaque"}]},
+    {"input": [{"type": "reasoning", "summary": [], "encrypted_content": 42}]},
+    {"input": [{"type": "compaction", "encrypted_content": ""}]},
 )
 
 
@@ -153,6 +147,140 @@ _UNVERIFIABLE_RESPONSES: Final[tuple[dict[str, object], ...]] = (
 async def test_responses_hidden_history_is_not_silently_counted_as_zero(extra: dict[str, object]) -> None:
     with pytest.raises(litellm.BadRequestError, match=r"完整|新会话"):
         await _HOOK.async_filter_deployments("group", [_deployment(10000)], None, {"input": "hello", **extra})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ("reasoning", "compaction"))
+@pytest.mark.parametrize("readable_field", ("input", "summary", "instructions", "tools", "tool_output"))
+async def test_encrypted_history_preserves_payload_and_checks_readable_context(kind: str, readable_field: str) -> None:
+    opaque: Final[dict[str, object]] = {"type": kind, "summary": [], "encrypted_content": "opaque-history" * 10000}
+    request: Final[dict[str, object]] = {"input": [opaque, {"role": "user", "content": "Continue"}]}
+    before: Final = copy.deepcopy(request)
+    assert await _filter(None, limit=100, **request)
+    assert (
+        await _HOOK.async_pre_call_deployment_hook(
+            {"model": _MODEL, "model_info": {"max_input_tokens": 100}, **request}, CallTypes.aresponses
+        )
+        is None
+    )
+    assert request == before
+
+    text: Final = "readable context " * 200
+    addition: Final[dict[str, object]] = (
+        {"input": [opaque, {"role": "user", "content": text}]}
+        if readable_field == "input"
+        else {
+            "input": [
+                {
+                    **opaque,
+                    **(
+                        {"summary": [{"type": "summary_text", "text": text}]}
+                        if kind == "reasoning"
+                        else {"content": text}
+                    ),
+                }
+            ]
+        }
+        if readable_field == "summary"
+        else {"instructions": text}
+        if readable_field == "instructions"
+        else {"tools": [{"type": "function", "name": "read", "description": text, "parameters": {"type": "object"}}]}
+        if readable_field == "tools"
+        else {"input": [opaque, {"type": "function_call_output", "call_id": "call_1", "output": text}]}
+    )
+    too_long: Final = {**request, **addition}
+    with pytest.raises(litellm.ContextWindowExceededError):
+        await _filter(None, limit=100, **too_long)
+    with pytest.raises(litellm.ContextWindowExceededError):
+        await _HOOK.async_pre_call_deployment_hook(
+            {"model": _MODEL, "model_info": {"max_input_tokens": 100}, **too_long}, CallTypes.aresponses
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ("messages", "responses"))
+async def test_real_router_replays_encrypted_history_to_responses_provider(
+    monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    encrypted: Final = "opaque-upstream-history"
+    item: Final[dict[str, object]] = {"type": "reasoning", "summary": [], "encrypted_content": encrypted}
+    transport: Final = ResponsesHistoryTransport()
+    client: Final = AsyncHTTPHandler(transport=httpx.MockTransport(transport))
+
+    def get_client(**kwargs: object) -> AsyncHTTPHandler:
+        return client
+
+    monkeypatch.setattr(llm_http_handler, "get_async_httpx_client", get_client)
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "encrypted-fixture",
+                "litellm_params": {
+                    "model": "openai/gpt-6.1-terra",
+                    "api_key": "test-key",
+                    "api_base": "https://test.invalid/v1",
+                },
+                "model_info": {"max_input_tokens": 100, "supported_endpoints": ["/v1/responses"]},
+            }
+        ],
+        num_retries=0,
+    )
+    try:
+        with patch.object(litellm, "callbacks", [RequestAdmission()]):
+            if route == "responses":
+                await router.aresponses(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
+                    model="encrypted-fixture", input=[item, {"role": "user", "content": "Continue"}], max_output_tokens=10
+                )
+            else:
+                await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
+                    model="encrypted-fixture",
+                    messages=[
+                        {"role": "user", "content": "Hello"},
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "redacted_thinking", "data": encrypted_reasoning_signature(encrypted)}
+                            ],
+                        },
+                        {"role": "user", "content": "Continue"},
+                    ],
+                    max_tokens=10,
+                )
+        assert len(transport.requests) == 1
+        sent: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[0].content)
+        assert item in TypeAdapter(list[dict[str, object]]).validate_python(sent["input"])
+        assert transport.requests[0].url.path == "/v1/responses"
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+class ResponsesHistoryTransport:
+    def __init__(self) -> None:
+        self.requests: tuple[httpx.Request, ...] = ()
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests = (*self.requests, request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_fixture",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "gpt-6.1-terra",
+                "output": [
+                    {
+                        "id": "msg_fixture",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "Accepted", "annotations": []}],
+                    }
+                ],
+                "usage": {"input_tokens": 20, "output_tokens": 1, "total_tokens": 21},
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -841,7 +969,12 @@ async def test_real_router_opus_uses_one_provider_count_and_never_sends_rejected
                 )
             else:
                 await router.aresponses(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由方法参数未标注
-                    model="opus-fixture", input="Hello", max_output_tokens=10
+                    model="opus-fixture",
+                    input=[
+                        {"type": "reasoning", "summary": [], "encrypted_content": "opaque-history"},
+                        {"role": "user", "content": "Hello"},
+                    ],
+                    max_output_tokens=10,
                 )
         assert len(transport.requests) == 1
     finally:
