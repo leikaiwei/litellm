@@ -52,6 +52,8 @@ Responses 正常的加密 reasoning、compaction 历史改为保留并交给上�
 
 本批尚未上线，生产仍为 patch.4 和回滚后的旧准入插件。曾两次仅更新插件后因实际客户端字段兼容问题回滚，不能把当时短文本验收当作发布依据。晚间 review 又修复了 Chat 计数参数漂移和旧版结构化输出计数问题，需从最终提交重新构建核心镜像并配套最新外置插件，禁止直接复用早先的候选镜像、暂存插件或 manifest。已有真实回放覆盖主渠道三系列生成及超限拒绝，两个备用渠道的生成权限故障在关闭插件时也存在，不能宣称所有渠道均正常
 
+2026-11-09 已完成 patch.5 构建与生产服务器预拉取，源码固定为 `3b0a3d4a6e9`，镜像为 `leikaiwei/litellm:v1.108.0-fork.patch.5`，digest 为 `sha256:30a88b8e23a89cce022ed042c54259b25ab99376cf910237fea58b6c9a17a4ee`。[发布构建](https://github.com/leikaiwei/litellm/actions/runs/42623399610)成功，正式镜像与新插件的断网校验通过，包含源码哈希、图片依赖、参数删除、结构化输出、加密历史和三系列准入。配套插件与 manifest 已独立暂存，尚未切换生产，也未对新镜像执行付费上游验收
+
 **PostgreSQL 空字节修复** — `proxy/utils.py`
 - 清洗 spend logs 中的 `\x00` 空字节，避免 PostgreSQL jsonb 写入失败（22P05）
 

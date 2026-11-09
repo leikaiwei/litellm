@@ -717,7 +717,10 @@ tokenizer 首次加载遵循 LiteLLM 既有配置。若部署要求禁止 Huggin
 以今天改动前的 `cd630e62698` 为基线运行完整 `scripts/pre_commit_lint.sh` 通过，五项 lint gate
 均未超出基线，插件单独 basedpyright 为零错误。当前插件 SHA256 为
 `99b7ba1cd607f1387ee60128d46d5868e57f4cca55c0875e5dddd63ad6a0ab82`。
-这些是本地源码验收结果，修复后的正式镜像尚未构建，也未执行新镜像真实上游验收或生产切换
+这些是本地源码验收结果。随后已构建并预拉取 `v1.108.0-fork.patch.5`，源码 `3b0a3d4a6e9`，
+镜像 digest 为 `sha256:30a88b8e23a89cce022ed042c54259b25ab99376cf910237fea58b6c9a17a4ee`。
+正式镜像与上述插件通过断网校验，覆盖源码哈希、Pillow、Chat 参数删除、结构化输出、加密历史
+和三系列准入。配套文件已独立暂存，尚未执行新镜像真实上游验收或生产切换
 
 三个 Claude 系列候选不再以本地 tokenizer 的估算值判断是否可发送。候选阶段保留图片校验和输入上限检查，
 选定部署后调用该部署上游的 `/v1/messages/count_tokens`，等于或超过输入上限即拒绝。
