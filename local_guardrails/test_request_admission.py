@@ -18,9 +18,11 @@ from litellm.litellm_core_utils.token_counter import high_detail_image_token_upp
 from litellm.llms.anthropic.chat import handler as chat_handler
 from litellm.llms.anthropic.count_tokens import handler as count_handler
 from litellm.llms.compaction import CompactionProtocol
+from litellm.llms.custom_httpx import llm_http_handler
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.custom_llm import CustomLLM
 from litellm.router_strategy.complexity_router.context_compaction import compaction_executor
+from litellm.types.llms.anthropic import ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import CallTypes, Choices, CredentialItem
 from litellm.utils import custom_llm_setup
@@ -642,6 +644,7 @@ def _install_count_transport(monkeypatch: pytest.MonkeyPatch, transport: CountTr
 
     monkeypatch.setattr(count_handler, "get_async_httpx_client", get_client)
     monkeypatch.setattr(chat_handler, "get_async_httpx_client", get_client)
+    monkeypatch.setattr(llm_http_handler, "get_async_httpx_client", get_client)
     return client
 
 
@@ -780,7 +783,7 @@ async def test_real_router_opus_uses_one_provider_count_and_never_sends_rejected
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ("chat", "responses"))
+@pytest.mark.parametrize("route", ("chat", "responses", "messages"))
 async def test_real_router_opus_count_and_inference_use_the_same_transformed_body(
     monkeypatch: pytest.MonkeyPatch, route: str
 ) -> None:
@@ -803,6 +806,22 @@ async def test_real_router_opus_count_and_inference_use_the_same_transformed_bod
                 max_tokens=10,
             )
             assert _answer(response) == "Accepted"
+        elif route == "messages":
+            await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由方法参数未标注
+                model="opus-fixture",
+                messages=[
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hello"},
+                    {"role": "system", "content": [], "output_config": {"effort": "high"}},
+                    {"role": "user", "content": "Continue"},
+                ],
+                system="System instructions",
+                tools=[{"name": "lookup", "description": "Look up records", "input_schema": schema}],
+                extra_headers={"anthropic-beta": "fixture-client-feature"},
+                thinking={"type": "adaptive"},
+                output_config={"effort": "high"},
+                max_tokens=10,
+            )
         else:
             await router.aresponses(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由方法参数未标注
                 model="opus-fixture",
@@ -820,6 +839,51 @@ async def test_real_router_opus_count_and_inference_use_the_same_transformed_bod
         assert {key: counted[key] for key in ("model", "system", "messages", "tools")} == {
             key: sent[key] for key in ("model", "system", "messages", "tools")
         }
+        if route == "messages":
+            assert counted["thinking"] == sent["thinking"]
+            assert counted["output_config"] == sent["output_config"]
+            assert set(transport.requests[1].headers["anthropic-beta"].split(",")) <= set(
+                transport.requests[0].headers["anthropic-beta"].split(",")
+            )
+            assert ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER in transport.requests[0].headers[
+                "anthropic-beta"
+            ].split(",")
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", (False, True))
+@pytest.mark.parametrize("route", ("chat", "messages"))
+async def test_rejected_opus_request_does_not_cool_down_the_next_request(
+    monkeypatch: pytest.MonkeyPatch, failure: bool, route: str
+) -> None:
+    counter: Final = AsyncMock(side_effect=[TimeoutError("fixture") if failure else 100, 75])
+    transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
+    client: Final = _install_count_transport(monkeypatch, transport)
+    monkeypatch.setattr(litellm, "callbacks", [RequestAdmission(opus_counter=counter)])
+    router: Final = litellm.Router(
+        model_list=[_opus_deployment()], num_retries=0, allowed_fails=0, cooldown_time=60
+    )
+
+    async def request() -> None:
+        if route == "messages":
+            await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由
+                model="opus-fixture", messages=_messages(), max_tokens=10
+            )
+        else:
+            await router.acompletion(  # pyright: ignore[reportUnknownMemberType]  # 上游路由参数未标注
+                model="opus-fixture", messages=_messages(), max_tokens=10
+            )
+
+    try:
+        with pytest.raises(litellm.BadRequestError if failure else litellm.ContextWindowExceededError):
+            await request()
+        assert transport.requests == ()
+        await request()
+        assert counter.await_count == 2
+        assert tuple(item.url.path for item in transport.requests) == ("/v1/messages",)
     finally:
         router.reset()
         await client.client.aclose()

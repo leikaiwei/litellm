@@ -698,6 +698,8 @@ Opus 候选不再以本地 tokenizer 的估算值判断是否可发送。候选�
 计数直接复用现有 `AnthropicCountTokensHandler`，不经 Router 重选部署，也不调用会回退本地的
 `acount_tokens()`。命名凭据在副本中按 LiteLLM 原有优先级合并，实际请求不变。Messages 保留
 system、tools、thinking、tool_choice 和 output_config；Chat 复用现有 Anthropic 请求转换器。
+计数请求保留客户端和鉴权 beta，并复用 Messages 的功能头推导。消息携带 `output_config`
+时还加入现有 `mid-conversation-output-config` beta，避免合法的逐轮配置被计数端点拒绝。
 Responses 在外层检查图片和隐藏历史，再由现有 Chat 桥接后的 deployment hook 计数，避免
 对转换前后请求重复调用。声明原生 `/v1/responses` 透传的 Opus 部署会被拒绝，除非显式启用
 `use_chat_completions_api`，确保必经 Chat 检查。服务端上下文编辑仍按编辑前的完整输入检查
@@ -708,8 +710,9 @@ Opus 请求，不回退本地估算。错误只显示异常类型，不回显上
 
 这次只更新外部挂载的 `request_admission.py`，沿用现有 patch.4 镜像，不需要新建镜像或修改
 模型限额。部署时需备份旧插件、核验新文件哈希并重启主代理加载；回滚恢复旧插件再重启。
-2026-11-09 已部署插件提交 `2b6fab9af53`，镜像保持 patch.4。主代理重启后就绪检查通过，
-插件挂载哈希一致，其他容器和配置不变。切换探测记录约 58 秒不可用
+2026-11-09 首次部署提交 `2b6fab9af53` 后，带逐轮 `output_config` 的计数请求被上游拒绝，
+导致正常 Opus 请求进入 fallback。已于 UTC 04:07 回滚旧插件，UTC 04:08 观察到真实 Opus
+请求成功。首次部署的健康检查与短文本计数不足以覆盖 Claude Code 实际请求，镜像仍为 patch.4
 
 本地验证通过全部 569 项外部插件回归，其中准入测试 60 项，ruff 和 basedpyright 通过。
 新增测试使用真实 Router 和模拟 HTTP 传输，覆盖三种接口的拒绝路径、Chat/Responses 计数与
@@ -718,6 +721,11 @@ Opus 请求，不回退本地估算。错误只显示异常类型，不回显上
 部署验收在正式镜像断网容器验证了放行、超限、503 和缺失计数，并在生产容器的独立检查进程中
 调用真实上游计数，验证低于上限放行、达到上限拒绝。该检查未调用推理端点，也未修改生产模型
 限额；不能视为真实客户端生成请求的端到端验收
+
+此次修复验证通过全部 574 项插件回归，其中准入测试 65 项，ruff 和 basedpyright 通过。
+新增回归覆盖原生 Messages 的逐轮 `output_config`、功能请求头，以及同一个 Router 中超限
+或计数失败后下一条正常请求仍能使用 Opus。正式镜像独立进程调用真实上游，验证计数
+`1200376` 的请求在 100 万上限处拒绝，Messages、Chat 和 Responses 的真实生成均返回 Opus
 
 ### 注册
 

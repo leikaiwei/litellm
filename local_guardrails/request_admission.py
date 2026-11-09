@@ -24,14 +24,19 @@ from litellm.litellm_core_utils.token_counter import (
     token_counter,  # pyright: ignore[reportUnknownVariableType]  # 上游 custom_tokenizer 包含裸 dict
 )
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
-from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+from litellm.llms.anthropic.common_utils import AnthropicModelInfo, merge_anthropic_beta_headers
 from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
 from litellm.llms.anthropic.count_tokens.transformation import COUNT_TOKEN_OPTION_NAMES
+from litellm.llms.anthropic.pass_through.messages.transformation import (
+    AnthropicMessagesConfig,
+    messages_carry_output_config,
+)
 from litellm.llms.anthropic.pass_through.messages.utils import anthropic_system_to_openai_message
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig as ResponsesConfig,
 )
 from litellm.router_strategy.complexity_router.context_compaction import compaction_pending
+from litellm.types.llms.anthropic import ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
 from litellm.types.utils import CallTypes
 
@@ -39,6 +44,7 @@ _OBJECT: Final = TypeAdapter(dict[str, object])
 _JSON_OBJECT: Final = TypeAdapter(dict[str, JsonValue])
 _JSON_MESSAGES: Final = TypeAdapter(list[dict[str, JsonValue]])
 _OPTIONAL_STRING: Final = TypeAdapter[str | None](str | None)
+_HEADERS: Final = TypeAdapter(dict[str, str])
 _ITEMS: Final = TypeAdapter(tuple[object, ...])
 _MESSAGES: Final = TypeAdapter(tuple[dict[str, object], ...])
 _TOOL_CHOICE: Final = TypeAdapter[str | dict[str, object] | None](str | dict[str, object] | None)
@@ -385,10 +391,32 @@ async def _count_opus(data: Mapping[str, object], call_type: CallTypes) -> int:
         if auth is None:
             raise ValueError("Opus 上游计数缺少凭据")
         body: Final = await offload_token_count(_opus_body)(params, model, call_type)
+        caller_headers: Final = {**_mapping(params.get("headers")), **_mapping(params.get("extra_headers"))}
+        caller_betas: Final = tuple(
+            str(value) for key, value in caller_headers.items() if key.lower() == "anthropic-beta"
+        )
+        per_turn_betas: Final = (
+            (ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER,)
+            if messages_carry_output_config(_JSON_MESSAGES.validate_python(body.get("messages")))
+            else ()
+        )
+        config: Final = AnthropicMessagesConfig()
+        count_headers: Final = _HEADERS.validate_python(
+            config._finalize_messages_headers(  # pyright: ignore[reportUnknownMemberType, reportPrivateUsage]  # 复用功能头
+                headers={
+                    **auth,
+                    "anthropic-beta": merge_anthropic_beta_headers(
+                        auth.get("anthropic-beta"), (*caller_betas, *per_turn_betas)
+                    ),
+                },
+                optional_params=body,
+                messages=list[object](_JSON_MESSAGES.validate_python(body.get("messages"))),
+            )
+        )
         response: Final = await AnthropicCountTokensHandler().handle_count_tokens_request(
             model=model,
             messages=_JSON_MESSAGES.validate_python(body.get("messages")),
-            auth_header=auth,
+            auth_header=count_headers,
             api_base=base,
             timeout=30,
             tools=_JSON_MESSAGES.validate_python(body["tools"]) if body.get("tools") is not None else None,
