@@ -42,7 +42,7 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 历史工具名跨供应商不兼容暂不做全局重命名。[#47434](https://github.com/BerriAI/litellm/pull/47434) 和 [#42963](https://github.com/BerriAI/litellm/pull/42963) 分别涉及 guardrail 恢复和 Bedrock 长度，未确认覆盖此次同一问题。修改名称还需保证声明、调用和结果关联，以及不同目的供应商往返一致，不能用某一供应商的修复宣称通用兼容
 
-**2026-11-09 待发布补丁，Claude 上游计数与加密历史兼容**
+**2026-11-09 已部署补丁，Claude 上游计数与加密历史兼容**
 
 Opus、Sonnet、Haiku 按实际部署调用现有 Anthropic `count_tokens` 处理器，使用该部署的凭据和输入上限，计数失败不退回本地估算。原生 Messages 与缓存预测共用请求转换，Chat 复用生成路径的参数转换，包含 `additional_drop_params` 和输出预算对 thinking 的影响。保留真实客户端 User-Agent、X-App 和功能 beta，只发送一个 Content-Type，不转发客户端鉴权头，也不伪造客户端身份。无需修改 CPA，现有路由与 fallback 保持原配置
 
@@ -50,9 +50,11 @@ Opus、Sonnet、Haiku 按实际部署调用现有 Anthropic `count_tokens` 处�
 
 Responses 正常的加密 reasoning、compaction 历史改为保留并交给上游校验，本地继续检查可读正文、摘要、指令与工具。密文不按字符数估算，也不宣称已完整计数。`previous_response_id`、`conversation`、`item_reference` 和未知输入项仍受原有无法核验策略限制。这是上述严格准入的明确例外，详细行为与验证记录见 [插件说明](local_guardrails/README.md#request_admission-请求上下文准入)
 
-本批尚未上线，生产仍为 patch.4 和回滚后的旧准入插件。曾两次仅更新插件后因实际客户端字段兼容问题回滚，不能把当时短文本验收当作发布依据。晚间 review 又修复了 Chat 计数参数漂移和旧版结构化输出计数问题，需从最终提交重新构建核心镜像并配套最新外置插件，禁止直接复用早先的候选镜像、暂存插件或 manifest。已有真实回放覆盖主渠道三系列生成及超限拒绝，两个备用渠道的生成权限故障在关闭插件时也存在，不能宣称所有渠道均正常
+本批上线前，生产保持 patch.4 和回滚后的旧准入插件。曾两次仅更新插件后因实际客户端字段兼容问题回滚，不能把当时短文本验收当作发布依据。晚间 review 又修复了 Chat 计数参数漂移和旧版结构化输出计数问题，已从最终提交重新构建核心镜像并配套最新外置插件，禁止直接复用早先的候选镜像、暂存插件或 manifest。已有真实回放覆盖主渠道三系列生成及超限拒绝，两个备用渠道的生成权限故障在关闭插件时也存在，不能宣称所有渠道均正常
 
-2026-11-09 已完成 patch.5 构建与生产服务器预拉取，源码固定为 `3b0a3d4a6e9`，镜像为 `leikaiwei/litellm:v1.108.0-fork.patch.5`，digest 为 `sha256:30a88b8e23a89cce022ed042c54259b25ab99376cf910237fea58b6c9a17a4ee`。[发布构建](https://github.com/leikaiwei/litellm/actions/runs/42623399610)成功，正式镜像与新插件的断网校验通过，包含源码哈希、图片依赖、参数删除、结构化输出、加密历史和三系列准入。配套插件与 manifest 已独立暂存，尚未切换生产，也未对新镜像执行付费上游验收
+2026-11-09 已完成 patch.5 构建，源码固定为 `3b0a3d4a6e9`，镜像为 `leikaiwei/litellm:v1.108.0-fork.patch.5`，digest 为 `sha256:30a88b8e23a89cce022ed042c54259b25ab99376cf910237fea58b6c9a17a4ee`。[发布构建](https://github.com/leikaiwei/litellm/actions/runs/42623399610)成功，正式镜像与新插件的断网校验通过，包含源码哈希、图片依赖、参数删除、结构化输出、加密历史和三系列准入
+
+同日 UTC+8 23:05 完成生产切换，镜像与配套插件一起更新，约 44 秒不可用。主代理健康、数据库连接、回调与源码哈希核对通过，其他五个容器、路由、限额和无关挂载保持不变。Opus、Sonnet、Haiku 及加密历史的八个普通和流式真实验收请求均返回目标模型，重试与降级均为 0，流式正常结束并返回用量。超限请求只在关闭该请求 fallback 时返回 400，保留原路由时会按既有策略降级，不能把严格准入描述成禁止全部跨模型回退。观察窗口另有 129 条普通用户请求成功，尚无普通用户 Claude 完成请求，不能将管理员回放算作自然流量。镜像和插件的成对回滚入口已保留
 
 **PostgreSQL 空字节修复** — `proxy/utils.py`
 - 清洗 spend logs 中的 `\x00` 空字节，避免 PostgreSQL jsonb 写入失败（22P05）
