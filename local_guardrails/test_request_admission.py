@@ -679,6 +679,7 @@ async def test_opus_provider_count_preserves_named_credentials_system_tools_and_
     data: Final[dict[str, object]] = {
         "model": f"anthropic/{_OPUS}",
         "litellm_credential_name": "count-fixture",
+        "max_tokens": 10,
         "messages": _messages(),
         "system": "System instructions",
         "tools": [tool]
@@ -740,6 +741,7 @@ async def test_opus_malformed_count_is_rejected_without_local_fallback(
                 {
                     "model": _OPUS,
                     "api_key": "test-key",
+                    "max_tokens": 10,
                     "messages": _messages(),
                     "model_info": {"max_input_tokens": 100},
                 },
@@ -884,6 +886,111 @@ async def test_rejected_opus_request_does_not_cool_down_the_next_request(
         await request()
         assert counter.await_count == 2
         assert tuple(item.url.path for item in transport.requests) == ("/v1/messages",)
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("options", "auto_summary"),
+    (
+        ({"thinking": {"type": "adaptive", "display": "updates"}}, False),
+        ({"thinking": {"type": "adaptive", "display": "updates"}}, True),
+        ({"thinking": {"type": "enabled", "budget_tokens": 4096}}, False),
+        ({"thinking": {"type": "disabled"}}, False),
+        ({"reasoning_effort": "high"}, False),
+        ({"output_format": {"type": "json_schema", "schema": {"type": "object"}}}, False),
+        ({"context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}}, False),
+        ({"mcp_servers": [{"type": "url", "name": "fixture", "url": "https://mcp.invalid"}]}, False),
+        ({"cache_control": {"type": "ephemeral"}}, False),
+        ({"compaction": {"type": "summarize", "instructions": "Keep important details"}}, False),
+    ),
+)
+@pytest.mark.parametrize("route", ("messages", "chat"))
+async def test_opus_count_matches_final_inference_options(
+    monkeypatch: pytest.MonkeyPatch, options: dict[str, object], auto_summary: bool, route: str
+) -> None:
+    transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
+    client: Final = _install_count_transport(monkeypatch, transport)
+    monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
+    monkeypatch.setattr(litellm, "reasoning_auto_summary", auto_summary)
+    router: Final = litellm.Router(model_list=[_opus_deployment()], num_retries=0)
+    try:
+        if route == "messages":
+            await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
+                model="opus-fixture",
+                messages=_messages(),
+                max_tokens=8192,
+                system="Policy",
+                **options,  # pyright: ignore[reportArgumentType]  # 测试仅传 Anthropic 原生可选参数
+            )
+        else:
+            await router.acompletion(  # pyright: ignore[reportUnknownMemberType, reportCallIssue]  # 参数化原生参数
+                model="opus-fixture",
+                messages=[{"role": "system", "content": "Policy"}, *_messages()],
+                max_tokens=8192,
+                **options,  # pyright: ignore[reportArgumentType]  # 测试只提供原生参数，不覆盖 stream
+            )
+        assert tuple(request.url.path for request in transport.requests) == (
+            "/v1/messages/count_tokens", "/v1/messages"
+        )
+        counted: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[0].content)
+        sent: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[1].content)
+        assert counted == {key: value for key, value in sent.items() if key not in ("max_tokens", "stream")}
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_type", (CallTypes.aanthropic_messages, CallTypes.acompletion))
+async def test_opus_container_is_rejected_before_count_or_inference(
+    monkeypatch: pytest.MonkeyPatch, call_type: CallTypes
+) -> None:
+    transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
+    client: Final = _install_count_transport(monkeypatch, transport)
+    try:
+        with pytest.raises(litellm.BadRequestError, match="不支持 container"):
+            await RequestAdmission().async_pre_call_deployment_hook(
+                {
+                    "model": _OPUS,
+                    "api_key": "test-key",
+                    "max_tokens": 100,
+                    "messages": _messages(),
+                    "extra_body": {"container": {"id": "fixture-container"}},
+                    "model_info": {"max_input_tokens": 100},
+                },
+                call_type,
+            )
+        assert transport.requests == ()
+    finally:
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra",
+    (
+        {"thinking": {"type": "adaptive", "display": "updates"}},
+        {"context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}},
+        {"output_format": {"type": "json_schema", "schema": {"type": "object"}}},
+        {"mcp_servers": [{"type": "url", "name": "fixture", "url": "https://mcp.invalid"}]},
+    ),
+)
+async def test_chat_opus_extra_body_cannot_be_counted_as_flattened_native_input(
+    monkeypatch: pytest.MonkeyPatch, extra: dict[str, object]
+) -> None:
+    transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
+    client: Final = _install_count_transport(monkeypatch, transport)
+    monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
+    router: Final = litellm.Router(model_list=[_opus_deployment()], num_retries=0)
+    try:
+        with pytest.raises(litellm.BadRequestError, match="无法核验 extra_body"):
+            await router.acompletion(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
+                model="opus-fixture", messages=_messages(), max_tokens=100, extra_body=extra
+            )
+        assert transport.requests == ()
     finally:
         router.reset()
         await client.client.aclose()

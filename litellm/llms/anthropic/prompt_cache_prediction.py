@@ -6,7 +6,6 @@ import json
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import reduce
 from itertools import accumulate, groupby
 from types import MappingProxyType
 from typing import Annotated, Final, Literal, Protocol, TypeAlias
@@ -16,11 +15,9 @@ from pydantic import ConfigDict, Field, JsonValue, StrictInt, TypeAdapter, Valid
 
 import litellm
 from litellm.caching.dual_cache import DualCache
-from litellm.litellm_core_utils.dot_notation_indexing import delete_nested_value
 from litellm.llms.anthropic.common_utils import (
     AnthropicModelInfo,
     is_anthropic_oauth_key,
-    strip_provider_specific_fields_from_anthropic_messages,
 )
 from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
 from litellm.llms.anthropic.count_tokens.transformation import COUNT_TOKEN_OPTION_NAMES
@@ -28,20 +25,18 @@ from litellm.llms.anthropic.pass_through.messages.transformation import (
     DEFAULT_ANTHROPIC_API_VERSION,
     AnthropicMessagesConfig,
 )
-from litellm.llms.anthropic.pass_through.messages.utils import AnthropicMessagesRequestUtils, prepare_native_messages
+from litellm.llms.anthropic.pass_through.messages.utils import prepare_native_request_body
 from litellm.router_utils.baseline_request import (
     BASELINE_PARAMETERS,
     capture_baseline_parameters,
 )
 from litellm.types.llms.base import LiteLLMBaseModel
-from litellm.types.router import GenericLiteLLMParams, LiteLLM_Params
+from litellm.types.router import LiteLLM_Params
 from litellm.types.utils import ModelResponse
 from litellm.utils import supports_thinking_cache_preservation
 
 _JSON_OBJECT: Final = TypeAdapter(dict[str, JsonValue])
 _HEADERS: Final = TypeAdapter(dict[str, str])
-_MESSAGES: Final = TypeAdapter(list[dict[str, JsonValue]])
-_SYSTEM: Final = TypeAdapter(str | list[dict[str, JsonValue]] | None)
 _counter: Final = AnthropicCountTokensHandler()
 
 
@@ -304,7 +299,9 @@ def _prefix_body(
         _JSON_OBJECT.validate_python(
             MappingProxyType(
                 {
-                    **MappingProxyType({key: body[key] for key in COUNT_TOKEN_OPTION_NAMES if key in body}),
+                    **MappingProxyType(
+                        {key: body[key] for key in COUNT_TOKEN_OPTION_NAMES if key in body and key != "cache_control"}
+                    ),
                     **sections,
                     "messages": _count_objects(messages),
                 }
@@ -642,32 +639,7 @@ def prepare_native_baseline_body(request: Mapping[str, object], model: str) -> M
         owned: Final = _JSON_OBJECT.validate_python(source)
         context: Final = {**{k: v for k, v in request.items() if k not in ("metadata", "litellm_metadata")}, **owned}
         resolved_model: Final = litellm.get_llm_provider(model=model, custom_llm_provider="anthropic")[0]
-        messages, system = prepare_native_messages(
-            _MESSAGES.validate_python(owned.get("messages")),
-            _SYSTEM.validate_python(owned.get("system")),
-            context,
-            model=resolved_model,
-            custom_llm_provider="anthropic",
-            tools=_MESSAGES.validate_python(owned.get("tools") or []),
-        )
-        options: Final = AnthropicMessagesRequestUtils.get_requested_anthropic_messages_optional_param(
-            {**owned, "system": system},
-            model=resolved_model,
-            custom_llm_provider="anthropic",
-            drop_params=owned.get("drop_params") is True,
-        )
-        filtered: Final = reduce(
-            delete_nested_value,
-            TypeAdapter(tuple[str, ...]).validate_python(owned.get("additional_drop_params") or ()),
-            dict(options),
-        )
-        body: Final = AnthropicMessagesConfig().transform_anthropic_messages_request(
-            model=resolved_model,
-            messages=strip_provider_specific_fields_from_anthropic_messages(messages),
-            anthropic_messages_optional_request_params=filtered,
-            litellm_params=GenericLiteLLMParams(),
-            headers={},
-        )
+        body: Final = prepare_native_request_body(context, resolved_model)
         return MappingProxyType(_JSON_OBJECT.validate_python(body))
     except Exception:  # noqa: BLE001  # an unsupported hypothetical request is unavailable, never an inference failure
         return None

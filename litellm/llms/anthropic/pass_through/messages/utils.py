@@ -1,15 +1,17 @@
 from collections.abc import Iterable, Mapping, Sequence
-from functools import lru_cache
+from functools import lru_cache, reduce
 from typing import TYPE_CHECKING, Final, cast, get_type_hints
 
-from pydantic import JsonValue
+from pydantic import JsonValue, TypeAdapter
 
 from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
+from litellm.litellm_core_utils.dot_notation_indexing import delete_nested_value
 from litellm.llms.anthropic.common_utils import (
     flatten_unencrypted_web_search_results_in_anthropic_messages,
     sanitize_tool_use_ids_in_anthropic_messages,
     strip_empty_content_blocks_from_anthropic_messages,
+    strip_provider_specific_fields_from_anthropic_messages,
 )
 from litellm.llms.anthropic.pass_through.utils import is_reasoning_auto_summary_enabled
 from litellm.types.llms.anthropic import (
@@ -20,9 +22,15 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,
 )
 from litellm.types.llms.openai import ChatCompletionSystemMessage
+from litellm.types.router import GenericLiteLLMParams
 
 if TYPE_CHECKING:
     from litellm.exceptions import ContentPolicyViolationError
+
+_NATIVE_BODY: Final = TypeAdapter(dict[str, JsonValue])
+_NATIVE_MESSAGES: Final = TypeAdapter(list[dict[str, JsonValue]])
+_NATIVE_SYSTEM: Final = TypeAdapter[str | list[dict[str, JsonValue]] | None](str | list[dict[str, JsonValue]] | None)
+_DROP_PATHS: Final = TypeAdapter(tuple[str, ...])
 
 
 INCOMPLETE_STREAM_ERROR_MESSAGE: Final = (
@@ -172,6 +180,52 @@ def anthropic_messages_optional_param_keys() -> frozenset[str]:
     full-pass cost from the /v1/messages request-parse path.
     """
     return frozenset(get_type_hints(AnthropicMessagesRequestOptionalParams).keys())
+
+
+def prepare_native_request_body(request: Mapping[str, object], model: str) -> dict[str, JsonValue]:
+    from litellm.llms.anthropic.pass_through.messages.transformation import AnthropicMessagesConfig
+
+    keys: Final = anthropic_messages_optional_param_keys() | frozenset(
+        ("messages", "drop_params", "additional_drop_params", "enable_prompt_caching", "cache_control_injection_points")
+    )
+    owned: Final = _NATIVE_BODY.validate_python(
+        {key: value for key, value in request.items() if key in keys and key != "metadata"}
+    )
+    params: Final = GenericLiteLLMParams.model_validate(request)
+    context: Final = {
+        **{key: value for key, value in request.items() if key not in ("metadata", "litellm_metadata")},
+        **owned,
+    }
+    messages, system = prepare_native_messages(
+        _NATIVE_MESSAGES.validate_python(owned.get("messages")),
+        _NATIVE_SYSTEM.validate_python(owned.get("system")),
+        context,
+        model=model,
+        custom_llm_provider="anthropic",
+        tools=_NATIVE_MESSAGES.validate_python(owned.get("tools") or []),
+        api_base=params.api_base,
+    )
+    options: Final = AnthropicMessagesRequestUtils.get_requested_anthropic_messages_optional_param(
+        {**owned, "system": system},
+        model=model,
+        custom_llm_provider="anthropic",
+        drop_params=params.drop_params is True,
+    )
+    filtered: Final = reduce(
+        delete_nested_value,
+        _DROP_PATHS.validate_python(request.get("additional_drop_params") or ()),
+        dict(options),
+    )
+    config: Final = AnthropicMessagesConfig()
+    return _NATIVE_BODY.validate_python(
+        config.transform_anthropic_messages_request(  # pyright: ignore[reportUnknownMemberType]  # 旧转换器出口校验类型
+            model=model,
+            messages=_NATIVE_MESSAGES.validate_python(strip_provider_specific_fields_from_anthropic_messages(messages)),
+            anthropic_messages_optional_request_params=filtered,
+            litellm_params=params,
+            headers={},
+        )
+    )
 
 
 class AnthropicMessagesRequestUtils:

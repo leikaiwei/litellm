@@ -697,19 +697,28 @@ Opus 候选不再以本地 tokenizer 的估算值判断是否可发送。候选�
 
 计数直接复用现有 `AnthropicCountTokensHandler`，不经 Router 重选部署，也不调用会回退本地的
 `acount_tokens()`。命名凭据在副本中按 LiteLLM 原有优先级合并，实际请求不变。Messages 保留
-system、tools、thinking、tool_choice 和 output_config；Chat 复用现有 Anthropic 请求转换器。
+system、tools 和官方计数接口支持的输入参数。Messages 与 baseline 预测共用无预测预算限制的
+请求规范化函数，包含原生 thinking 转换、drop_params 和上下文管理；Chat 复用现有 Anthropic
+请求转换器。计数投影包含 output_format、context_management、mcp_servers、cache_control、
+speed 和 compaction，不静默漏掉这些字段。官方计数接口接受但忽略 compaction，因此结果
+仍针对当前消息，不能当作压缩后上下文的预计长度
 计数请求保留客户端和鉴权 beta，并复用 Messages 的功能头推导。消息携带 `output_config`
 时还加入现有 `mid-conversation-output-config` beta，避免合法的逐轮配置被计数端点拒绝。
 Responses 在外层检查图片和隐藏历史，再由现有 Chat 桥接后的 deployment hook 计数，避免
 对转换前后请求重复调用。声明原生 `/v1/responses` 透传的 Opus 部署会被拒绝，除非显式启用
 `use_chat_completions_api`，确保必经 Chat 检查。服务端上下文编辑仍按编辑前的完整输入检查
 
+非空 container 会被明确拒绝，避免漏计隐藏上下文。Opus Chat 非空 extra_body 同样拒绝，
+因为当前生成路径将其嵌套发送，无法与计数拍平语义保持一致；应改用原生 Messages 或顶层
+受支持参数。失败均不回退本地估算
+
 计数最多等待 30 秒，鉴权失败、超时、上游错误或缺少有效的正整数 `input_tokens` 都拒绝当前
 Opus 请求，不回退本地估算。错误只显示异常类型，不回显上游正文或凭据。供应商计数也有延迟、
 限流和可用性成本；中转是否真正调用官方计数取决于供应商实现。原有 Router fallback 策略不变
 
-这次只更新外部挂载的 `request_admission.py`，沿用现有 patch.4 镜像，不需要新建镜像或修改
-模型限额。部署时需备份旧插件、核验新文件哈希并重启主代理加载；回滚恢复旧插件再重启。
+当前生产已撤回上游计数插件，恢复旧版准入检查。下述两次上线记录均不是当前生产状态。
+后续修复须同时验证 LiteLLM 的输入转换与 CPA 的计数兼容性，不能仅凭短文本或合成请求
+成功判断可上线。部署时需备份旧插件、核验新文件哈希并重启主代理加载；回滚恢复旧插件再重启。
 2026-11-09 首次部署提交 `2b6fab9af53` 后，带逐轮 `output_config` 的计数请求被上游拒绝，
 导致正常 Opus 请求进入 fallback。已于 UTC 04:07 回滚旧插件，UTC 04:08 观察到真实 Opus
 请求成功。首次部署的健康检查与短文本计数不足以覆盖 Claude Code 实际请求，镜像仍为 patch.4
@@ -730,7 +739,18 @@ Opus 请求，不回退本地估算。错误只显示异常类型，不回显上
 修复提交 `54f206439cb` 已于 2026-11-09 UTC 04:16 部署，仅替换插件并重启主代理，约
 48 秒不可用。正式镜像临时 HTTP 代理依次验证正常请求 200、超限请求 400、后续正常请求
 200。生产 `/v1/messages` 的逐轮配置、工具和 thinking 请求返回 Opus，重试与 fallback 均为 0。
-生产继续使用上游计数，失败不回退本地估算，镜像与模型路由保持原值
+但实际用户的 `thinking.display=updates` 随后被 CPA 计数接口拒绝。已于 UTC 04:22:45 再次
+回滚旧插件，UTC 04:24 的受影响用户真实请求恢复 Opus，fallback 为 0。生产尚未启用可靠的
+上游计数准入，不能把合成请求验收结果当成真实业务已恢复的证据
+
+后续本地候选修复已修改 LiteLLM 核心，需新构建，不能只替换插件。相关回归 778 项通过，
+其中准入测试 91 项。两份实际失败请求在本地真实 Router 和受控 HTTP 传输下，计数与生成
+的全部计数输入字段一致。该结果尚不等于真实 CPA 验收通过
+
+CPA v8.0.61 会在计数路径重建基础 beta，并过滤部分由自身管理的调用方功能头，造成保留
+display updates 等字段却丢失所需 beta。必须同时修正 CPA 的字段与功能头一致性。计数和
+生成的 CPA 系统提示注入仍有差异，上游 count_tokens 本身也不是最终 usage 的严格等值保证，
+不能仅以计数返回 200 声称精确准入。[官方计数说明](https://platform.claude.com/docs/en/build-with-claude/token-counting)
 
 ### 注册
 

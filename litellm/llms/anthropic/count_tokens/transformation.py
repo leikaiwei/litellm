@@ -22,7 +22,17 @@ from litellm.types.llms.openai import ChatCompletionImageObject
 _COUNT_REQUEST: Final = TypeAdapter(dict[str, JsonValue])
 _SYSTEM_BLOCKS: Final = TypeAdapter(list[JsonValue])
 _IMAGE_BLOCK: Final = TypeAdapter(ChatCompletionImageObject)
-COUNT_TOKEN_OPTION_NAMES: Final = ("thinking", "tool_choice", "output_config")
+COUNT_TOKEN_OPTION_NAMES: Final = (
+    "thinking",
+    "tool_choice",
+    "output_config",
+    "output_format",
+    "context_management",
+    "compaction",
+    "mcp_servers",
+    "cache_control",
+    "speed",
+)
 
 
 def _count_image(block: JsonValue) -> JsonValue:

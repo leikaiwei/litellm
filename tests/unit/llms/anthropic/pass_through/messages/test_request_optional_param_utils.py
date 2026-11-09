@@ -6,12 +6,16 @@ Regression tests for the /v1/messages request-parse fast paths:
   while resolving the (static) type hints only once per process.
 """
 
+from copy import deepcopy
+from typing import Final
+
 import pytest
 
 import litellm
 from litellm.llms.anthropic.pass_through.messages.utils import (
     AnthropicMessagesRequestUtils,
     anthropic_messages_optional_param_keys,
+    prepare_native_request_body,
 )
 
 
@@ -133,3 +137,40 @@ def test_sampling_param_raises_clean_400_without_drop_params(monkeypatch):
             model="claude-opus-4-7",
             drop_params=False,
         )
+
+
+def test_native_body_preparation_keeps_long_system_and_source_unchanged() -> None:
+    request: Final[dict[str, object]] = {
+        "messages": [{"role": "user", "content": "Hello"}],
+        "system": "Long instructions " * 50_000,
+        "max_tokens": 8192,
+        "api_base": "https://native.invalid",
+        "thinking": {"type": "adaptive", "display": "updates"},
+        "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        "enable_prompt_caching": True,
+    }
+    before: Final = deepcopy(request)
+    body: Final = prepare_native_request_body(request, "claude-opus-5-5")
+    system: Final = body["system"]
+    assert isinstance(system, list)
+    assert isinstance(system[0], dict)
+    assert system[0]["text"] == request["system"]
+    assert body["thinking"] == request["thinking"]
+    assert body["context_management"] == request["context_management"]
+    assert request == before
+
+
+def test_native_body_preparation_applies_deployment_drop_settings_without_mutation() -> None:
+    request: Final[dict[str, object]] = {
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 8192,
+        "thinking": {"type": "enabled", "budget_tokens": 4096, "fixture_extra": True},
+        "output_config": {"effort": "high", "fixture_extra": True},
+        "drop_params": True,
+        "additional_drop_params": ["output_config.fixture_extra"],
+    }
+    before: Final = deepcopy(request)
+    body: Final = prepare_native_request_body(request, "claude-opus-5-5")
+    assert body["thinking"] == {"type": "adaptive"}
+    assert body["output_config"] == {"effort": "high"}
+    assert request == before

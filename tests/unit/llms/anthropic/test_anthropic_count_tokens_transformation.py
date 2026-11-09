@@ -125,6 +125,29 @@ def test_transform_basic_request():
     }
 
 
+def test_count_preserves_supported_context_parameters_without_generation_options() -> None:
+    options: Final[dict[str, JsonValue]] = {
+        "thinking": {"type": "adaptive", "display": "updates"},
+        "tool_choice": {"type": "auto"},
+        "output_config": {"effort": "high"},
+        "output_format": {"type": "json_schema", "schema": {"type": "object"}},
+        "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        "compaction": {"type": "summarize", "instructions": "Retain decisions"},
+        "mcp_servers": [{"type": "url", "name": "fixture", "url": "https://mcp.invalid"}],
+        "cache_control": {"type": "ephemeral"},
+        "speed": "fast",
+    }
+    messages: Final[list[dict[str, JsonValue]]] = [{"role": "user", "content": "Hello"}]
+    before: Final = deepcopy((messages, options))
+    result: Final = AnthropicCountTokensConfig().transform_request_to_count_tokens(
+        model="claude-opus-5-5",
+        messages=messages,
+        optional_params={**options, "max_tokens": 100, "stream": True, "temperature": 1},
+    )
+    assert result == {"model": "claude-opus-5-5", "messages": messages, **options}
+    assert (messages, options) == before
+
+
 def test_transform_includes_system():
     """Test that system prompt is included when provided."""
     config = AnthropicCountTokensConfig()

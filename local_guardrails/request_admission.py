@@ -31,7 +31,10 @@ from litellm.llms.anthropic.pass_through.messages.transformation import (
     AnthropicMessagesConfig,
     messages_carry_output_config,
 )
-from litellm.llms.anthropic.pass_through.messages.utils import anthropic_system_to_openai_message
+from litellm.llms.anthropic.pass_through.messages.utils import (
+    anthropic_system_to_openai_message,
+    prepare_native_request_body,
+)
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig as ResponsesConfig,
 )
@@ -325,9 +328,7 @@ def _is_opus(candidate: Candidate) -> bool:
 def _opus_body(data: Mapping[str, object], model: str, call_type: CallTypes) -> dict[str, JsonValue]:
     fields: Final = {**data, **_mapping(data.get("extra_body"))}
     if call_type in (CallTypes.anthropic_messages, CallTypes.aanthropic_messages):
-        return _JSON_OBJECT.validate_python(
-            {key: fields[key] for key in ("messages", "system", "tools", *COUNT_TOKEN_OPTION_NAMES) if key in fields}
-        )
+        return prepare_native_request_body(fields, model)
     config: Final = AnthropicConfig()
     chat_options: Final = {
         key: fields[key]
@@ -338,10 +339,18 @@ def _opus_body(data: Mapping[str, object], model: str, call_type: CallTypes) -> 
             "response_format",
             "reasoning_effort",
             "web_search_options",
+            "thinking",
+            "context_management",
+            "cache_control",
+            "speed",
         )
         if key in fields
     }
-    native_options: Final = {key: fields[key] for key in ("thinking", "output_config") if key in fields}
+    native_options: Final = {
+        key: fields[key]
+        for key in COUNT_TOKEN_OPTION_NAMES
+        if key in fields and key not in ("thinking", "tool_choice", "context_management", "cache_control", "speed")
+    }
     options: Final = _JSON_OBJECT.validate_python(
         config.map_openai_params(  # pyright: ignore[reportUnknownMemberType]  # 上游转换器仍返回裸 dict，出口验证类型
             non_default_params=copy.deepcopy(chat_options),
@@ -498,6 +507,16 @@ class RequestAdmission(CustomLogger):
         await offload_token_count(_admit)(kwargs, (candidate,), model if isinstance(model, str) else "")
         if not _is_opus(candidate):
             return None
+        if kwargs.get("container") or _mapping(kwargs.get("extra_body")).get("container"):
+            _raise_invalid(
+                AdmissionProblem("container", "Opus 上游计数不支持 container，无法核验隐藏上下文", False),
+                candidate.model,
+            )
+        if call_type in (CallTypes.completion, CallTypes.acompletion) and kwargs.get("extra_body"):
+            _raise_invalid(
+                AdmissionProblem("extra_body", "Opus Chat 无法核验 extra_body，请使用 Messages 或顶层参数", False),
+                candidate.model,
+            )
         problem: Final = (
             _responses_problem(kwargs) if call_type in (CallTypes.responses, CallTypes.aresponses) else None
         )
