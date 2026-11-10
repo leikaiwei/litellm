@@ -706,6 +706,17 @@ tokenizer 首次加载遵循 LiteLLM 既有配置。若部署要求禁止 Huggin
 
 ### Opus、Sonnet、Haiku 上游计数
 
+2026-11-10 候选插件修正计数与生成的身份差异，尚未部署。计数不再从原始请求的
+metadata、litellm_metadata 或 proxy_server_request 单独取 User-Agent、X-App 和 beta，
+而是使用实际出站的 headers、extra_headers 和当前供应商匹配的 provider_specific_header。
+没有显式身份头时，计数与生成共用 HTTP 客户端默认 User-Agent，功能 beta 仍按实际输入推导。
+原始客户端鉴权、Cookie 与无关头不会因此转发。生成请求保持原有行为，无需修改核心镜像
+
+此次发现 CPA 的计数与生成输入转换不一致会漏计历史 thinking，仅改计数身份不能修复旧 CPA。
+必须配套 CPA 的输入转换修复并完成完整历史请求验收后再部署。原生 Claude Code 的独立计数
+语义应保持不变，不能靠给所有计数请求伪造原生身份或统一增加固定 token 余量掩盖差异。
+下文客户端身份透传描述属于 2026-11-09 已部署版本的历史记录
+
 2026-11-09 晚间 review 补充两项修复，Chat 计数改用生成路径的参数转换，遵守
 `additional_drop_params`，并保留输出预算参与 thinking 转换。按上游已合并的
 [#47363](https://github.com/BerriAI/litellm/pull/47363)，旧版 `output_format` 仅在计数时

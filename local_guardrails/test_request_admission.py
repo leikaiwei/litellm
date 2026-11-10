@@ -887,17 +887,34 @@ async def test_opus_malformed_count_is_rejected_without_local_fallback(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ("metadata", "litellm_metadata", "proxy_server_request", None))
+@pytest.mark.parametrize("outbound_source", (None, "headers", "extra_headers", "provider_specific_header"))
 @pytest.mark.parametrize("api_key", ("test-key", "sk-ant-oat-fixture-token"))
 @pytest.mark.parametrize("model", _CLAUDE_MODELS)
-async def test_claude_count_carries_only_original_client_identity_without_changing_generation(
-    monkeypatch: pytest.MonkeyPatch, model: str, source: str | None, api_key: str
+async def test_claude_count_matches_generation_identity_without_forwarding_original_credentials(
+    monkeypatch: pytest.MonkeyPatch, model: str, source: str | None, api_key: str, outbound_source: str | None
 ) -> None:
     transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
     client: Final = _install_count_transport(monkeypatch, transport)
     deployment: Final = _claude_deployment(model=model)
     params: Final = TypeAdapter(dict[str, object]).validate_python(deployment["litellm_params"])
+    outgoing: Final = {
+        "user-agent": "configured-client/1.0",
+        "x-app": "configured-app",
+        "Anthropic-Beta": "fixture-configured-feature",
+    }
+    header_options: Final[dict[str, object]] = (
+        {}
+        if outbound_source is None
+        else {
+            outbound_source: (
+                {"custom_llm_provider": "anthropic", "extra_headers": outgoing}
+                if outbound_source == "provider_specific_header"
+                else outgoing
+            )
+        }
+    )
     router: Final = litellm.Router(
-        model_list=[{**deployment, "litellm_params": {**params, "api_key": api_key}}], num_retries=0
+        model_list=[{**deployment, "litellm_params": {**params, "api_key": api_key, **header_options}}], num_retries=0
     )
     inbound: Final = {
         "User-Agent": "claude-cli/2.1.319 (fixture)",
@@ -916,7 +933,10 @@ async def test_claude_count_carries_only_original_client_identity_without_changi
             messages=_messages(),
             max_tokens=100,
             thinking={"type": "adaptive", "display": "updates"},
-            extra_headers={"anthropic-beta": "fixture-caller-feature"},
+            extra_headers={
+                "anthropic-beta": "fixture-caller-feature",
+                **(outgoing if outbound_source == "extra_headers" else {}),
+            },
             **carried,  # pyright: ignore[reportArgumentType]  # 测试只提供原始请求上下文
         )
 
@@ -938,14 +958,9 @@ async def test_claude_count_carries_only_original_client_identity_without_changi
         assert set(baseline.headers["anthropic-beta"].split(",")) <= set(
             counted.headers["anthropic-beta"].split(",")
         )
-        if source is None:
-            assert counted.headers.get("user-agent") != inbound["User-Agent"]
-            assert "x-app" not in counted.headers
-            assert "fixture-original-feature" not in counted.headers["anthropic-beta"].split(",")
-        else:
-            assert counted.headers["user-agent"] == inbound["User-Agent"]
-            assert counted.headers["x-app"] == inbound["X-App"]
-            assert "fixture-original-feature" in counted.headers["anthropic-beta"].split(",")
+        assert counted.headers.get("user-agent") == generated.headers.get("user-agent")
+        assert counted.headers.get("x-app") == generated.headers.get("x-app")
+        assert "fixture-original-feature" not in counted.headers["anthropic-beta"].split(",")
     finally:
         router.reset()
         await client.client.aclose()
@@ -998,7 +1013,12 @@ async def test_real_router_claude_count_and_inference_use_the_same_transformed_b
     transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
     client: Final = _install_count_transport(monkeypatch, transport)
     monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
-    router: Final = litellm.Router(model_list=[_claude_deployment(model=model)], num_retries=0)
+    identity: Final = {"user-agent": "configured-inference/1.0", "x-app": "configured-inference"}
+    deployment: Final = _claude_deployment(model=model)
+    params: Final = TypeAdapter(dict[str, object]).validate_python(deployment["litellm_params"])
+    router: Final = litellm.Router(
+        model_list=[{**deployment, "litellm_params": {**params, "extra_headers": identity}}], num_retries=0
+    )
     schema: Final = {"type": "object", "properties": {"query": {"type": "string"}}}
     try:
         if route == "chat":
@@ -1025,7 +1045,7 @@ async def test_real_router_claude_count_and_inference_use_the_same_transformed_b
                 ],
                 system="System instructions",
                 tools=[{"name": "lookup", "description": "Look up records", "input_schema": schema}],
-                extra_headers={"anthropic-beta": "fixture-client-feature"},
+                extra_headers={**identity, "anthropic-beta": "fixture-client-feature"},
                 thinking={"type": "adaptive"},
                 output_config={"effort": "high"},
                 max_tokens=10,
@@ -1042,6 +1062,9 @@ async def test_real_router_claude_count_and_inference_use_the_same_transformed_b
             "/v1/messages/count_tokens",
             "/v1/messages",
         )
+        assert transport.requests[0].headers.get("user-agent") == transport.requests[1].headers.get("user-agent")
+        assert transport.requests[1].headers.get("user-agent") == identity["user-agent"]
+        assert transport.requests[0].headers.get("x-app") == transport.requests[1].headers.get("x-app")
         counted: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[0].content)
         sent: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[1].content)
         assert {key: counted[key] for key in ("model", "system", "messages", "tools")} == {

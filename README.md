@@ -44,6 +44,8 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 **2026-11-09 已部署补丁，Claude 上游计数与加密历史兼容**
 
+2026-11-10 外部插件候选修复让准入计数使用实际生成的出站身份与功能头，避免计数独自透传原始 Claude Code 身份而生成仍使用 LiteLLM 身份。默认 User-Agent 继续由共享 HTTP 客户端提供，显式 headers、extra_headers 与供应商专属身份头保持一致。该修改尚未部署，需配套 CPA 计数与生成输入转换修复后完成真实验收，不需要重建 LiteLLM 核心镜像。下面的客户端身份透传行为记录 patch.5 发布时状态
+
 Opus、Sonnet、Haiku 按实际部署调用现有 Anthropic `count_tokens` 处理器，使用该部署的凭据和输入上限，计数失败不退回本地估算。原生 Messages 与缓存预测共用请求转换，Chat 复用生成路径的参数转换，包含 `additional_drop_params` 和输出预算对 thinking 的影响。保留真实客户端 User-Agent、X-App 和功能 beta，只发送一个 Content-Type，不转发客户端鉴权头，也不伪造客户端身份。无需修改 CPA，现有路由与 fallback 保持原配置
 
 计数参数包含上下文管理、工具、结构化输出等输入。参考已合并的 [#47363](https://github.com/BerriAI/litellm/pull/47363)，计数时将旧版 `output_format` 归一到 `output_config.format`，保留其他输出配置，避免计数接口拒绝生成接口接受的格式。该 PR 的 Responses 转换复用、[#44784](https://github.com/BerriAI/litellm/pull/44784) 的压缩历史计数以及 [#46815](https://github.com/BerriAI/litellm/pull/46815) 的计数错误传播均可参考，但不能直接替代发送前准入。2026-11-09 核对上游 main，尚无完整同义实现，升级时需逐项核对再删除本地差异。仍未合并的 [#49764](https://github.com/BerriAI/litellm/pull/49764) 放宽非 OpenAI 估算阈值，与本插件的严格限额策略不同，不回移

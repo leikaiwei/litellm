@@ -17,6 +17,7 @@ from litellm.constants import DEFAULT_CHAT_COMPLETION_PARAM_VALUES, MAX_IMAGE_UR
 from litellm.exceptions import MalformedRequestFieldError
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+from litellm.litellm_core_utils.get_provider_specific_headers import ProviderSpecificHeaderUtils
 from litellm.litellm_core_utils.token_counter import (
     calculate_img_tokens,
     high_detail_image_token_upper_bound,
@@ -41,7 +42,7 @@ from litellm.responses.litellm_completion_transformation.transformation import (
 from litellm.router_strategy.complexity_router.context_compaction import compaction_pending
 from litellm.types.llms.anthropic import ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
-from litellm.types.utils import CallTypes
+from litellm.types.utils import CallTypes, ProviderSpecificHeader
 from litellm.utils import (
     get_optional_params,  # pyright: ignore[reportUnknownVariableType]  # 上游参数转换器仍包含裸类型
 )
@@ -51,6 +52,9 @@ _JSON_OBJECT: Final = TypeAdapter(dict[str, JsonValue])
 _JSON_MESSAGES: Final = TypeAdapter(list[dict[str, JsonValue]])
 _OPTIONAL_STRING: Final = TypeAdapter[str | None](str | None)
 _HEADERS: Final = TypeAdapter(dict[str, str])
+_PROVIDER_HEADERS: Final[TypeAdapter[ProviderSpecificHeader | tuple[ProviderSpecificHeader, ...] | None]] = TypeAdapter(
+    ProviderSpecificHeader | tuple[ProviderSpecificHeader, ...] | None
+)
 _ITEMS: Final = TypeAdapter(tuple[object, ...])
 _MESSAGES: Final = TypeAdapter(tuple[dict[str, object], ...])
 _TOOL_CHOICE: Final = TypeAdapter[str | dict[str, object] | None](str | dict[str, object] | None)
@@ -371,16 +375,24 @@ def _claude_body(data: Mapping[str, object], model: str, call_type: CallTypes) -
     )
 
 
-def _original_count_headers(data: Mapping[str, object]) -> dict[str, str]:
-    def headers(source: str) -> dict[str, str]:
-        incoming: Final = _mapping(_mapping(data.get(source)).get("headers"))
-        return {
+def _generation_count_headers(data: Mapping[str, object]) -> dict[str, str]:
+    scoped: Final = ProviderSpecificHeaderUtils.get_provider_specific_headers(
+        _PROVIDER_HEADERS.validate_python(data.get("provider_specific_header")), "anthropic"
+    )
+    outgoing: Final = {**_mapping(data.get("headers")), **_mapping(data.get("extra_headers")), **scoped}
+    return {
+        **{
             key.lower(): value
-            for key, value in incoming.items()
-            if key.lower() in ("user-agent", "x-app", "anthropic-beta") and isinstance(value, str)
-        }
-
-    return {**headers("metadata"), **headers("litellm_metadata"), **headers("proxy_server_request")}
+            for key, value in outgoing.items()
+            if key.lower() in ("user-agent", "x-app") and isinstance(value, str)
+        },
+        "anthropic-beta": merge_anthropic_beta_headers(
+            None,
+            tuple(
+                value for key, value in outgoing.items() if key.lower() == "anthropic-beta" and isinstance(value, str)
+            ),
+        ),
+    }
 
 
 async def _count_claude(data: Mapping[str, object], call_type: CallTypes) -> int:
@@ -404,11 +416,7 @@ async def _count_claude(data: Mapping[str, object], call_type: CallTypes) -> int
         if auth is None:
             raise ValueError("Claude 上游计数缺少凭据")
         body: Final = await offload_token_count(_claude_body)(params, model, call_type)
-        caller_headers: Final = {**_mapping(params.get("headers")), **_mapping(params.get("extra_headers"))}
-        caller_betas: Final = tuple(
-            str(value) for key, value in caller_headers.items() if key.lower() == "anthropic-beta"
-        )
-        original_headers: Final = _original_count_headers(params)
+        generation_headers: Final = _generation_count_headers(params)
         messages: Final = _JSON_MESSAGES.validate_python(body.get("messages"))
         per_turn_betas: Final = (
             (ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER,)
@@ -419,11 +427,11 @@ async def _count_claude(data: Mapping[str, object], call_type: CallTypes) -> int
         count_headers: Final = _HEADERS.validate_python(
             config._finalize_messages_headers(  # pyright: ignore[reportUnknownMemberType, reportPrivateUsage]  # 复用功能头
                 headers={
-                    **{key: value for key, value in original_headers.items() if key != "anthropic-beta"},
+                    **{key: value for key, value in generation_headers.items() if key != "anthropic-beta"},
                     **auth,
                     "anthropic-beta": merge_anthropic_beta_headers(
                         auth.get("anthropic-beta"),
-                        (*caller_betas, original_headers.get("anthropic-beta", ""), *per_turn_betas),
+                        (generation_headers.get("anthropic-beta", ""), *per_turn_betas),
                     ),
                 },
                 optional_params=body,
