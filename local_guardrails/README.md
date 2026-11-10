@@ -710,6 +710,7 @@ tokenizer 首次加载遵循 LiteLLM 既有配置。若部署要求禁止 Huggin
 metadata、litellm_metadata 或 proxy_server_request 单独取 User-Agent、X-App 和 beta，
 而是使用实际出站的 headers、extra_headers 和当前供应商匹配的 provider_specific_header。
 没有显式身份头时，计数与生成共用 HTTP 客户端默认 User-Agent，功能 beta 仍按实际输入推导。
+身份头保留生成路径的原始键名和重复值顺序，不把不同大小写的同名头压成单值或拼成逗号字符串。
 原始客户端鉴权、Cookie 与无关头不会因此转发。生成请求保持原有行为，无需修改核心镜像
 
 此次发现 CPA 的计数与生成输入转换不一致会漏计历史 thinking，仅改计数身份不能修复旧 CPA。

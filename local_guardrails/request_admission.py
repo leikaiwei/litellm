@@ -382,7 +382,7 @@ def _generation_count_headers(data: Mapping[str, object]) -> dict[str, str]:
     outgoing: Final = {**_mapping(data.get("headers")), **_mapping(data.get("extra_headers")), **scoped}
     return {
         **{
-            key.lower(): value
+            key: value
             for key, value in outgoing.items()
             if key.lower() in ("user-agent", "x-app") and isinstance(value, str)
         },

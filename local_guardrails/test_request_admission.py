@@ -968,6 +968,67 @@ async def test_claude_count_matches_generation_identity_without_forwarding_origi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ("messages", "chat", "responses"))
+async def test_claude_count_preserves_generation_identity_header_duplicates(
+    monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
+    client: Final = _install_count_transport(monkeypatch, transport)
+    monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
+    deployment: Final = _claude_deployment()
+    params: Final = TypeAdapter(dict[str, object]).validate_python(deployment["litellm_params"])
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                **deployment,
+                "litellm_params": {
+                    **params,
+                    "headers": {"User-Agent": "forwarded-client", "X-App": "forwarded-app"},
+                    "extra_headers": {"user-agent": "extra-client", "x-app": "extra-app"},
+                    "provider_specific_header": [
+                        {
+                            "custom_llm_provider": "openai",
+                            "extra_headers": {"USER-AGENT": "unrelated-client", "X-APP": "unrelated-app"},
+                        },
+                        {
+                            "custom_llm_provider": "anthropic",
+                            "extra_headers": {"USER-AGENT": "scoped-client", "X-APP": "scoped-app"},
+                        },
+                    ],
+                },
+            }
+        ],
+        num_retries=0,
+    )
+    try:
+        if route == "messages":
+            await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
+                model="claude-fixture", messages=_messages(), max_tokens=100
+            )
+        elif route == "chat":
+            await router.acompletion(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
+                model="claude-fixture", messages=_messages(), max_tokens=100
+            )
+        else:
+            await router.aresponses(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
+                model="claude-fixture", input="Hello", max_output_tokens=100
+            )
+        assert tuple(request.url.path for request in transport.requests) == (
+            "/v1/messages/count_tokens", "/v1/messages"
+        )
+        counted, generated = transport.requests
+        identity_names: Final = frozenset((b"user-agent", b"x-app"))
+        counted_identity: Final = tuple(pair for pair in counted.headers.raw if pair[0].lower() in identity_names)
+        generated_identity: Final = tuple(pair for pair in generated.headers.raw if pair[0].lower() in identity_names)
+        assert counted_identity == generated_identity
+        assert generated.headers.get_list("user-agent") == ["forwarded-client", "extra-client", "scoped-client"]
+        assert generated.headers.get_list("x-app") == ["forwarded-app", "extra-app", "scoped-app"]
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ("messages", "chat", "responses"))
 @pytest.mark.parametrize("failure", (False, True))
 @pytest.mark.parametrize("model", _CLAUDE_MODELS)
 async def test_real_router_claude_uses_one_provider_count_and_never_sends_rejected_inference(
