@@ -12,7 +12,9 @@ from pydantic import JsonValue, TypeAdapter
 
 import litellm
 from litellm._logging import verbose_logger
+from litellm.exceptions import ConfirmedUnsupportedParameterError
 from litellm.litellm_core_utils.asyncify import asyncify
+from litellm.litellm_core_utils.parameter_compatibility import validate_anthropic_thinking
 from litellm.llms.anthropic.common_utils import AnthropicError
 from litellm.llms.anthropic.count_tokens.transformation import (
     AnthropicCountTokensConfig,
@@ -70,6 +72,7 @@ class AnthropicCountTokensHandler(AnthropicCountTokensConfig):
                 system=system,
                 optional_params=optional_params,
             )
+            validate_anthropic_thinking(request_body, model)
 
             verbose_logger.debug("Transformed request: %s", request_body)
 
@@ -111,7 +114,7 @@ class AnthropicCountTokensHandler(AnthropicCountTokensConfig):
             # Return Anthropic response directly - no transformation needed
             return anthropic_response
 
-        except AnthropicError:
+        except (AnthropicError, ConfirmedUnsupportedParameterError):
             # Re-raise Anthropic exceptions as-is
             raise
         except httpx.HTTPStatusError as e:

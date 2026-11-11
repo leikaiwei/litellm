@@ -12,14 +12,16 @@ Regression tests for https://github.com/BerriAI/litellm/issues/21343
 
 import asyncio
 import datetime
+import json
 from collections.abc import Awaitable, Callable
-from typing import Final
+from typing import Final, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 import litellm
 from litellm import Router
+from litellm.exceptions import MidStreamFallbackError
 from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.litellm_core_utils.llm_response_utils.response_metadata import (
     _union_duration_ms,
@@ -27,7 +29,98 @@ from litellm.litellm_core_utils.llm_response_utils.response_metadata import (
 )
 from litellm.litellm_core_utils.logging_utils import track_llm_api_timing
 from litellm.litellm_core_utils.rules import Rules
+from litellm.llms.anthropic.common_utils import AnthropicError
+from litellm.types.router import RetryPolicy
 from litellm.utils import function_setup
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_retry", (False, True))
+@pytest.mark.parametrize("stream", (False, True))
+async def test_confirmed_parameter_error_stops_policy_retries_and_fallbacks(after_retry: bool, stream: bool) -> None:
+    terminal: Final = AnthropicError(
+        400,
+        json.dumps(
+            {"error": {"type": "invalid_request_error", "message": "thinking.display: Input should be 'omitted'"}}
+        ),
+    )
+    transient: Final = litellm.InternalServerError(message="busy", model="fixture-model", llm_provider="anthropic")
+    attempt: Final = AsyncMock(side_effect=([transient] if after_retry else []) + [terminal])
+    router: Final = Router(
+        model_list=[
+            {"model_name": group, "litellm_params": {"model": "openai/fixture-model", "api_key": "fixture-key"}}
+            for group in ("primary", "backup")
+        ],
+        num_retries=3,
+        retry_after=0,
+        retry_policy=RetryPolicy(BadRequestErrorRetries=3, InternalServerErrorRetries=3),
+        fallbacks=[{"primary": ["backup"]}],
+        fallback_on_unsupported_params=True,
+        disable_cooldowns=True,
+    )
+    call: Final = cast(
+        Callable[..., Awaitable[object]], router.async_function_with_fallbacks
+    )  # cast-ok: Router 的公开调用入口接受关键字参数并返回可等待结果
+    with pytest.raises(litellm.ConfirmedUnsupportedParameterError):
+        await call(
+            original_function=attempt,
+            model="primary",
+            messages=[{"role": "user", "content": "fixture"}],
+            stream=stream,
+            metadata={},
+        )
+    assert attempt.await_count == (2 if after_retry else 1)
+    assert all(call.kwargs["model"] == "primary" for call in attempt.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_midstream_parameter_error_cannot_use_committed_retry_budget() -> None:
+    terminal: Final = litellm.ConfirmedUnsupportedParameterError(
+        message="参数不兼容", model="fixture-model", llm_provider="anthropic"
+    )
+    envelope: Final = MidStreamFallbackError(
+        message="wrapped", model="primary", llm_provider="anthropic", original_exception=terminal, is_pre_first_chunk=True
+    )
+    router: Final = _create_router(num_retries=3)
+    attempt: Final = AsyncMock()
+    await router._astream_retry_same_group(  # pyright: ignore[reportPrivateUsage]  # 验证流式已承诺预算不重发请求
+        envelope,
+        {"model": "test-model", "metadata": {"attempted_retries": 1, "max_retries": 3}},
+        attempt,
+    )
+    attempt.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_parameter_error_from_fallback_target_stops_remaining_targets() -> None:
+    terminal: Final = litellm.ConfirmedUnsupportedParameterError(
+        message="参数不兼容", model="fixture-model", llm_provider="anthropic"
+    )
+    transient: Final = litellm.InternalServerError(message="busy", model="fixture-model", llm_provider="anthropic")
+    attempt: Final = AsyncMock(side_effect=[transient, terminal])
+    router: Final = Router(
+        model_list=[
+            {"model_name": group, "litellm_params": {"model": "openai/fixture-model", "api_key": "fixture-key"}}
+            for group in ("primary", "backup", "last")
+        ],
+        num_retries=0,
+        fallbacks=[{"primary": ["backup", "last"]}],
+        fallback_on_unsupported_params=True,
+        disable_cooldowns=True,
+    )
+    call: Final = cast(
+        Callable[..., Awaitable[object]], router.async_function_with_fallbacks
+    )  # cast-ok: Router 的公开调用入口接受关键字参数并返回可等待结果
+    with pytest.raises(litellm.ConfirmedUnsupportedParameterError) as rejected:
+        await call(
+            original_function=attempt,
+            model="primary",
+            messages=[{"role": "user", "content": "fixture"}],
+            metadata={},
+        )
+    assert rejected.value is terminal
+    assert rejected.value.__cause__ is not terminal
+    assert tuple(call.kwargs["model"] for call in attempt.await_args_list) == ("primary", "backup")
 
 
 def _make_rate_limit_error(message="Rate limited"):

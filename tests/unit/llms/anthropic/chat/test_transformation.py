@@ -432,3 +432,22 @@ def test_fix_ensures_tool_calls_for_tool_results():
 
 if __name__ == "__main__":
     test_fix_ensures_tool_calls_for_tool_results()
+
+
+@pytest.mark.parametrize("display", ("invalid-fixture", "updates"))
+def test_chat_thinking_display_compatibility(display: str) -> None:
+    from litellm.exceptions import ConfirmedUnsupportedParameterError
+
+    if display == "invalid-fixture":
+        with pytest.raises(ConfirmedUnsupportedParameterError, match=r"thinking\.display"):
+            AnthropicConfig().transform_request(
+                model="claude-sonnet-5-5", messages=[{"role": "user", "content": "Hello"}],
+                optional_params={"thinking": {"type": "adaptive", "display": display}},
+                litellm_params={}, headers={},
+            )
+        return
+    assert AnthropicConfig().transform_request(
+        model="claude-sonnet-5-5", messages=[{"role": "user", "content": "Hello"}],
+        optional_params={"thinking": {"type": "adaptive", "display": display}},
+        litellm_params={}, headers={},
+    )["thinking"]["display"] == display

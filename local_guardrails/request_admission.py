@@ -18,6 +18,7 @@ from litellm.exceptions import MalformedRequestFieldError
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.get_provider_specific_headers import ProviderSpecificHeaderUtils
+from litellm.litellm_core_utils.parameter_compatibility import confirmed_parameter_error
 from litellm.litellm_core_utils.token_counter import (
     calculate_img_tokens,
     high_detail_image_token_upper_bound,
@@ -555,6 +556,9 @@ class RequestAdmission(CustomLogger):
         try:
             count: Final = await self._claude_counter(kwargs, call_type)
         except Exception as error:
+            terminal: Final = confirmed_parameter_error(error, candidate.model)
+            if terminal is not None:
+                raise terminal
             _raise_invalid(
                 AdmissionProblem(
                     "count_tokens", f"Claude 上游计数失败（{type(error).__name__}），请求未发送，请稍后重试", False
