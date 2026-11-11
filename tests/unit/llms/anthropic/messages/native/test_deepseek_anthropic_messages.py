@@ -3,6 +3,7 @@ from litellm.llms.deepseek.messages.transformation import (
     DEEPSEEK_ANTHROPIC_API_BASE,
     DeepSeekAnthropicMessagesConfig,
 )
+from litellm.types.router import GenericLiteLLMParams
 from litellm.utils import ProviderConfigManager
 
 
@@ -33,7 +34,7 @@ def test_deepseek_anthropic_sanitizes_custom_tool_wrapper_fields():
         model="deepseek-v4-pro",
         messages=[{"role": "user", "content": "hello"}],
         anthropic_messages_optional_request_params=optional_params,
-        litellm_params={},
+        litellm_params=GenericLiteLLMParams(),
         headers={},
     )
 

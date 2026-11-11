@@ -907,9 +907,9 @@ class LiteLLMAnthropicMessagesAdapter:
             if "strict" in tool:
                 function_chunk["strict"] = bool(tool["strict"])
 
-            for k, v in tool.items():
-                if k not in mapped_tool_params:  # pass additional computer kwargs
-                    function_chunk.setdefault("parameters", {}).update({k: v})
+            extra_parameters: Final = {key: value for key, value in tool.items() if key not in mapped_tool_params}
+            if extra_parameters:
+                function_chunk["parameters"] = {**function_chunk.get("parameters", {}), **extra_parameters}
             tool_param = _chat_tool_param(function_chunk, tool)
             self._add_cache_control_if_applicable(tool, tool_param, model)
             new_tools.append(tool_param)
