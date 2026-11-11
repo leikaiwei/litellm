@@ -709,8 +709,7 @@ Rerank、音频转写和 evaluation，避免 Router 内部占位消息误触发�
 唯一例外是内部固定响应 provider `claude_code_review_allow/allow`，不按价格为零豁免普通模型。
 非 Claude 候选等于或超过上限时被排除；全部候选超限时返回 `ContextWindowExceededError`，
 保留已有 `context_window_fallbacks`。下述 Claude 候选方案的拒绝则终止整个请求，不走回退。
-例如希望在计数达到 100 万处拒绝，可把相应部署的
-`model_info.max_input_tokens` 设为 `1000000`，不需要改变供应商模型目录
+Claude 的有效预检上限进一步取已有上限和 `950000` 的较小值，不改变供应商模型目录
 
 2026-11-07 已在 patch.4 镜像配套 `0b852acb03f` 外部插件上启用。百万级输入上限封顶
 `1000000`，当前 DeepSeek V4.1 Flash 同源部署为 `970000`，保留其他已有较小上限。
@@ -719,7 +718,7 @@ Rerank、音频转写和 evaluation，避免 Router 内部占位消息误触发�
 未启用下述 Claude 上游计数的部署复用 LiteLLM 的 tokenizer、Anthropic system 提取和 Responses 输入转换，包含 system、
 instructions、工具定义和工具历史，不重命名工具，不修改用户消息。计数失败或全局计数关闭时，
 返回明确的本地无法核验提示，建议 `/compact` 或开启新会话，不再把未知长度的请求继续发给
-上游。非 Claude Responses 的正常加密推理和加密压缩历史除外，这类内容按下述规则保留并交由上游校验
+上游。Responses 的正常加密推理和加密压缩历史按下述规则保留，Claude 仍会调用上游计数
 
 内嵌图片在受限后台线程里复用 Pillow 校验结构和压缩像素。解码前按现有
 `MAX_IMAGE_URL_DOWNLOAD_SIZE_MB` 限制分配，解码后遵守 Pillow 像素上限。返回错误时包含
@@ -731,7 +730,7 @@ instructions、工具定义和工具历史，不重命名工具，不修改用�
 
 非 Claude 计数副本中的远端图片使用已有 high-detail tile 上界估算，实际请求和 detail 参数保持原样；
 本地图片继续使用已有尺寸计数。这仍是估算，不是所有供应商的精确视觉 token 公式。
-非 Claude Responses 的 `reasoning`、`compaction` 输入项携带非空字符串 `encrypted_content` 时，不再因
+Responses 的 `reasoning`、`compaction` 输入项携带非空字符串 `encrypted_content` 时，不再因
 密文不可本地读取而拒绝。仍通过共享转换器检查可读正文、推理摘要、系统指令、工具定义和工具
 历史，原始密文与请求保持不变。此时本地计数只覆盖可读部分，不代表完整上下文长度，密文的
 有效性和实际上下文上限由上游最终校验，不能用密文字符数代替 token 数。Messages 中的
@@ -768,70 +767,49 @@ tokenizer 首次加载遵循 LiteLLM 既有配置。若部署要求禁止 Huggin
 
 ### Opus、Sonnet、Haiku 上游计数
 
-#### 2026-11-11 保守准入候选，尚未部署
+#### 2026-11-11 95 万预检候选，尚未部署
 
-此方案继续使用官方 CPA，不依赖 CPA fork 或新增 CPA 插件。无法可靠核验的请求直接拒绝，
-即使实际未超限也不放行。适用部署按模型或 base_model 的 `claude-opus-`、`claude-sonnet-`、
-`claude-haiku-` 前缀识别，实际出站模型还须使用可核验的 Anthropic 协议
+按用户最终决定，保留官方 CPA 和现有请求改写，只优化 LiteLLM。三个 Claude 系列的输入
+预检上限封顶 `950000`，同时保留部署或模型目录中已有的较小上限。识别依据仍为实际模型或
+base_model 的 `claude-opus-`、`claude-sonnet-`、`claude-haiku-` 前缀，非 Claude 上限不变。
+计数小于有效上限时继续请求，等于或超过时返回错误；不会修改供应商模型的真实容量或计费目录
 
-在协议转换前检查原始历史，并检查转换后的计数正文。历史 thinking（包括 signed 和 redacted）、
-Responses reasoning/compaction、未知内容块、远端图片或文件引用、MCP、服务端工具及其他隐藏上下文
-均拒绝。Chat 的历史 reasoning/thinking 字段和 provider-specific history 同样拒绝，避免转换器
-删除或改写未知内容后，把较小计数当作完整输入。只检查协议字段，不递归误拦自定义工具参数中的
-普通同名 JSON 键。非空 container 和无法核验的 Claude Chat extra_body 继续拒绝
+95 万比此前 100 万多留出 5 万余量，属于减少漏拦的折中，不是最终生成输入的保证。
+原故障请求预检为 899,914，实际生成输入为 1,013,036，因此 95 万仍会放行这次历史样本。
+用户已接受计数低估造成的部分超长漏放，不能把这个阈值描述为彻底修复计数和生成差异
 
-这些限制同样影响短续聊。`/compact` 后若仍携带带签名的历史或 compaction 块，也会继续拒绝，
-建议使用纯文本摘要开启新会话。本地形状拒绝发生在计数之前，计数和生成调用均为零；不会为得到
-一个可接受计数而删除用户历史。普通和流式请求使用相同准入规则
+撤销上一候选的密文/媒体/服务端工具统一拒绝和 `CLAUDE_PREFLIGHT_VERIFIED_BASES` 门禁。
+正常 thinking、redacted_thinking、Responses reasoning/compaction 继续交给已有协议转换和上游
+count_tokens 处理，不要求关闭 CPA cloaking，不要求中转地址登记无改写白名单，也不通过删除
+用户历史来压低计数。Responses 仍经既有 Chat 桥接计数，原生透传、隐藏 conversation 引用、
+container 和无法拍平的 Claude Chat extra_body 保留已有限制
 
-可读文本、自定义工具以及支持的内嵌 base64 媒体通过检查后，按选中部署自身的凭据、api_base
-和输入上限调用 `/v1/messages/count_tokens`，不重选部署、不退回本地估算。Responses 经既有
-Chat 桥接后计数，原生 Responses 透传仍拒绝。计数达到或超过上限，以及鉴权失败、超时、
-上游错误或无效计数，都直接终止请求，不触发组内重试、普通 fallback 或上下文 fallback
+计数使用选中部署自身的凭据、api_base 和实际生成身份头，不经 Router 重选部署，也不退回
+本地 tokenizer 估算。保留 User-Agent、X-App、beta 和会话标识对齐，客户端鉴权和 Cookie
+不会透传。计数失败、无效结果或超过预检上限都直接返回错误，停止该请求的重试和 fallback。
+接受计数偏小的风险，不代表计数接口失败时无条件发送生成请求
 
-中转地址必须由服务端环境 `CLAUDE_PREFLIGHT_VERIFIED_BASES` 声明已完成计数/生成一致性验收，
-格式为 JSON 数组，例如 `'["https://api.anthropic.com", "https://reviewed-cpa.example"]'`。
-未设置时只允许官方 Anthropic 直连；设置后整体替换默认列表，空数组表示全部拒绝。
-解析命名凭据和实际 Anthropic base 后才核对，客户端 kwargs 或 model_info 不能添加白名单。
-未登记中转或白名单格式错误直接拒绝，不发起鉴权交换、计数或生成。此声明不是远程配置审计，
-运营须先核验所有可选凭证有效关闭 cloaking、无影响正文的 payload rules，再登记对应地址。
-CPA 升级也必须先隔离验收，再切换并继续放行，不能把旧声明当成新版本已验证
+95 万阈值及历史兼容调整都在外部插件。候选仍保留 `RequestAdmissionError`、
+`RequestAdmissionContextWindowExceededError` 和少量 LiteLLM 核心异常处理补丁，以确保拒绝后
+终止 SDK/Router 重试、普通/上下文/流式 fallback。它尚不是纯插件发布，需新核心镜像与插件
+配套部署，不能把含新异常导入的插件直接覆盖到 patch.5。生产尚未部署，本轮不更改 CPA 配置
 
-计数头取实际出站的 headers、extra_headers 和匹配供应商的 provider_specific_header，
-对齐 User-Agent、X-App、功能 beta 和支持的会话标识白名单。没有客户端身份时不伪造 Claude Code，
-不转发客户端 Authorization、x-api-key、Cookie 或无关请求头。生成请求保持原有行为
+上一候选关闭 cloaking 的隔离小请求曾得到 count=26、生成输入=26，690 项回归也曾通过，
+这些只属于已撤回方案的历史证据，不构成本方案的无漏检保证。CPA fork 的 `Fork release`
+自动同步工作流已按用户要求停用，生产继续使用官方 CPA，现有生产更新任务未改
 
-此候选新增 `RequestAdmissionError`、`RequestAdmissionContextWindowExceededError` 和配套
-Router/重试异常处理，必须构建包含这些核心补丁的 LiteLLM 镜像并与外部插件一起发布，不能只把
-新插件替换到现有 patch.5。当前尚未部署，以下历史版本、哈希和验收记录均不能代表此候选已上线
+本地 HTTP 代理使用模拟后端，配置原输入上限 100 万、两次重试和 fallback。预检计数 899,914
+的原历史请求及计数 949,999 的普通请求都返回 200；950,000 和流式 950,001 均返回 400，
+只调用一次计数、零次生成。计数接口 503 同样返回 400 且不生成。本轮未调用真实上游生成接口
 
-官方 CPA v8.0.66 的仅计数探测显式启用 `prefix_mismatch_behavior=error`，
-短文本返回 HTTP 200、`input_tokens=11`；原故障历史
-返回 HTTP 400、`signature_error/prefix_mismatch`。两项都只调用计数，生成调用为零。
-这不能证明其他账号或请求都会以同样方式拒绝，候选因此先在本地拒绝不可核验历史。
-复核 v8.0.66/67 还确认，非原生请求的 generation cloaking 会注入 CLI identity/currentDate，
-count 则不添加这些系统内容，纯文本也存在低计数路径。官方 CPA v8.0.66 隔离实例同时设置
-`upstream.claude.disable-claude-cloak-mode: true` 与账号副本 `cloak_mode: never`，普通客户端
-身份的短 system/user 请求计数返回 26，真实 Opus 5.5 生成输入同为 26、输出 5，正常结束。
-生产账号哈希未变化，隔离实例及凭据副本已删除。这是一份账号、一个短请求的验证，不能直接
-推定所有生产账号与后续版本兼容。强制 tool_choice 与有效 thinking/effort 并存也会在本地拒绝，
-避免 CPA 只在生成时删除这些参数。上游 count 仍是估算，不能宣称百万边界与最终生成严格相等
-或绝无超限差异。上线必须同步采用已验收 CPA 配置及白名单，不能只替换插件
-
-本地 HTTP 代理启用两次重试、普通 fallback 和上下文 fallback 后重放原故障请求，普通与流式
-均返回 400，计数与生成调用均为零。Chat inline opaque 和 Responses compaction 同样在本地
-拒绝。可读短文本完成一次计数和一次模拟生成；计数等于上限或计数接口返回 503 时均返回 400，
-各调用一次计数、零次生成。以上生成使用本机 fixture，不代表真实上游生成兼容性已验收
-
-候选最终合并回归 690 项通过，其中准入插件 338 项。完整 pre_commit_lint 检查通过，插件单独
-basedpyright 为零错误，Ruff 及格式检查通过。真实上游验证仅为上文关闭 cloaking 的一次小请求，
-未切换生产镜像、配置、插件或现有更新任务
+最终合并回归 646 项通过，其中插件 294 项，覆盖三种 API 的普通/流式历史兼容、95 万边界、
+已有较小上限、非 Claude 上限不变和终止回退。插件 basedpyright 零错误，Ruff 和格式检查通过
 
 #### 2026-11-09 至 11-10 历史实现与上线记录
 
 以下保留旧版计数、加密历史和 fallback 的实现及上线记录。11-10 曾计划以 CPA fork 对齐
-计数和生成转换；11-11 候选改为拒绝不可核验历史，不再要求部署该 fork。旧版允许历史 thinking、
-计数失败或超限后按原路由回退、只替换外部插件等描述，不适用于上面的新候选
+计数和生成转换；11-11 最终候选保留官方 CPA 改写，并把 LiteLLM 预检封顶降为 95 万。
+旧版计数失败或超限后按原路由回退、只替换外部插件的描述，不适用于上面的新候选
 
 2026-11-09 晚间 review 补充两项修复，Chat 计数改用生成路径的参数转换，遵守
 `additional_drop_params`，并保留输出预算参与 thinking 转换。按上游已合并的

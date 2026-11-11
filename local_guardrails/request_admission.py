@@ -2,12 +2,10 @@ import asyncio
 import base64
 import binascii
 import copy
-import os
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Final, cast
-from urllib.parse import urlsplit
 
 from openai.types.responses.response_create_params import ResponseInputParam
 from opentelemetry.trace import Span
@@ -42,7 +40,6 @@ from litellm.llms.anthropic.pass_through.messages.utils import (
     anthropic_system_to_openai_message,
     prepare_native_request_body,
 )
-from litellm.llms.anthropic.wif import resolve_anthropic_base
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig as ResponsesConfig,
 )
@@ -65,7 +62,6 @@ _PROVIDER_HEADERS: Final[TypeAdapter[ProviderSpecificHeader | tuple[ProviderSpec
 _ITEMS: Final = TypeAdapter(tuple[object, ...])
 _MESSAGES: Final = TypeAdapter(tuple[dict[str, object], ...])
 _TOOL_CHOICE: Final = TypeAdapter[str | dict[str, object] | None](str | dict[str, object] | None)
-_VERIFIED_BASES: Final = TypeAdapter(tuple[str, ...])
 _NON_CHAT_MODES: Final = frozenset(
     (
         "embedding",
@@ -95,6 +91,7 @@ _CALLS: Final = frozenset(
         CallTypes.aresponses,
     )
 )
+_CLAUDE_INPUT_CEILING: Final = 950_000
 _CLAUDE_COUNT_HEADERS: Final = frozenset(
     (
         "user-agent",
@@ -154,13 +151,20 @@ def _candidate(deployment: dict[str, object]) -> Candidate:
         return Candidate(deployment, model, None, True)
     explicit: Final = info.get("max_input_tokens")
     if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit > 0:
-        return Candidate(deployment, model, explicit)
+        return Candidate(deployment, model, _input_ceiling(model, explicit))
     try:
         catalog: Final = litellm.get_model_info(model=model)
     except Exception:  # noqa: BLE001  # 自定义模型可能不在目录内，只使用已知的输入上限
         return Candidate(deployment, model, None)
     maximum: Final = catalog.get("max_input_tokens")
-    return Candidate(deployment, model, maximum if isinstance(maximum, int) and maximum > 0 else None)
+    return Candidate(
+        deployment, model, _input_ceiling(model, maximum) if isinstance(maximum, int) and maximum > 0 else None
+    )
+
+
+def _input_ceiling(model: str, maximum: int) -> int:
+    # 给 CPA 改写留出余量，已有较小上限不放宽；这不是最终生成 token 数的保证。
+    return min(maximum, _CLAUDE_INPUT_CEILING) if _is_counted_claude(model) else maximum
 
 
 def _image_data(block: Mapping[str, object]) -> str | AdmissionProblem | None:
@@ -417,129 +421,12 @@ def _generation_count_headers(data: Mapping[str, object]) -> Mapping[str, str]:
     }
 
 
-def _reject_claude_preflight(field: str, model: str, detail: str = "无法可靠核验完整 Claude 上下文") -> None:
+def _reject_claude_preflight(field: str, model: str, detail: str) -> None:
     raise RequestAdmissionError(
-        message=f"{field} {detail}，请用纯文本摘要开启新会话；/compact 后仍有加密历史时也会拒绝。生成请求未发送",
+        message=f"{field} {detail}。生成请求未发送",
         model=model,
         llm_provider="anthropic",
         body={"type": "invalid_request_error", "param": field, "code": "request_admission_rejected"},
-    )
-
-
-def _check_claude_content(content: object, path: str, model: str) -> None:
-    if isinstance(content, str) or content is None:
-        return
-    for index, block in enumerate(_MESSAGES.validate_python(content)):
-        _check_claude_block(block, f"{path}[{index}]", model)
-
-
-def _check_claude_block(block: Mapping[str, object], path: str, model: str) -> None:
-    kind: Final = block.get("type")
-    if block.get("encrypted_content") is not None or block.get("signature") is not None:
-        _reject_claude_preflight(path, model)
-    if kind in ("text", "input_text", "output_text", "tool_use"):
-        return
-    if kind == "tool_result":
-        _check_claude_content(block.get("content"), f"{path}.content", model)
-        return
-    if kind in ("image", "document"):
-        source: Final = _mapping(block.get("source"))
-        if source.get("type") == "base64" or (kind == "document" and source.get("type") == "text"):
-            return
-    if kind in ("image_url", "input_image"):
-        image_url: Final = block.get("image_url")
-        url: Final = image_url if isinstance(image_url, str) else _mapping(image_url).get("url")
-        if isinstance(url, str) and url.startswith("data:image/"):
-            return
-    if kind == "file":
-        file_data: Final = _mapping(block.get("file")).get("file_data")
-        if isinstance(file_data, str) and file_data.startswith("data:application/pdf;base64,"):
-            return
-    _reject_claude_preflight(path, model)
-
-
-def _check_claude_original_history(data: Mapping[str, object], model: str) -> None:
-    # 转换器可能丢弃未知历史块，必须在转换前拒绝，避免把丢失后的低计数当成完整计数。
-    _check_claude_content(data.get("system"), "system", model)
-    for index, message in enumerate(_MESSAGES.validate_python(data.get("messages") or [])):
-        for field in ("thinking_blocks", "reasoning_content", "reasoning", "provider_specific_fields"):
-            if message.get(field):
-                _reject_claude_preflight(f"messages[{index}].{field}", model)
-        _check_claude_content(message.get("content"), f"messages[{index}].content", model)
-    raw_input: Final = data.get("input")
-    if raw_input is None or isinstance(raw_input, str):
-        return
-    for index, item in enumerate(_MESSAGES.validate_python(raw_input)):
-        _check_claude_response_item(item, f"input[{index}]", model)
-
-
-def _check_claude_response_item(item: Mapping[str, object], path: str, model: str) -> None:
-    if item.get("encrypted_content") is not None or item.get("signature") is not None:
-        _reject_claude_preflight(path, model)
-    if item.get("type") in ("reasoning", "compaction") or item.get("provider_specific_fields"):
-        _reject_claude_preflight(path, model)
-    if item.get("type") not in (None, "message", "function_call", "function_call_output"):
-        _reject_claude_preflight(path, model)
-    if item.get("type") is None and item.get("role") not in ("user", "assistant", "system", "developer"):
-        _reject_claude_preflight(path, model)
-    _check_claude_content(item.get("content"), f"{path}.content", model)
-    if item.get("type") == "function_call_output" and isinstance(item.get("output"), (list, tuple)):
-        _check_claude_content(item["output"], f"{path}.output", model)
-
-
-def _check_claude_countable_body(body: Mapping[str, object], model: str) -> None:
-    # 密文不能证明计数完整；只检查协议字段，不扫描工具参数中的同名键。
-    _check_claude_content(body.get("system"), "system", model)
-    if body.get("mcp_servers"):
-        _reject_claude_preflight("mcp_servers", model)
-    tool_choice: Final = body.get("tool_choice")
-    choice_type: Final = tool_choice if isinstance(tool_choice, str) else _mapping(tool_choice).get("type")
-    thinking: Final = _mapping(body.get("thinking"))
-    if choice_type in ("any", "tool") and (
-        (bool(thinking) and thinking.get("type") != "disabled") or "effort" in _mapping(body.get("output_config"))
-    ):
-        _reject_claude_preflight("tool_choice", model, "强制工具调用与 thinking/effort 不能保证计数和生成一致")
-    for index, tool in enumerate(_MESSAGES.validate_python(body.get("tools") or [])):
-        if tool.get("type") not in (None, "custom"):
-            _reject_claude_preflight(f"tools[{index}].type", model)
-    for index, message in enumerate(_MESSAGES.validate_python(body.get("messages", []))):
-        _check_claude_content(message.get("content"), f"messages[{index}].content", model)
-
-
-def _normalized_claude_base(base: str) -> str:
-    parts: Final = urlsplit(base)
-    if (
-        parts.scheme not in ("http", "https")
-        or not parts.hostname
-        or parts.username is not None
-        or parts.password is not None
-        or parts.query
-        or parts.fragment
-        or parts.netloc.endswith(":")
-        or parts.port == 0
-        or any(character.isspace() for character in base)
-    ):
-        raise ValueError("Claude 上游地址配置无效")
-    return resolve_anthropic_base(base)
-
-
-def _verified_claude_base(api_base: str | None, model: str) -> str:
-    # 白名单只读进程环境，不能从请求参数或 model_info 扩大信任范围。
-    try:
-        configured: Final = _VERIFIED_BASES.validate_json(
-            os.getenv("CLAUDE_PREFLIGHT_VERIFIED_BASES", '["https://api.anthropic.com"]')
-        )
-        verified: Final = frozenset(_normalized_claude_base(entry) for entry in configured)
-        base: Final = _normalized_claude_base(AnthropicModelInfo.get_api_base(api_base) or "https://api.anthropic.com")
-        if base in verified:
-            return base
-    except ValueError:
-        pass
-    raise RequestAdmissionError(
-        message="Claude 上游未登记预检验收或白名单配置无效，生成请求未发送。请管理员核验无 cloak 和请求改写后配置 CLAUDE_PREFLIGHT_VERIFIED_BASES",
-        model=model,
-        llm_provider="anthropic",
-        body={"type": "invalid_request_error", "code": "request_admission_rejected"},
     )
 
 
@@ -553,7 +440,7 @@ async def _count_claude(data: Mapping[str, object], call_type: CallTypes) -> int
     provider: Final = params.get("custom_llm_provider")
     if provider not in (None, "anthropic") or not _is_counted_claude(model):
         raise ValueError("Claude 部署不是可核验的 Anthropic 上游")
-    base: Final = _verified_claude_base(_OPTIONAL_STRING.validate_python(params.get("api_base")), model)
+    base: Final = _OPTIONAL_STRING.validate_python(params.get("api_base"))
     async with asyncio.timeout(30):
         auth: Final = await AnthropicModelInfo.aget_auth_header(
             api_key=_OPTIONAL_STRING.validate_python(params.get("api_key")) or litellm.anthropic_key or litellm.api_key,
@@ -564,7 +451,6 @@ async def _count_claude(data: Mapping[str, object], call_type: CallTypes) -> int
         if auth is None:
             raise ValueError("Claude 上游计数缺少凭据")
         body: Final = await offload_token_count(_claude_body)(params, model, call_type)
-        _check_claude_countable_body(body, model)
         generation_headers: Final = _generation_count_headers(params)
         messages: Final = _JSON_MESSAGES.validate_python(body.get("messages"))
         per_turn_betas: Final = (
@@ -691,7 +577,6 @@ class RequestAdmission(CustomLogger):
             await offload_token_count(_admit)(kwargs, (candidate,), model if isinstance(model, str) else "")
             if not _is_counted_claude(candidate.model):
                 return None
-            _check_claude_original_history(kwargs, candidate.model)
             extra_body: Final = (
                 _OBJECT.validate_python(kwargs["extra_body"]) if kwargs.get("extra_body") is not None else {}
             )
@@ -724,7 +609,7 @@ class RequestAdmission(CustomLogger):
             count: Final = await self._claude_counter(kwargs, call_type)
             if candidate.limit is not None and count >= candidate.limit:
                 raise RequestAdmissionContextWindowExceededError(
-                    message=f"Claude 上游计数 {count} tokens，达到输入上限 {candidate.limit}。请先 /compact 或开启新会话",
+                    message=f"Claude 上游计数 {count} tokens，达到预检上限 {candidate.limit}。请先 /compact 或开启新会话",
                     model=candidate.model,
                     llm_provider="anthropic",
                 )

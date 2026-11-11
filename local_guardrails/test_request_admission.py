@@ -1,7 +1,7 @@
 import base64
 import copy
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from io import BytesIO
 from typing import Final, cast
 from unittest.mock import AsyncMock, patch
@@ -23,6 +23,7 @@ from litellm.llms.compaction import CompactionProtocol
 from litellm.llms.custom_httpx import llm_http_handler
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.custom_llm import CustomLLM
+from litellm.responses.litellm_completion_transformation.reasoning_items import encode_thinking_blocks
 from litellm.router_strategy.complexity_router.context_compaction import compaction_executor
 from litellm.types.llms.anthropic import ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER
 from litellm.types.llms.openai import AllMessageValues
@@ -36,10 +37,7 @@ _MODEL: Final = "admission_test/model"
 
 
 @pytest.fixture(autouse=True)
-def no_network(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("CLAUDE_PREFLIGHT_VERIFIED_BASES", '["https://counter.invalid", "https://named.invalid"]')
-    monkeypatch.setenv("ANTHROPIC_API_BASE", "https://counter.invalid")
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+def no_network() -> Iterator[None]:
     disable_socket(allow_unix_socket=True)
     yield
     enable_socket()
@@ -756,13 +754,44 @@ class CountTransport:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests = (*self.requests, request)
         if self.allow_inference and request.url.path == "/v1/messages":
+            body: Final = TypeAdapter(dict[str, object]).validate_json(request.content)
+            if body.get("stream") is True:
+                events: Final[tuple[Mapping[str, object], ...]] = (
+                    {
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg_fixture",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": body["model"],
+                            "content": [],
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": 75, "output_tokens": 0},
+                        },
+                    },
+                    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Accepted"}},
+                    {"type": "content_block_stop", "index": 0},
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "usage": {"output_tokens": 1},
+                    },
+                    {"type": "message_stop"},
+                )
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    content="".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events),
+                )
             return httpx.Response(
                 200,
                 json={
                     "id": "msg_fixture",
                     "type": "message",
                     "role": "assistant",
-                    "model": json.loads(request.content)["model"],
+                    "model": body["model"],
                     "content": [{"type": "text", "text": "Accepted"}],
                     "stop_reason": "end_turn",
                     "stop_sequence": None,
@@ -784,6 +813,7 @@ def _install_count_transport(monkeypatch: pytest.MonkeyPatch, transport: CountTr
     monkeypatch.setattr(count_handler, "get_async_httpx_client", get_client)
     monkeypatch.setattr(chat_handler, "get_async_httpx_client", get_client)
     monkeypatch.setattr(llm_http_handler, "get_async_httpx_client", get_client)
+    monkeypatch.setattr(litellm, "module_level_aclient", client)
     return client
 
 
@@ -1461,13 +1491,13 @@ async def test_claude_base_model_cannot_defer_an_unverified_responses_backend(
 @pytest.mark.parametrize("route", ("messages", "chat", "responses"))
 @pytest.mark.parametrize("stream", (False, True))
 @pytest.mark.parametrize("redacted", (False, True))
-async def test_claude_opaque_history_is_rejected_locally_without_rewriting_it(
+async def test_claude_reasoning_history_is_counted_and_forwarded_without_rewriting(
     monkeypatch: pytest.MonkeyPatch, route: str, stream: bool, redacted: bool
 ) -> None:
-    transport: Final = CountTransport({"input_tokens": 1}, allow_inference=True)
+    transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
     client: Final = _install_count_transport(monkeypatch, transport)
     monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
-    router: Final = litellm.Router(model_list=[_claude_deployment()], num_retries=2)
+    router: Final = litellm.Router(model_list=[_claude_deployment()], num_retries=0)
     block: Final = (
         {"type": "redacted_thinking", "data": "opaque-history"}
         if redacted
@@ -1480,39 +1510,60 @@ async def test_claude_opaque_history_is_rejected_locally_without_rewriting_it(
     ]
     before: Final = copy.deepcopy(messages)
 
-    async def request() -> None:
-        if route == "messages":
-            await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
-                model="claude-fixture", messages=messages, max_tokens=10, stream=stream
-            )
-        elif route == "chat":
-            await router.acompletion(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
-                model="claude-fixture",
-                messages=TypeAdapter(list[AllMessageValues]).validate_python(
-                    [
-                        messages[0],
-                        {"role": "assistant", "content": "Earlier answer", "thinking_blocks": [block]},
-                        messages[2],
-                    ]
-                ),
-                max_tokens=10,
-                stream=stream,
-            )
-        else:
-            await router.aresponses(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
-                model="claude-fixture",
-                input=[
-                    {"type": "reasoning", "summary": [], "encrypted_content": "opaque-history"},
-                    {"role": "user", "content": "Continue"},
-                ],
-                max_output_tokens=10,
-                stream=stream,
-            )
+    async def consume(response: object) -> None:
+        if stream:
+            assert isinstance(response, AsyncIterator)
+            chunks: Final = [
+                chunk
+                async for chunk in cast(AsyncIterator[object], response)  # cast-ok: 已确认响应实现异步迭代协议
+            ]
+            assert chunks
 
     try:
-        with pytest.raises(RequestAdmissionError, match="/compact"):
-            await request()
-        assert transport.requests == ()
+        if route == "messages":
+            await consume(
+                await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # 上游动态路由
+                    model="claude-fixture", messages=messages, max_tokens=10, stream=stream
+                )
+            )
+        elif route == "chat":
+            await consume(
+                await router.acompletion(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由
+                    model="claude-fixture",
+                    messages=TypeAdapter(list[AllMessageValues]).validate_python(
+                        [
+                            messages[0],
+                            {"role": "assistant", "content": "Earlier answer", "thinking_blocks": [block]},
+                            messages[2],
+                        ]
+                    ),
+                    max_tokens=10,
+                    stream=stream,
+                )
+            )
+        else:
+            await consume(
+                await router.aresponses(  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # 上游动态路由
+                    model="claude-fixture",
+                    input=[
+                        {"role": "user", "content": "Earlier question"},
+                        {"type": "reasoning", "summary": [], "encrypted_content": encode_thinking_blocks([block])},
+                        {"role": "assistant", "content": [{"type": "output_text", "text": "Earlier answer"}]},
+                        {"role": "user", "content": "Continue"},
+                    ],
+                    max_output_tokens=10,
+                    stream=stream,
+                )
+            )
+        assert tuple(request.url.path for request in transport.requests) == (
+            "/v1/messages/count_tokens",
+            "/v1/messages",
+        )
+        counted: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[0].content)
+        sent: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[1].content)
+        assert counted["messages"] == sent["messages"]
+        counted_messages: Final = TypeAdapter(list[dict[str, object]]).validate_python(counted["messages"])
+        assert block in TypeAdapter(list[dict[str, object]]).validate_python(counted_messages[1]["content"])
         assert messages == before
     finally:
         router.reset()
@@ -1539,79 +1590,39 @@ async def test_claude_opaque_history_is_rejected_locally_without_rewriting_it(
                 }
             ]
         },
-        {"messages": [{"role": "user", "content": [{"type": "future_opaque_content", "data": "opaque"}]}]},
         {"mcp_servers": [{"type": "url", "name": "remote", "url": "https://mcp.invalid"}]},
         {"tools": [{"type": "web_search_20250305", "name": "web_search"}]},
+        {
+            "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "any"},
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+        },
     ),
 )
-async def test_claude_unverifiable_content_stops_before_token_count(
+async def test_claude_native_media_tools_and_options_are_counted_and_forwarded(
     monkeypatch: pytest.MonkeyPatch, extra: Mapping[str, object]
 ) -> None:
-    transport: Final = CountTransport({"input_tokens": 1}, allow_inference=True)
+    transport: Final = CountTransport({"input_tokens": 75}, allow_inference=True)
     client: Final = _install_count_transport(monkeypatch, transport)
-    data: Final = {"model": _OPUS, "api_key": "test-key", "messages": _messages(), "max_tokens": 10, **extra}
-    before: Final = copy.deepcopy(data)
+    monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
+    router: Final = litellm.Router(model_list=[_claude_deployment()], num_retries=0)
+    before: Final = copy.deepcopy(extra)
     try:
-        with pytest.raises(RequestAdmissionError, match="无法可靠核验"):
-            await RequestAdmission().async_pre_call_deployment_hook(data, CallTypes.aanthropic_messages)
-        assert transport.requests == ()
-        assert data == before
+        await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
+            **{"model": "claude-fixture", "messages": _messages(), "max_tokens": 10, **extra}  # pyright: ignore[reportArgumentType]  # 参数化 Anthropic 原生请求
+        )
+        assert tuple(request.url.path for request in transport.requests) == (
+            "/v1/messages/count_tokens",
+            "/v1/messages",
+        )
+        counted: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[0].content)
+        sent: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[1].content)
+        assert counted == {key: value for key, value in sent.items() if key not in ("max_tokens", "stream")}
+        assert extra == before
     finally:
+        router.reset()
         await client.client.aclose()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("call_type", "payload"),
-    (
-        (
-            CallTypes.acompletion,
-            {
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {"type": "redacted_thinking", "data": "opaque"},
-                            {"type": "text", "text": "Summary"},
-                        ],
-                    }
-                ]
-            },
-        ),
-        (
-            CallTypes.acompletion,
-            {"messages": [{"role": "assistant", "content": [{"type": "future_history", "content": "Summary"}]}]},
-        ),
-        (
-            CallTypes.aresponses,
-            {
-                "input": [
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": "Summary", "encrypted_content": "opaque"}],
-                    }
-                ]
-            },
-        ),
-        (CallTypes.aresponses, {"input": [{"type": "compaction", "content": "Summary", "signature": "opaque"}]}),
-        (CallTypes.aresponses, {"input": [{"type": "mcp_call", "content": "Summary"}]}),
-        (CallTypes.aresponses, {"input": [{"type": "future_history", "content": "Summary"}]}),
-        (
-            CallTypes.aanthropic_messages,
-            {"messages": _messages(), "system": [{"type": "future_history", "content": "Summary"}]},
-        ),
-    ),
-)
-async def test_claude_checks_original_history_before_lossy_protocol_translation(
-    call_type: CallTypes, payload: Mapping[str, object]
-) -> None:
-    counter: Final = AsyncMock(return_value=1)
-    hook: Final = RequestAdmission(claude_counter=counter)
-    before: Final = copy.deepcopy(payload)
-    with pytest.raises(RequestAdmissionError, match="无法可靠核验"):
-        await hook.async_pre_call_deployment_hook({"model": _OPUS, **payload}, call_type)
-    counter.assert_not_awaited()
-    assert payload == before
 
 
 @pytest.mark.asyncio
@@ -1676,35 +1687,34 @@ async def test_filter_local_failure_is_terminal_only_for_claude_candidates(compo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("call_type", (CallTypes.acompletion, CallTypes.aanthropic_messages, CallTypes.aresponses))
+@pytest.mark.parametrize("call_type", (CallTypes.acompletion, CallTypes.aanthropic_messages))
 @pytest.mark.parametrize(
     "overrides",
-    (
-        {"extra_body": []},
-        {"extra_body": "private-validation-marker"},
-        {"extra_body": {1: "private-validation-marker"}},
-        {"messages": [{"role": "user", "content": ["private-validation-marker"]}]},
-    ),
+    ({"extra_body": []}, {"extra_body": "private-validation-marker"}, {"tools": "private-validation-marker"}),
 )
-async def test_claude_local_validation_errors_use_terminal_boundary(
-    call_type: CallTypes, overrides: Mapping[str, object]
+async def test_claude_request_parsing_errors_use_terminal_boundary(
+    monkeypatch: pytest.MonkeyPatch, call_type: CallTypes, overrides: Mapping[str, object]
 ) -> None:
-    counter: Final = AsyncMock(return_value=1)
+    transport: Final = CountTransport({"input_tokens": 1})
+    client: Final = _install_count_transport(monkeypatch, transport)
     data: Final = {
         "model": _OPUS,
         "messages": _messages(),
-        "input": "Hello",
+        "max_tokens": 10,
+        "api_key": "test-key",
         "model_info": {"max_input_tokens": 100},
         **overrides,
     }
     before: Final = copy.deepcopy(data)
-    with pytest.raises(RequestAdmissionError) as caught:
-        await RequestAdmission(claude_counter=counter).async_pre_call_deployment_hook(data, call_type)
-    assert caught.value.status_code == 400
-    assert caught.value.body == {"type": "invalid_request_error", "code": "request_admission_rejected"}
-    assert "private-validation-marker" not in str(caught.value)
-    assert data == before
-    counter.assert_not_awaited()
+    try:
+        with pytest.raises(RequestAdmissionError) as caught:
+            await RequestAdmission().async_pre_call_deployment_hook(data, call_type)
+        assert caught.value.status_code == 400
+        assert "private-validation-marker" not in str(caught.value)
+        assert data == before
+        assert transport.requests == ()
+    finally:
+        await client.client.aclose()
 
 
 @pytest.mark.asyncio
@@ -1732,194 +1742,73 @@ async def test_claude_existing_terminal_rejection_is_preserved_by_boundary() -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ("request", "ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL", "credential"))
-@pytest.mark.parametrize("verified", (False, True))
-async def test_claude_preflight_verifies_resolved_base_before_auth_or_count(
-    monkeypatch: pytest.MonkeyPatch, source: str, verified: bool
+@pytest.mark.parametrize("limit_source", ("deployment", "catalog"))
+@pytest.mark.parametrize(
+    ("configured_limit", "input_tokens", "allowed"),
+    (
+        pytest.param(1000000, 899914, True, id="original-899914-remains-allowed"),
+        (1000000, 949999, True),
+        (1000000, 950000, False),
+        (1000000, 950001, False),
+        (200000, 199999, True),
+        (200000, 200000, False),
+    ),
+)
+async def test_claude_provider_count_respects_950000_ceiling_and_smaller_limits(
+    monkeypatch: pytest.MonkeyPatch, limit_source: str, configured_limit: int, input_tokens: int, allowed: bool
 ) -> None:
-    base: Final = "https://named.invalid/v1/messages" if verified else "https://unverified.invalid/private-route"
-    if source in ("ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL"):
-        monkeypatch.delenv("ANTHROPIC_API_BASE", raising=False)
-        monkeypatch.setenv(source, base)
-    if source == "credential":
-        monkeypatch.setattr(
-            litellm,
-            "credential_list",
-            [
-                CredentialItem(
-                    credential_name="base-verification-fixture",
-                    credential_info={},
-                    credential_values={"api_base": base, "api_key": "private-auth-marker"},
-                )
-            ],
-        )
-    transport: Final = CountTransport({"input_tokens": 1})
-    client: Final = _install_count_transport(monkeypatch, transport)
-    data: Final[Mapping[str, object]] = {
-        "model": _OPUS,
-        "messages": _messages(),
-        "max_tokens": 10,
-        "api_key": "private-auth-marker",
-        "model_info": {
-            "max_input_tokens": 100,
-            "CLAUDE_PREFLIGHT_VERIFIED_BASES": [base],
-            "claude_preflight_verified_bases": [base],
+    model: Final = "claude-opus-ceiling-fixture"
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {
+            model: {
+                "max_input_tokens": configured_limit,
+                "max_output_tokens": 8192,
+                "litellm_provider": "anthropic",
+                "mode": "chat",
+            }
         },
-        "CLAUDE_PREFLIGHT_VERIFIED_BASES": [base],
-        "claude_preflight_verified_bases": [base],
-        **({"api_base": base} if source == "request" else {}),
-        **({"litellm_credential_name": "base-verification-fixture"} if source == "credential" else {}),
+    )
+    deployment: Final = {
+        **_claude_deployment(model=model),
+        "model_info": {
+            "id": "claude-fixture",
+            **({"max_input_tokens": configured_limit} if limit_source == "deployment" else {}),
+        },
     }
+    transport: Final = CountTransport({"input_tokens": input_tokens}, allow_inference=True)
+    client: Final = _install_count_transport(monkeypatch, transport)
+    monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
+    router: Final = litellm.Router(model_list=[deployment], num_retries=0)
     try:
-        if verified:
-            await RequestAdmission().async_pre_call_deployment_hook(dict(data), CallTypes.aanthropic_messages)
-            assert tuple(str(request.url) for request in transport.requests) == (
-                "https://named.invalid/v1/messages/count_tokens",
+        if allowed:
+            await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由
+                model="claude-fixture", messages=_messages(), max_tokens=10
             )
         else:
-            with pytest.raises(RequestAdmissionError, match="预检验收") as caught:
-                await RequestAdmission().async_pre_call_deployment_hook(dict(data), CallTypes.aanthropic_messages)
-            assert transport.requests == ()
-            assert "unverified.invalid" not in str(caught.value)
-            assert "private-route" not in str(caught.value)
-            assert "private-auth-marker" not in str(caught.value)
-    finally:
-        await client.client.aclose()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("configured_suffix", ("", "/v1", "/v1/messages"))
-@pytest.mark.parametrize("requested_suffix", ("", "/v1", "/v1/messages"))
-async def test_claude_verified_bases_share_count_endpoint_normalization(
-    monkeypatch: pytest.MonkeyPatch, configured_suffix: str, requested_suffix: str
-) -> None:
-    monkeypatch.setenv("CLAUDE_PREFLIGHT_VERIFIED_BASES", json.dumps([f"https://counter.invalid{configured_suffix}"]))
-    monkeypatch.setenv("ANTHROPIC_API_BASE", "https://unverified.invalid")
-    transport: Final = CountTransport({"input_tokens": 1})
-    client: Final = _install_count_transport(monkeypatch, transport)
-    try:
-        await RequestAdmission().async_pre_call_deployment_hook(
-            {
-                "model": _OPUS,
-                "messages": _messages(),
-                "max_tokens": 10,
-                "api_key": "test-key",
-                "api_base": f"https://counter.invalid{requested_suffix}",
-            },
-            CallTypes.aanthropic_messages,
-        )
-        assert tuple(str(request.url) for request in transport.requests) == (
-            "https://counter.invalid/v1/messages/count_tokens",
+            with pytest.raises(litellm.ContextWindowExceededError, match=str(min(configured_limit, 950000))) as caught:
+                await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由
+                    model="claude-fixture", messages=_messages(), max_tokens=10
+                )
+            assert isinstance(caught.value, RequestAdmissionError)
+        assert tuple(request.url.path for request in transport.requests) == (
+            ("/v1/messages/count_tokens", "/v1/messages") if allowed else ("/v1/messages/count_tokens",)
         )
     finally:
+        router.reset()
         await client.client.aclose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("official", (False, True))
-async def test_claude_default_verification_allows_only_official_base(
-    monkeypatch: pytest.MonkeyPatch, official: bool
-) -> None:
-    monkeypatch.delenv("CLAUDE_PREFLIGHT_VERIFIED_BASES")
-    monkeypatch.delenv("ANTHROPIC_API_BASE")
-    transport: Final = CountTransport({"input_tokens": 1})
-    client: Final = _install_count_transport(monkeypatch, transport)
-    data: Final[Mapping[str, object]] = {
-        "model": _OPUS,
-        "messages": _messages(),
-        "max_tokens": 10,
-        "api_key": "test-key",
-        **({} if official else {"api_base": "https://counter.invalid"}),
-    }
-    try:
-        if official:
-            await RequestAdmission().async_pre_call_deployment_hook(dict(data), CallTypes.aanthropic_messages)
-            assert tuple(request.url.host for request in transport.requests) == ("api.anthropic.com",)
-        else:
-            with pytest.raises(RequestAdmissionError, match="预检验收"):
-                await RequestAdmission().async_pre_call_deployment_hook(dict(data), CallTypes.aanthropic_messages)
-            assert transport.requests == ()
-    finally:
-        await client.client.aclose()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "configured",
-    (
-        "",
-        "[]",
-        "null",
-        "{}",
-        '"https://counter.invalid"',
-        "[1]",
-        '[""]',
-        '["https://counter.invalid", "not-a-url"]',
-        '["https://private-config-marker@counter.invalid"]',
-        '["https://counter.invalid?key=private-config-marker"]',
-        '["https://counter.invalid#private-config-marker"]',
-        '["https://counter.invalid:70000"]',
-        '[" https://counter.invalid"]',
-    ),
-)
-async def test_claude_invalid_verification_configuration_fails_closed(
-    monkeypatch: pytest.MonkeyPatch, configured: str
-) -> None:
-    monkeypatch.setenv("CLAUDE_PREFLIGHT_VERIFIED_BASES", configured)
-    transport: Final = CountTransport({"input_tokens": 1})
-    client: Final = _install_count_transport(monkeypatch, transport)
-    try:
-        with pytest.raises(RequestAdmissionError, match="白名单配置") as caught:
-            await RequestAdmission().async_pre_call_deployment_hook(
-                {"model": _OPUS, "messages": _messages(), "api_key": "private-auth-marker"},
-                CallTypes.aanthropic_messages,
-            )
-        assert transport.requests == ()
-        assert "counter.invalid" not in str(caught.value)
-        assert "private-config-marker" not in str(caught.value)
-        assert "private-auth-marker" not in str(caught.value)
-    finally:
-        await client.client.aclose()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("choice", ("any", "tool"))
-@pytest.mark.parametrize(
-    ("options", "rejected"),
-    (
-        ({"thinking": {"type": "enabled", "budget_tokens": 1024}}, True),
-        ({"thinking": {"type": "adaptive"}}, True),
-        ({"output_config": {"effort": "high"}}, True),
-        ({"thinking": {"type": "disabled"}, "output_config": {"effort": "high"}}, True),
-        ({"thinking": {"type": "disabled"}}, False),
-        ({}, False),
-    ),
-)
-async def test_claude_forced_tool_choice_rejects_active_reasoning_before_count(
-    monkeypatch: pytest.MonkeyPatch, choice: str, options: Mapping[str, object], rejected: bool
-) -> None:
-    transport: Final = CountTransport({"input_tokens": 1})
-    client: Final = _install_count_transport(monkeypatch, transport)
-    data: Final = {
-        "model": _OPUS,
-        "messages": _messages(),
-        "api_key": "test-key",
-        "max_tokens": 4096,
-        "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
-        "tool_choice": {"type": choice, **({"name": "lookup"} if choice == "tool" else {})},
-        **options,
-    }
-    before: Final = copy.deepcopy(data)
-    try:
-        if rejected:
-            with pytest.raises(RequestAdmissionError, match="强制工具调用"):
-                await RequestAdmission().async_pre_call_deployment_hook(data, CallTypes.aanthropic_messages)
-            assert transport.requests == ()
-        else:
-            await RequestAdmission().async_pre_call_deployment_hook(data, CallTypes.aanthropic_messages)
-            assert len(transport.requests) == 1
-            counted: Final = TypeAdapter(dict[str, object]).validate_json(transport.requests[0].content)
-            assert counted["tool_choice"] == data["tool_choice"]
-        assert data == before
-    finally:
-        await client.client.aclose()
+async def test_non_claude_context_limit_can_still_exceed_950000() -> None:
+    messages: Final = _messages("token " * 950000)
+    count: Final = litellm.token_counter(  # pyright: ignore[reportUnknownMemberType]  # 上游计数器仍有未注解参数
+        model=_MODEL, messages=messages
+    )
+    assert count > 950000
+    deployment: Final = _deployment(count + 1)
+    assert await RequestAdmission().async_filter_deployments("fixture", [deployment], messages) == [deployment]
+    with pytest.raises(litellm.ContextWindowExceededError) as caught:
+        await RequestAdmission().async_filter_deployments("fixture", [_deployment(count)], messages)
+    assert not isinstance(caught.value, RequestAdmissionError)
