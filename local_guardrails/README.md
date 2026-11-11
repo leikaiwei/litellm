@@ -10,6 +10,50 @@
 .venv/bin/python -m pytest local_guardrails/ -q
 ```
 
+## parameter_compatibility 参数兼容预拦截
+
+独立外部插件，不修改 LiteLLM 核心。针对已确认计数链路不兼容的模型组，在代理 pre_call
+阶段拒绝 `thinking.display=updates`，返回 HTTP 400，参数名为 `thinking.display`。
+此时尚未进入 Router，也没有调用上游计数或生成，因此不触发重试或降级。普通和流式生成
+采用同一入口检查，覆盖顶层参数以及 Chat 等接口的 `extra_body.thinking`
+
+这是一条明确配置的渠道限制，不表示 Anthropic 全局不支持 `updates`。只匹配
+`blocked_models` 中的客户端模型组名称，不按 Claude 前缀扩大范围。入口若使用别名，也需
+列出实际进入 pre_call 的别名。当前示例只列出 2026-11-11 已确认受影响的 Sonnet 组。
+同组请求即使存在可接受该参数的其他渠道也会拒绝，这是保证路由前零上游调用的取舍。
+其他模型组、`summarized`、`omitted` 和不携带该字段的请求保持不变
+
+`drop_params=false` 仅控制 LiteLLM 已识别的不支持参数是否抛错，不能检测 CPA 内部计数
+兼容性。插件不依赖 `drop_params`，即使为 true 或显式要求删除参数，命中本规则仍直接拒绝，
+不静默改写后发送。功能依据见 [LiteLLM 官方参数说明](https://docs.litellm.ai/docs/completion/drop_params)，
+核验日期 2026-11-11。本插件不拦截客户端直接调用的独立 token-count 端点，不处理上游返回后的错误
+
+将 `parameter_compatibility.py` 放在代理配置同目录，或作为单文件挂载到
+`/app/parameter_compatibility.py`，在原有 `guardrails` 列表中添加，并放在可能调用外部服务的
+pre_call guardrail 之前。不应为目标 Key 设置跳过此 guardrail 的权限
+
+```yaml
+guardrails:
+  - guardrail_name: parameter-compatibility
+    litellm_params:
+      guardrail: parameter_compatibility.ParameterCompatibilityGuardrail
+      mode: pre_call
+      default_on: true
+      blocked_models:
+        - claude-sonnet-5-5
+```
+
+只需新增插件文件和配置，不需要构建核心镜像。新挂载文件需重建代理容器加载；若运行环境
+已可访问插件文件，按现有加载方式重启即可。删除这一配置项即可停用，其他插件不变。
+当前仅实现并验证插件，以上配置尚未应用到生产
+
+验证使用禁网测试与进程内 HTTP 请求，经过真实 `ProxyLogging.pre_call_hook`，断言命中时
+HTTP 400 且后续计数/路由步骤未调用，同时验证未命中请求继续执行。运行命令如下
+
+```bash
+LITELLM_LOCAL_MODEL_COST_MAP=True .venv/bin/python -m pytest local_guardrails/test_parameter_compatibility.py -q
+```
+
 ## local_content_policy — 中文内容策略
 
 这两个 guardrail 都是纯本地 `pre_call` 检测，不调用 LLM 或外部 API：
