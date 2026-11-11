@@ -2,7 +2,7 @@
 
 Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础上打了以下补丁：
 
-2026-11-12 正在同步上游稳定版 [v1.109.0](https://github.com/BerriAI/litellm/releases/tag/v1.109.0)。生产核验仍为 `v1.108.0-fork.patch.5`，外部准入插件仍是该次发布版本，下面的本地升级改动尚未部署
+2026-11-12 已同步上游稳定版 [v1.109.0](https://github.com/BerriAI/litellm/releases/tag/v1.109.0)，发布源码为 `4972faa706f`，[v1.109.0-fork 镜像构建](https://github.com/leikaiwei/litellm/actions/runs/43062709338)成功。生产核验仍为 `v1.108.0-fork.patch.5`，外部准入插件仍是该次发布版本，本次升级尚未部署
 
 Claude 预检查命中输入上限时抛出 `ContextWindowExceededError`，不发送该部署的生成请求，保留既有 fallback。当前生产 `num_retries=0`，全局及模型组重试策略均未设置，因此不会在该模型上重复尝试。若以后显式设置 `BadRequestErrorRetries` 等策略，上游允许它覆盖默认的不重试行为，不能把本插件描述成无条件禁止重试
 
@@ -50,7 +50,7 @@ Claude 预检查命中输入上限时抛出 `ContextWindowExceededError`，不�
 
 **2026-11-09 已部署补丁，Claude 上游计数与加密历史兼容**
 
-2026-11-10 外部插件候选修复让准入计数使用实际生成的出站身份与功能头，避免计数独自透传原始 Claude Code 身份而生成仍使用 LiteLLM 身份。默认 User-Agent 继续由共享 HTTP 客户端提供，显式 headers、extra_headers 与供应商专属身份头保持一致。该修改尚未部署，需配套 CPA 计数与生成输入转换修复后完成真实验收，不需要重建 LiteLLM 核心镜像。下面的客户端身份透传行为记录 patch.5 发布时状态
+2026-11-10 外部插件候选修复让准入计数使用实际生成的出站身份与功能头，避免计数独自透传原始 Claude Code 身份而生成仍使用 LiteLLM 身份。默认 User-Agent 继续由共享 HTTP 客户端提供，显式 headers、extra_headers 与供应商专属身份头保持一致。该修改尚未部署，当时无需重建核心镜像。若要求消除 CPA 输入转换差异，需要配套修复并完成真实验收。2026-11-11 后续决定接受部分漏拦，沿用本文开头说明的边界。下面的客户端身份透传行为记录 patch.5 发布时状态
 
 Opus、Sonnet、Haiku 按实际部署调用现有 Anthropic `count_tokens` 处理器，使用该部署的凭据和输入上限，计数失败不退回本地估算。原生 Messages 与缓存预测共用请求转换，Chat 复用生成路径的参数转换，包含 `additional_drop_params` 和输出预算对 thinking 的影响。保留真实客户端 User-Agent、X-App 和功能 beta，只发送一个 Content-Type，不转发客户端鉴权头，也不伪造客户端身份。无需修改 CPA，现有路由与 fallback 保持原配置
 
@@ -177,6 +177,8 @@ Anthropic 模块按上游移动到 `messages/native` 和 `messages/adapters`，�
 同步时复现了上游适配器对深层工具 schema 的输入污染，JSON 深拷贝失败后，附加工具参数会写回调用方的原 schema。仅将原地更新改为新字典合并，上游原有行为测试由失败变为通过，不调整测试断言或递归限制
 
 108.0 到 109.0 新增 5 份数据库迁移，旧迁移未改，没有 SpendLogs DDL 或数据重写。两个并发索引涉及的既有表在上线前只读核验中均无数据，另有配置 revision trigger、账本和订阅账户新表。仍由启动时正常迁移，不绕过迁移检查
+
+发布镜像固定为 `leikaiwei/litellm@sha256:d533be118fdf405b127ced8c87e3bbe76e57f9c37849a3588a94a90dc63f2ef2`，最终源码的 `make check BASE_REF=v1.109.0` 及相关回归通过。正式镜像的 25 个补丁模块和准入插件哈希与发布源码一致，Pillow、参数删除、结构化输出和加密历史检查通过。禁网容器内使用模拟上游，经实际 HTTP 入口验证三系列正常请求、超限拒绝、计数失败拒绝及跨模型 fallback。默认重试次数设为 3 时，两种拒绝均只计数一次，没有 Claude 生成请求。尚未进行本次生产切换或真实供应商验收
 
 已移除的补丁（保留记录，便于回溯）：
 
