@@ -19,14 +19,15 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from thinking_switch import ThinkingSwitchGuardrail
+
 from litellm.caching.dual_cache import DualCache
-from litellm.llms.anthropic.pass_through.messages.transformation import (
+from litellm.llms.anthropic.messages.native.transformation import (
     AnthropicMessagesConfig,
 )
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import CallTypes
-from thinking_switch import ThinkingSwitchGuardrail
 
 GUARDRAIL_NAME = "thinking-switch"
 

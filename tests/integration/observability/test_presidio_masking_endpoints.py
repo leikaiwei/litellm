@@ -11,7 +11,6 @@ from typing import Final
 import pytest
 import yaml
 from integration._support.client import Gateway, eventually, gateway_from_environment, list_value, object_value
-from integration._support.database import read_rows
 from integration._support.process import owned_proxy_process
 from integration._support.wire import Reply, Request, Wire, wire_server
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
@@ -480,7 +479,7 @@ def _ask(rig: Rig, model: str, surface: Surface, guardrail: str, prompt: str) ->
 
 def _spend_row(rig: Rig, model: str) -> dict[str, JsonValue]:
     rows: Final = eventually(
-        lambda: read_rows('SELECT response, metadata FROM "LiteLLM_SpendLogs" WHERE model_group = %s', (model,)),
+        lambda: rig.gateway.rows('SELECT response, metadata FROM "LiteLLM_SpendLogs" WHERE model_group = %s', (model,)),
         lambda found: len(found) == 1,
         seconds=70,
     )

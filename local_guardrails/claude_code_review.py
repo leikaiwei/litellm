@@ -8,9 +8,9 @@ from litellm import ModelResponse
 from litellm._logging import verbose_proxy_logger
 from litellm.caching.dual_cache import DualCache
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.llms.anthropic.pass_through.caller_model_checks import CallerModelVerdict, caller_model_verdict
-from litellm.llms.anthropic.pass_through.safeguards import requested_dangerous_tool_use
-from litellm.llms.anthropic.pass_through.utils import proxy_general_settings
+from litellm.llms.anthropic.messages.caller_model_checks import CallerModelVerdict, caller_model_verdict
+from litellm.llms.anthropic.messages.safeguards import requested_dangerous_tool_use
+from litellm.llms.anthropic.messages.utils import proxy_general_settings
 from litellm.llms.custom_llm import CustomLLM
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.utils import CallTypesLiteral, GenericStreamingChunk

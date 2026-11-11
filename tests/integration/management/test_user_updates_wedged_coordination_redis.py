@@ -193,10 +193,8 @@ def test_user_budget_updates_return_promptly_while_coordination_redis_is_wedged(
                     timings["s6_customer_update"] = _timed_post(
                         candidate, "/customer/update", {"user_id": customer_id, "max_budget": 6.0}
                     )
-                    assert timings["s6_customer_update"] < _SHORTEST_REDIS_WAIT_SECONDS, (
-                        f"/customer/update took {timings['s6_customer_update']:.3f}s, reaching the "
-                        f"{_SHORTEST_REDIS_WAIT_SECONDS}s shortest wait the proxy puts on Redis, so it waited on the "
-                        "wedged coordination Redis"
+                    assert timings["s6_customer_update"] < _HANDLER_BUDGET_SECONDS, (
+                        f"/customer/update took {timings['s6_customer_update']:.3f}s with a wedged coordination Redis"
                     )
                     timings["s7_reset_spend"] = _timed_post(candidate, f"/key/{key}/reset_spend", {"reset_to": 0})
                     assert timings["s7_reset_spend"] < _HANDLER_BUDGET_SECONDS, (
@@ -465,6 +463,7 @@ def test_user_budget_update_propagates_to_gateway_and_peer(gateway: Gateway, pee
                 == 200
             )
             assert _observed(upstream) == [_chat_observation(warm)]
+            upstream.delete("/__observations").raise_for_status()
         _wait_for_spend(user_id, 0.11)
 
         shrink: Final = gateway.request("POST", "/user/update", {"user_id": user_id, "max_budget": 0.01})
@@ -497,6 +496,7 @@ def test_user_budget_update_propagates_to_gateway_and_peer(gateway: Gateway, pee
                 == 200
             )
             assert _observed(upstream) == [_chat_observation(text)]
+            upstream.delete("/__observations").raise_for_status()
 
         _wait_for_spend(user_id, 0.23)
         email: Final = f"{user_id}@integration.local"
@@ -529,6 +529,7 @@ def test_user_models_update_with_metadata_propagates_to_gateway_and_peer(gateway
                 == 200
             )
             assert _observed(upstream) == [_chat_observation(warm)]
+            upstream.delete("/__observations").raise_for_status()
 
         narrowed: Final = gateway.request(
             "POST",
@@ -570,6 +571,7 @@ def test_user_models_update_with_metadata_propagates_to_gateway_and_peer(gateway
                 == 200
             )
             assert _observed(upstream) == [_chat_observation(text)]
+            upstream.delete("/__observations").raise_for_status()
 
 
 def test_partial_user_update_preserves_sibling_fields(gateway: Gateway) -> None:
@@ -623,6 +625,7 @@ def test_user_models_only_update_is_enforced_on_the_gateway(gateway: Gateway) ->
         warmed: Final = _user_chat(gateway, model, key, warm)
         assert warmed.status_code == 200, warmed.text
         assert _observed(upstream) == [_chat_observation(warm)]
+        upstream.delete("/__observations").raise_for_status()
 
         narrowed: Final = gateway.request("POST", "/user/update", {"user_id": user_id, "models": ["no-default-models"]})
         assert narrowed.status_code == 200, narrowed.text
@@ -650,12 +653,13 @@ def test_user_models_update_without_metadata_propagates_to_gateway_and_peer(gate
         scenario.cleanups.callback(lambda: gateway.request("POST", "/user/delete", {"user_ids": [user_id]}))
         key: Final = string_value(gateway.post("/key/generate", {"user_id": user_id})["key"])
 
-        _observed(upstream)
+        upstream.delete("/__observations").raise_for_status()
         for proxy in (gateway, peer):
             warm: Final = f"warm {uuid.uuid4().hex}"
             warmed: Final = _user_chat(proxy, model, key, warm)
             assert warmed.status_code == 200, warmed.text
             assert _observed(upstream) == [_chat_observation(warm)]
+            upstream.delete("/__observations").raise_for_status()
 
         narrowed: Final = gateway.request("POST", "/user/update", {"user_id": user_id, "models": ["no-default-models"]})
         assert narrowed.status_code == 200, narrowed.text

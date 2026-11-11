@@ -693,6 +693,13 @@ chunk 的用量提上来（`utils.py:2143`），有它就说明字节已经出�
 
 ## request_admission 请求上下文准入
 
+1.109 升级适配沿用外部插件和发送前检查，改用上游 `messages/native` 公共路径及
+`finalize_messages_headers`。计数与缓存预测共用原生请求转换，在转换正文前推导功能头，
+并复用部署的 reasoning effort 映射，避免功能字段在计数时被误删。空 `context_management`
+沿用上游计数规范化，Responses 压缩历史使用上游共享的编码与转换。超限及计数失败在普通
+重试配置下直接报错或进入已有 fallback；显式 `BadRequestErrorRetries` 或 `DefaultRetries`
+仍遵循上游优先级，可以覆盖这一行为
+
 `request_admission.py` 使用现有 `CustomLogger` 扩展点，不修改 Router 源码。它在异步候选部署
 筛选时检查输入长度，并在选定部署、向上游发送之前再次检查，覆盖直接指定 deployment ID 和
 fallback。注册后对 Chat Completions、Anthropic Messages 和 Responses 生效，不依赖客户端
@@ -774,8 +781,10 @@ metadata、litellm_metadata 或 proxy_server_request 单独取 User-Agent、X-Ap
 原始客户端鉴权、Cookie 与无关头不会因此转发。生成请求保持原有行为，无需修改核心镜像
 
 此次发现 CPA 的计数与生成输入转换不一致会漏计历史 thinking，仅改计数身份不能修复旧 CPA。
-必须配套 CPA 的输入转换修复并完成完整历史请求验收后再部署。原生 Claude Code 的独立计数
-语义应保持不变，不能靠给所有计数请求伪造原生身份或统一增加固定 token 余量掩盖差异。
+若要求消除此类转换差异，需要配套 CPA 的输入转换修复并完成完整历史请求验收。
+2026-11-11 后续运营决策保留 CPA 现有改写，只优化 LiteLLM，并接受部分超长输入漏过预检。
+候选上限 950,000 尚未上线，原有更小上限保留，不能将这项余量描述成完整解决漏计。
+原生 Claude Code 的独立计数语义应保持不变，不能靠伪造原生身份或固定倍率宣称精确计数。
 下文客户端身份透传描述属于 2026-11-09 已部署版本的历史记录
 
 2026-11-09 晚间 review 补充两项修复，Chat 计数改用生成路径的参数转换，遵守
@@ -1032,7 +1041,7 @@ curl -sS "$LITELLM_BASE_URL/config/field/update" \
 ### 验证
 
 ```bash
-LITELLM_LOCAL_MODEL_COST_MAP=True .venv/bin/python -m pytest local_guardrails/test_claude_code_review.py tests/unit/llms/anthropic/pass_through/test_safeguards.py -q
+LITELLM_LOCAL_MODEL_COST_MAP=True .venv/bin/python -m pytest local_guardrails/test_claude_code_review.py tests/unit/llms/anthropic/messages/test_safeguards.py -q
 ```
 
 回归覆盖已知独立审核模板、普通请求和未知模板、内部组隔离、权限预算拒绝、请求路由覆盖、

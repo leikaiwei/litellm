@@ -18,6 +18,8 @@ from integration._support.process import graceful_stop_seconds, owned_proxy
 from integration._support.wire import Reply, Request, wire_server
 from pydantic import JsonValue
 
+pytestmark: Final = pytest.mark.shares_worker_state
+
 _ROW: Final = "anthropic.claude-audit-reload-v1:0"
 _GEO: Final = f"au.{_ROW}"
 _FINETUNE: Final = "ft:gpt-audit-reload-2025-01-01"
@@ -282,7 +284,7 @@ def _charged_as_listed(proxy: Gateway, deployment: _Deployment, scale: float) ->
     assert _listed_rates(proxy, deployment.name) == _expected_listing(rates), deployment.name
     request_id, charged = _billed(proxy.client, proxy.key, deployment)
     expected: Final = _expected_cost(rates, deployment.usage)
-    assert charged == (None if rates is None else pytest.approx(expected, rel=1e-6)), deployment.name
+    assert charged == pytest.approx(expected, rel=1e-6), deployment.name
     return _Charge(request_id=request_id, expected=expected)
 
 

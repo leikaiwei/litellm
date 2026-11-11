@@ -2,6 +2,12 @@
 
 Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础上打了以下补丁：
 
+2026-11-12 正在同步上游稳定版 [v1.109.0](https://github.com/BerriAI/litellm/releases/tag/v1.109.0)。生产核验仍为 `v1.108.0-fork.patch.5`，外部准入插件仍是该次发布版本，下面的本地升级改动尚未部署
+
+Claude 预检查命中输入上限时抛出 `ContextWindowExceededError`，不发送该部署的生成请求，保留既有 fallback。当前生产 `num_retries=0`，全局及模型组重试策略均未设置，因此不会在该模型上重复尝试。若以后显式设置 `BadRequestErrorRetries` 等策略，上游允许它覆盖默认的不重试行为，不能把本插件描述成无条件禁止重试
+
+预检查仍可能低估 CPA 改写后的完整输入。2026-11-11 已决定保留 CPA 的现有改写，并接受部分超长输入漏过预检查的边界，候选的 950,000 上限尚未上线。它只提供余量，不保证所有百万 token 超限都在生成前被识别。身份头对齐代码与生产挂载文件仍有差异，本次发布需明确使用的插件和限额，不能把本地测试通过当作线上已经修复
+
 2026-11-06 发布范围调整，撤回 `27e276c5112` 和 `0d923ebc042` 的请求准入及错误路径补丁，保留 1.108.0 升级和此前旧补丁。`v1.108.0-fork.patch.1` 已含准入修改，`v1.108.0-fork.patch.2` 进一步包含错误路径修改，两者均不作为本次上线候选，也不移动既有标签
 
 不含这批修改的已发布镜像是 `leikaiwei/litellm:v1.108.0-fork`，发布 digest 为 `sha256:a677652db2903c8b637121e87b04a01721e236df9969e033865aba858bc0490a`。其核心运行逻辑与撤回后的版本一致，源码仅保留 Responses schema 参数的类型声明，并说明重试处理多种供应商异常所需的 BLE001 豁免，均不改变运行行为。外部 Claude Code 审核改动另存于 `f72874dd9cd`，不随该镜像启用。此段记录当时的源码回退与候选镜像，当前部署见下文
@@ -83,7 +89,8 @@ Responses 正常的加密 reasoning、compaction 历史改为保留并交给上�
 - 支持 Claude Code -> LiteLLM -> OpenRouter(OpenAI 系列模型) 链路正常调用
 
 **Docker 自动发布** — `docker_release_auto.yml`
-- tag/release 时自动构建多架构镜像推送 DockerHub 和 GHCR
+- release 或手动发布时，只构建生产服务器使用的 `linux/amd64` 镜像，推送 DockerHub 和 GHCR
+- 保留一次构建，不恢复 ARM64、重复扫描构建或未使用的发布链路
 
 **流式 tokens 统计修复** — `litellm_core_utils/streaming_handler.py`
 - 症状：OpenAI 兼容后端流式调用时 tokens 严重偏低。实测同一 prompt 真实 87/18，客户端与日志只记 15/2；不带 `include_usage` 的那条路径更是直接记 0
@@ -162,6 +169,12 @@ Responses 正常的加密 reasoning、compaction 历史改为保留并交给上�
 1.105.1 验证记录（2026-10-15）：补丁所在 18 个测试文件与两个 `local_` 目录共 1,703 项通过，扩大模块回归 9,384 passed、1 skipped。扩大回归用 UTC 运行，排除 macOS/Python MIME 映射缺少 `text/markdown` 的一条上游用例，以及上游 Realtime 测试文件：后者的旧 mock 未适配新的异步日志 dispatcher，原样运行有 24 项在日志 flush 超时，仅在测试进程内补齐 mock 后整文件 122 项通过，源码与测试文件均未改动。`make lint` 全部通过，未修改预算文件。`make check` 的 API-types 同步仍有上游基线漂移，纯 v1.105.1 在同一环境也生成完全相同的 1,097 行新增内容，保留上游生成文件。临时本地 proxy 调真实 DeepSeek V4 的七条 curl 请求全部 200，覆盖 chat/messages、原生/适配层、流式/非流式及 custom tool schema；流式包含结束事件与 token 用量。wheel 构建通过并核对包内补丁源码及 Anthropic 新路径，生产部署另行执行
 
 1.104.0 同步核对结论：本轮没有补丁被上游新吸收，但查出一处早已冗余的（流式 tokens 统计在 `streaming_chunk_builder_utils.py` 里的那一半，见上），该文件交还上游，其余逐文件核对后全部保留。与上游有差异的文件 42 -> 41（不含 `local_` 目录）。上游这一版把 `tests/test_litellm` 的大部分测试搬到了 `tests/unit`，补丁测试跟着搬：多数由 git 按改名自动带过去，`test_caching_handler.py` 因上游同时大幅扩写而认不出改名，手工移植；fork 独有的两份根目录测试（`test_anthropic_messages_header_forwarding.py`、`test_model_cost_map_local_merge.py`）一并挪到 `tests/unit/`。`llms/deepseek/` 下两个文件上游本轮没有改动；`llms/openrouter/chat/transformation.py` 上游只换了 tokenizer 的类型标注。价格表与上游只差 `anthropic/deepseek-v4-pro` 这一条镜像，native 的 `deepseek/deepseek-v4-pro` 本轮没有调价，镜像仍未跟 `off_peak_pricing`（那是 DeepSeek 官方直连的计费规则）
+
+1.109.0 同步核对结论（2026-11-12），按稳定发布标签合并。工具数组缺少 `items`、压缩摘要、搜索结果、Anthropic tool choice 和内嵌 auto 图片计数已由上游覆盖，删除对应回移实现，只保留上游尚未支持的服务端工具与搜索错误结果兼容，`token_counter.py` 相对上游缩减为 6 行差异。其他仍未被上游修复的缓存、定价、流式用量、DeepSeek、guardrail 和预算时区补丁继续保留
+
+Anthropic 模块按上游移动到 `messages/native` 和 `messages/adapters`，准入复用新的公开功能头接口，在请求转换前推导功能头，保留真实出站身份与计数正文的一致性。共享计数参数继续覆盖 native 结构化输出和上下文管理，不重复实现上游已有的 Chat 计数转换。新版供应商 `usage.cost` 快捷计费也遵守 `always_use_local_pricing`，避免绕过本地单价
+
+108.0 到 109.0 新增 5 份数据库迁移，旧迁移未改，没有 SpendLogs DDL 或数据重写。两个并发索引涉及的既有表在上线前只读核验中均无数据，另有配置 revision trigger、账本和订阅账户新表。仍由启动时正常迁移，不绕过迁移检查
 
 已移除的补丁（保留记录，便于回溯）：
 
@@ -269,12 +282,56 @@ response = client.chat.completions.create(
 )
 ```
 
-[**Docs: LLM Providers**](https://docs.litellm.ai/docs/providers)
+</details>
+
+<details>
+<summary><b>Auto Routing</b> - Choose a model for each prompt (Python SDK + AI Gateway)</summary>
+
+### Python SDK
+
+[**Docs: Autorouter SDK**](https://docs.litellm.ai/docs/autorouter_sdk)
+
+Install with `uv add litellm` and set `OPENAI_API_KEY` for the models below.
+
+```python
+import asyncio
+from litellm import Router
+
+router = Router(model_list=[
+    {"model_name": "fast", "litellm_params": {"model": "openai/gpt-6-luna"}},
+    {"model_name": "capable", "litellm_params": {"model": "openai/gpt-6.1-sol"}},
+    {"model_name": "auto", "litellm_params": {
+        "model": "auto_router/complexity_router",
+        "complexity_router_config": {
+            "classifier_type": "heuristic",
+            "tiers": {"SIMPLE": "fast", "MEDIUM": "fast",
+                      "COMPLEX": "capable", "REASONING": "capable"},
+            "return_raw_model_name": True,
+        },
+        "complexity_router_default_model": "capable",
+    }},
+])
+response = asyncio.run(router.acompletion(
+    model="auto", messages=[{"role": "user", "content": "What is 2+2?"}],
+))
+print(response.model, response.choices[0].message.content)
+```
+
+### AI Gateway (Proxy Server)
+
+[**Create an Auto Router**](https://docs.litellm.ai/docs/auto_router/setup), then call its model name. Replace `auto` and the URL below with yours, and set `LITELLM_API_KEY` to your virtual key.
+
+```shell
+curl http://localhost:4000/v1/chat/completions \
+  -H "Authorization: Bearer $LITELLM_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"What is 2+2?"}]}'
+```
 
 </details>
 
 <details>
-<summary><b>Agents</b> - Invoke A2A Agents (Python SDK + AI Gateway)</summary>
+<summary><b>A2A</b> - Invoke A2A Agents (Python SDK + AI Gateway)</summary>
 
 [**Supported Providers**](https://docs.litellm.ai/docs/a2a#add-a2a-agents) - LangGraph, Vertex AI Agent Engine, Azure AI Foundry, Bedrock AgentCore, Pydantic AI
 
@@ -351,7 +408,7 @@ async with httpx.AsyncClient(headers=headers, timeout=60.0) as http_client:
 ```python
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from litellm import experimental_mcp_client
+from litellm import mcp_client
 import litellm
 
 server_params = StdioServerParameters(command="python", args=["mcp_server.py"])
@@ -361,7 +418,7 @@ async with stdio_client(server_params) as (read, write):
         await session.initialize()
 
         # Load MCP tools in OpenAI format
-        tools = await experimental_mcp_client.load_mcp_tools(session=session, format="openai")
+        tools = await mcp_client.load_mcp_tools(session=session, format="openai")
 
         # Use with any LiteLLM model
         response = await litellm.acompletion(
@@ -415,7 +472,7 @@ For MCP OAuth, an upstream may advertise dynamic client registration but refuse 
 </details>
 
 <details>
-<summary><b>Agents</b> - Run Claude Code, Codex, OpenCode or Deep Agents on any model (Python SDK)</summary>
+<summary><b>Agents</b> - Run Claude Code, Codex, OpenCode, pi or Deep Agents on any model (Python SDK)</summary>
 
 ### Python SDK - Agents
 
@@ -424,7 +481,7 @@ import litellm
 from litellm import Harness, sandbox
 
 result = litellm.agent(
-    Harness.CLAUDE_CODE,  # or Harness.CODEX, Harness.OPENCODE, Harness.DEEPAGENTS
+    Harness.CLAUDE_CODE,  # or Harness.CODEX, Harness.OPENCODE, Harness.PI, Harness.DEEPAGENTS
     "Find why tests/test_router.py is flaky and fix it.",
     sandbox=sandbox.local("./repo"),
     model="litellm_proxy/claude-sonnet-4-5",  # a model group on your AI Gateway
@@ -433,7 +490,7 @@ result = litellm.agent(
 print(result.text, result.cost, [f.path for f in result.files])
 ```
 
-Set `LITELLM_PROXY_API_BASE` and `LITELLM_PROXY_API_KEY` and every model call the agent makes goes through your AI Gateway, tagged `harness,claude_code`. Drop the `litellm_proxy/` prefix to call a provider directly. Install `starlette uvicorn` plus the agent's CLI (`claude`, `codex` or `opencode`), or `deepagents langchain-litellm` for Deep Agents.
+Set `LITELLM_PROXY_API_BASE` and `LITELLM_PROXY_API_KEY` and every model call the agent makes goes through your AI Gateway, tagged `harness,claude_code`. Drop the `litellm_proxy/` prefix to call a provider directly. Install `starlette uvicorn` plus the agent's CLI (`claude`, `codex`, `opencode` or `pi`), or `deepagents langchain-litellm` for Deep Agents.
 
 [**Docs: Agent Harnesses**](https://docs.litellm.ai/docs/harness)
 
@@ -463,6 +520,7 @@ Set `LITELLM_PROXY_API_BASE` and `LITELLM_PROXY_API_KEY` and every model call th
 | [Bytez (`bytez`)](https://docs.litellm.ai/docs/providers/bytez) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Cerebras (`cerebras`)](https://docs.litellm.ai/docs/providers/cerebras) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Clarifai (`clarifai`)](https://docs.litellm.ai/docs/providers/clarifai) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
+| [CLF AI Gateway (`clf_ai_gateway`)](https://docs.litellm.ai/docs/providers/clf_ai_gateway) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Cloudflare AI Workers (`cloudflare`)](https://docs.litellm.ai/docs/providers/cloudflare_workers) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Codestral (`codestral`)](https://docs.litellm.ai/docs/providers/codestral) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Cognition (`cognition`)](https://docs.litellm.ai/docs/providers/cognition) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
@@ -482,6 +540,7 @@ Set `LITELLM_PROXY_API_BASE` and `LITELLM_PROXY_API_KEY` and every model call th
 | [Eden AI (`edenai`)](https://docs.litellm.ai/docs/providers/edenai) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |  |  |
 | [ElevenLabs (`elevenlabs`)](https://docs.litellm.ai/docs/providers/elevenlabs) | ✅ | ✅ | ✅ |  |  | ✅ | ✅ |  |  |  |
 | [Empower (`empower`)](https://docs.litellm.ai/docs/providers/empower) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
+| [eu/jev Decisions API (`eu_jev`)](https://docs.litellm.ai/docs/pass_through/eu_jev) |  |  |  |  |  |  |  |  |  |  |
 | [Fal AI (`fal_ai`)](https://docs.litellm.ai/docs/providers/fal_ai) | ✅ | ✅ | ✅ |  | ✅ |  |  |  |  |  |
 | [Featherless AI (`featherless_ai`)](https://docs.litellm.ai/docs/providers/featherless_ai) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Fireworks AI (`fireworks_ai`)](https://docs.litellm.ai/docs/providers/fireworks_ai) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
@@ -512,6 +571,7 @@ Set `LITELLM_PROXY_API_BASE` and `LITELLM_PROXY_API_KEY` and every model call th
 | [ModelScope (`modelscope`)](https://docs.litellm.ai/docs/providers/modelscope) | ✅ | ✅ | ✅ |  | ✅ |  |  |  |  |  |
 | [Moonshot (`moonshot`)](https://docs.litellm.ai/docs/providers/moonshot) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Morph (`morph`)](https://docs.litellm.ai/docs/providers/morph) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
+| [Nace (`nace`)](https://console.nace.ai/docs/drex) |  |  |  |  |  |  |  |  |  |  |
 | [Nebius AI Studio (`nebius`)](https://docs.litellm.ai/docs/providers/nebius) | ✅ | ✅ | ✅ | ✅ |  |  |  |  |  |  |
 | [NLP Cloud (`nlp_cloud`)](https://docs.litellm.ai/docs/providers/nlp_cloud) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Novita AI (`novita`)](https://novita.ai/models/llm?utm_source=github_litellm&utm_medium=github_readme&utm_campaign=github_link) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
@@ -554,6 +614,7 @@ Set `LITELLM_PROXY_API_BASE` and `LITELLM_PROXY_API_KEY` and every model call th
 | [Watsonx Text (`watsonx_text`)](https://docs.litellm.ai/docs/providers/watsonx) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [xAI (`xai`)](https://docs.litellm.ai/docs/providers/xai) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Xinference (`xinference`)](https://docs.litellm.ai/docs/providers/xinference) |  |  |  | ✅ |  |  |  |  |  |  |
+| [ZeroGPU (`zerogpu`)](https://docs.litellm.ai/docs/providers/zerogpu) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 
 [**Read the Docs**](https://docs.litellm.ai/docs/)
 
@@ -568,7 +629,7 @@ You can use LiteLLM through either the Proxy Server or Python SDK. Both give you
 <tr>
 <th style={{width: '14%'}}></th>
 <th style={{width: '43%'}}><strong><a href="https://docs.litellm.ai/docs/simple_proxy">LiteLLM AI Gateway</a></strong></th>
-<th style={{width: '43%'}}><strong><a href="https://docs.litellm.ai/docs/">LiteLLM Python SDK</a></strong></th>
+<th style={{width: '43%'}}><strong><a href="https://docs.litellm.ai/docs/python_sdk">LiteLLM Python SDK</a></strong></th>
 </tr>
 </thead>
 <tbody>
@@ -776,7 +837,7 @@ For companies that need better security, user management and professional suppor
 [Talk to founders](https://enterprise.litellm.ai/demo)
 
 This covers:
-- ✅ **Features under the [LiteLLM Commercial License](https://docs.litellm.ai/docs/proxy/enterprise):**
+- ✅ **Features under the [LiteLLM Commercial License](https://docs.litellm.ai/docs/enterprise):**
 - ✅ **Feature Prioritization**
 - ✅ **Custom Integrations**
 - ✅ **Professional Support - Dedicated discord + slack**
@@ -786,6 +847,8 @@ This covers:
 # Contributing
 
 We welcome contributions to LiteLLM! Whether you're fixing bugs, adding features, or improving documentation, we appreciate your help.
+
+If you want to work closely with our team, check out [LiteLLM OSS Champions](https://www.litellm.ai/champions), our program for trusted OSS contributors with their own Slack channel and a voice in the roadmap
 
 ## Quick Start for Contributors
 

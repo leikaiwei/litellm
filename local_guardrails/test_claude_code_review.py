@@ -10,7 +10,7 @@ from pytest_socket import disable_socket, enable_socket
 import litellm
 from litellm.caching.dual_cache import DualCache
 from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup as LogSetup
-from litellm.llms.anthropic.pass_through.caller_model_checks import CallerModelVerdict
+from litellm.llms.anthropic.messages.caller_model_checks import CallerModelVerdict
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.config_resolvers import SettingsStore
 from litellm.proxy.route_llm_request import (

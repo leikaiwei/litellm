@@ -11,8 +11,9 @@ from pydantic import TypeAdapter
 
 import litellm
 from litellm.litellm_core_utils.prompt_templates.mid_conversation_system import message_field
+from litellm.litellm_core_utils.url_utils import join_api_base
 from litellm.llms.anthropic.common_utils import validated_object_list, validated_object_mapping
-from litellm.llms.anthropic.pass_through.messages.transformation import (
+from litellm.llms.anthropic.messages.native.transformation import (
     AnthropicMessagesConfig,
 )
 from litellm.llms.bedrock.common_utils import (
@@ -167,9 +168,9 @@ class DeepSeekAnthropicMessagesConfig(AnthropicMessagesConfig):
         base_url = base_url.removesuffix("/beta")
 
         if not base_url.endswith("/anthropic") and "/anthropic/" not in base_url:
-            base_url = f"{base_url}/anthropic"
+            base_url = join_api_base(base_url, "anthropic")
 
-        return f"{base_url}/v1/messages"
+        return join_api_base(base_url, "v1/messages")
 
     @staticmethod
     def _sanitize_tools_for_deepseek(tools: object) -> object:

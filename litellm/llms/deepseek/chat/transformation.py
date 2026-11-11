@@ -8,10 +8,13 @@ from typing import Final, Literal, cast, overload
 from pydantic import InstanceOf, TypeAdapter
 
 import litellm
+from litellm.litellm_core_utils.core_helpers import as_str_mapping
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     convert_content_list_to_str,
     extract_search_results_text,
 )
+from litellm.litellm_core_utils.reasoning_effort_utils import OPAQUE_VALUE, warn_dropped_reasoning
+from litellm.litellm_core_utils.url_utils import ensure_api_route
 from litellm.llms.bedrock.common_utils import (
     normalize_json_schema_custom_types_to_object,
 )
@@ -23,6 +26,17 @@ from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 
 _TOOL_ITEMS: Final = TypeAdapter(tuple[object, ...])
 _TOOL_OBJECT: Final = TypeAdapter(InstanceOf[dict[str, object]])
+SUPPORTED_REASONING_EFFORTS: Final = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+_NO_BUDGET_REASON: Final = "DeepSeek takes thinking only as enabled or disabled, with no budget."
+
+
+def _warn_on_dropped_budget(thinking: object, model: str) -> None:
+    fields: Final = as_str_mapping(thinking)
+    if fields is None or fields.get("type") != "enabled" or "budget_tokens" not in fields:
+        return
+    warn_dropped_reasoning(
+        "thinking.budget_tokens", fields["budget_tokens"], model, _NO_BUDGET_REASON, drop_params_gated=False
+    )
 
 
 class DeepSeekChatConfig(OpenAIGPTConfig):
@@ -40,7 +54,7 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         optional_params: dict,
         model: str,
         drop_params: bool,
-    ) -> dict:
+    ) -> dict[str, object]:
         """
         Map OpenAI params to DeepSeek params.
 
@@ -58,6 +72,7 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         # Then re-add only if valid for DeepSeek
         thinking_value: Final = optional_params.pop("thinking", None)
         reasoning_effort: Final = optional_params.pop("reasoning_effort", None)
+        _warn_on_dropped_budget(OPAQUE_VALUE.validate_python(thinking_value), model)
 
         # Handle thinking parameter - accept both enabled and disabled, ignore budget_tokens
         if isinstance(thinking_value, dict) and thinking_value.get("type") in ("enabled", "disabled"):
@@ -66,6 +81,13 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         # Otherwise fall back to reasoning_effort: "none" disables, anything else enables
         elif reasoning_effort is not None:
             optional_params["thinking"] = {"type": "disabled" if reasoning_effort == "none" else "enabled"}
+
+        if (
+            isinstance(reasoning_effort, str)
+            and reasoning_effort in SUPPORTED_REASONING_EFFORTS
+            and optional_params["thinking"] == {"type": "enabled"}
+        ):
+            return {**optional_params, "reasoning_effort": reasoning_effort}
 
         return optional_params
 
@@ -407,9 +429,4 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         """
         If api_base is not provided, use the default DeepSeek /chat/completions endpoint.
         """
-        clean_api_base: Final = (api_base or "https://api.deepseek.com/beta").rstrip("/")
-
-        if not clean_api_base.endswith("/chat/completions"):
-            return f"{clean_api_base}/chat/completions"
-
-        return clean_api_base
+        return ensure_api_route(api_base or "https://api.deepseek.com/beta", "chat/completions")

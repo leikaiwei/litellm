@@ -28,11 +28,11 @@ from litellm.llms.anthropic.chat.transformation import AnthropicConfig
 from litellm.llms.anthropic.common_utils import AnthropicModelInfo, merge_anthropic_beta_headers
 from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
 from litellm.llms.anthropic.count_tokens.transformation import COUNT_TOKEN_OPTION_NAMES
-from litellm.llms.anthropic.pass_through.messages.transformation import (
+from litellm.llms.anthropic.messages.native.transformation import (
     AnthropicMessagesConfig,
     messages_carry_output_config,
 )
-from litellm.llms.anthropic.pass_through.messages.utils import (
+from litellm.llms.anthropic.messages.native.utils import (
     anthropic_system_to_openai_message,
     prepare_native_request_body,
 )
@@ -340,7 +340,9 @@ def _is_counted_claude(model: str) -> bool:
 
 def _claude_body(data: Mapping[str, object], model: str, call_type: CallTypes) -> dict[str, JsonValue]:
     if call_type in (CallTypes.anthropic_messages, CallTypes.aanthropic_messages):
-        return _JSON_OBJECT.validate_python(prepare_native_request_body(data, model))
+        return _JSON_OBJECT.validate_python(
+            prepare_native_request_body(data, model, headers=_generation_count_headers(data, call_type))
+        )
     config: Final = AnthropicConfig()
     keys: Final = frozenset(DEFAULT_CHAT_COMPLETION_PARAM_VALUES) | frozenset(COUNT_TOKEN_OPTION_NAMES)
     request_options: Final = {
@@ -375,9 +377,11 @@ def _claude_body(data: Mapping[str, object], model: str, call_type: CallTypes) -
     )
 
 
-def _generation_count_headers(data: Mapping[str, object]) -> dict[str, str]:
+def _generation_count_headers(data: Mapping[str, object], call_type: CallTypes) -> dict[str, str]:
     scoped: Final = ProviderSpecificHeaderUtils.get_provider_specific_headers(
-        _PROVIDER_HEADERS.validate_python(data.get("provider_specific_header")), "anthropic"
+        _PROVIDER_HEADERS.validate_python(data.get("provider_specific_header")),
+        "anthropic",
+        native_anthropic_messages=call_type in (CallTypes.anthropic_messages, CallTypes.aanthropic_messages),
     )
     outgoing: Final = {**_mapping(data.get("headers")), **_mapping(data.get("extra_headers")), **scoped}
     return {
@@ -416,7 +420,7 @@ async def _count_claude(data: Mapping[str, object], call_type: CallTypes) -> int
         if auth is None:
             raise ValueError("Claude 上游计数缺少凭据")
         body: Final = await offload_token_count(_claude_body)(params, model, call_type)
-        generation_headers: Final = _generation_count_headers(params)
+        generation_headers: Final = _generation_count_headers(params, call_type)
         messages: Final = _JSON_MESSAGES.validate_python(body.get("messages"))
         per_turn_betas: Final = (
             (ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER,)
@@ -425,7 +429,7 @@ async def _count_claude(data: Mapping[str, object], call_type: CallTypes) -> int
         )
         config: Final = AnthropicMessagesConfig()
         count_headers: Final = _HEADERS.validate_python(
-            config._finalize_messages_headers(  # pyright: ignore[reportUnknownMemberType, reportPrivateUsage]  # 复用功能头
+            config.finalize_messages_headers(  # pyright: ignore[reportUnknownMemberType]  # 复用功能头
                 headers={
                     **{key: value for key, value in generation_headers.items() if key != "anthropic-beta"},
                     **auth,

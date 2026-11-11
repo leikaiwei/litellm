@@ -1,9 +1,4 @@
 [[IgnoredVulns]]
-id = "GHSA-w8v5-vhqr-4h9v"
-ignoreUntil = 2026-11-27
-reason = "diskcache has no fixed release published and is installed only by the litellm[caching] extra for the disk cache backend; main removed that backend in #48114, a breaking change that stays off the 1.108 line; remove this entry once 1.108 is out of support or a diskcache fix ships"
-
-[[IgnoredVulns]]
 id = "GHSA-v4x8-3wr5-3wq8"
 ignoreUntil = 2026-11-20
 reason = "filelock ReadWriteLock advisory, which no package in the lock takes (litellm and huggingface_hub, filelock's only dependents, use just FileLock and SoftFileLock); fixed only in 4.2.1, and filelock 4.1.1+ needs Python >= 3.11; litellm's own filelock<4.0 cap keeps every Python on 3.32.7 until it is lifted for 3.11+ (#48635, #48802); remove once that lands and 3.10 is dropped"
