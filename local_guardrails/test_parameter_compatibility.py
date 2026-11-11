@@ -18,7 +18,8 @@ from litellm.proxy.utils import ProxyLogging
 from litellm.types.utils import CallTypesLiteral
 from local_guardrails.parameter_compatibility import ParameterCompatibilityGuardrail
 
-_MODEL: Final = "claude-sonnet-5-5"
+_MODELS: Final = ("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-opus-5-5-bak")
+_MODEL: Final = _MODELS[0]
 
 
 @pytest.fixture(autouse=True)
@@ -29,20 +30,21 @@ def no_network() -> Iterator[None]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", _MODELS)
 @pytest.mark.parametrize("call_type", ("anthropic_messages", "acompletion", "aresponses"))
 @pytest.mark.parametrize("nested", (False, True))
 @pytest.mark.parametrize("drop_params", (False, True))
 async def test_known_incompatibility_is_rejected_without_changing_request(
-    call_type: CallTypesLiteral, nested: bool, drop_params: bool
+    model: str, call_type: CallTypesLiteral, nested: bool, drop_params: bool
 ) -> None:
     thinking: Final = {"thinking": {"type": "adaptive", "display": "updates"}}
     data: Final[dict[str, object]] = {
-        "model": _MODEL,
+        "model": model,
         "drop_params": drop_params,
         **({"extra_body": thinking} if nested else thinking),
     }
     original: Final = copy.deepcopy(data)
-    guard: Final = ParameterCompatibilityGuardrail(blocked_models=[_MODEL])
+    guard: Final = ParameterCompatibilityGuardrail(blocked_models=_MODELS)
     with pytest.raises(HTTPException) as error:
         await guard.async_pre_call_hook(UserAPIKeyAuth(), DualCache(), data, call_type)
     assert error.value.status_code == 400
@@ -70,9 +72,12 @@ async def test_other_requests_are_unchanged(model: str, thinking: object) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", _MODELS)
 @pytest.mark.parametrize("stream", (False, True))
-async def test_http_pre_call_rejects_before_count_or_routing(monkeypatch: pytest.MonkeyPatch, stream: bool) -> None:
-    guard: Final = ParameterCompatibilityGuardrail(blocked_models=[_MODEL], guardrail_name="parameter-compatibility")
+async def test_http_pre_call_rejects_before_count_or_routing(
+    monkeypatch: pytest.MonkeyPatch, model: str, stream: bool
+) -> None:
+    guard: Final = ParameterCompatibilityGuardrail(blocked_models=_MODELS, guardrail_name="parameter-compatibility")
     monkeypatch.setattr(litellm, "callbacks", [guard])
     logging: Final = ProxyLogging(user_api_key_cache=UserApiKeyCache())
     downstream: Final = AsyncMock(return_value={"accepted": True})
@@ -90,7 +95,7 @@ async def test_http_pre_call_rejects_before_count_or_routing(monkeypatch: pytest
         response: Final = await client.post(
             "/v1/messages",
             json={
-                "model": _MODEL,
+                "model": model,
                 "messages": [{"role": "user", "content": "Hello"}],
                 "thinking": {"type": "adaptive", "display": "updates"},
                 "stream": stream,
@@ -99,6 +104,6 @@ async def test_http_pre_call_rejects_before_count_or_routing(monkeypatch: pytest
         assert response.status_code == 400
         assert response.json()["detail"]["code"] == "unsupported_request_parameter"
         downstream.assert_not_awaited()
-        allowed: Final = await client.post("/v1/messages", json={"model": _MODEL, "stream": stream})
+        allowed: Final = await client.post("/v1/messages", json={"model": model, "stream": stream})
         assert allowed.status_code == 200
         downstream.assert_awaited_once()

@@ -19,7 +19,7 @@
 
 这是一条明确配置的渠道限制，不表示 Anthropic 全局不支持 `updates`。只匹配
 `blocked_models` 中的客户端模型组名称，不按 Claude 前缀扩大范围。入口若使用别名，也需
-列出实际进入 pre_call 的别名。当前示例只列出 2026-11-11 已确认受影响的 Sonnet 组。
+列出实际进入 pre_call 的别名。当前配置覆盖 CPA 上游的 Sonnet、Opus、Haiku 和 Opus 备用组。
 同组请求即使存在可接受该参数的其他渠道也会拒绝，这是保证路由前零上游调用的取舍。
 其他模型组、`summarized`、`omitted` 和不携带该字段的请求保持不变
 
@@ -41,15 +41,27 @@ guardrails:
       default_on: true
       blocked_models:
         - claude-sonnet-5-5
+        - claude-opus-5-5
+        - claude-haiku-5-5
+        - claude-opus-5-5-bak
 ```
 
 只需新增插件文件和配置，不需要构建核心镜像。新挂载文件需重建代理容器加载；若运行环境
 已可访问插件文件，按现有加载方式重启即可。删除这一配置项即可停用，其他插件不变。
-2026-11-11 已将上述配置应用到生产，限制范围仅为 `claude-sonnet-5-5`。使用现有 patch.5
+2026-11-11 首次部署误将范围只配为 `claude-sonnet-5-5`，漏掉同一 CPA 上游的其他模型组。使用现有 patch.5
 镜像增加插件只读挂载并重新创建主代理容器，没有构建或拉取镜像。普通与流式 Messages
 验收均在 pre_call 返回 HTTP 400，readiness healthy、数据库 connected，其余五个容器未重启。
 切换总耗时约 74 秒，非 200 探测区间约 54 秒。备份与回滚脚本位于生产主机
 `/root/litellm/backup-parameter-guard-20261111T064230Z/`
+
+同日补齐上述四个模型组，保留插件代码和镜像不变，仅更新配置并重启主代理。四组各自的普通、
+流式 Messages 请求共八次生产验收均返回本插件的 HTTP 400，readiness healthy、数据库 connected，
+其余五个容器的 ID 和启动时间未变。重启到 healthy 约 42 秒，非 200 探测跨度约 37 秒。
+本次备份与回滚脚本在 `/root/litellm/backup-parameter-scope-20261111T084044Z/`
+
+参数拦截不代表上下文计数已经修复。当前生产 CPA 的 count 与 generation 转换仍存在已知差异，
+LiteLLM 外部准入插件的身份头对齐修改也尚未上线。仅更新此名单不能消除 token 低估，亦未验证
+关闭 CPA cloak 或任意降低上限能可靠解决该问题。本次没有修改计数插件、CPA 或上下文上限
 
 验证使用禁网测试与进程内 HTTP 请求，经过真实 `ProxyLogging.pre_call_hook`，断言命中时
 HTTP 400 且后续计数/路由步骤未调用，同时验证未命中请求继续执行。运行命令如下
