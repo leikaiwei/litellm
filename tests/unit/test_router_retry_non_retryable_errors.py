@@ -20,6 +20,8 @@ import pytest
 
 import litellm
 from litellm import Router
+from litellm.exceptions import MidStreamFallbackError, RequestAdmissionContextWindowExceededError, RequestAdmissionError
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.litellm_core_utils.llm_response_utils.response_metadata import (
     _union_duration_ms,
@@ -27,7 +29,179 @@ from litellm.litellm_core_utils.llm_response_utils.response_metadata import (
 )
 from litellm.litellm_core_utils.logging_utils import track_llm_api_timing
 from litellm.litellm_core_utils.rules import Rules
+from litellm.router_utils.cooldown_handlers import get_cooldown_deployments
+from litellm.router_utils.router_callbacks.track_deployment_metrics import get_deployment_failures_for_current_minute
+from litellm.types.router import RetryPolicy
+from litellm.types.utils import CallTypes
 from litellm.utils import function_setup
+
+
+class AdmissionVerdicts(CustomLogger):
+    def __init__(self, errors: tuple[Exception, ...]) -> None:
+        super().__init__()
+        self.errors = errors
+        self.calls: tuple[str, ...] = ()
+
+    async def async_pre_call_deployment_hook(
+        self, kwargs: dict[str, object], call_type: CallTypes | None
+    ) -> dict[str, object] | None:
+        index: Final = len(self.calls)
+        self.calls = (*self.calls, str(kwargs.get("model")))
+        if index < len(self.errors):
+            raise self.errors[index]
+        return None
+
+
+def _admission_router(
+    model: str = "anthropic/claude-admission-fixture", ordered: bool = False, **options: object
+) -> Router:
+    return Router(
+        model_list=[
+            {
+                "model_name": group,
+                "litellm_params": {
+                    "model": model,
+                    "api_key": "unused",
+                    "mock_response": "accepted",
+                    "order": order if ordered else 0,
+                },
+                "model_info": {"id": identifier},
+            }
+            for group, order, identifier in (
+                ("primary", 0, "primary"),
+                ("primary", 1, "secondary"),
+                ("backup", 0, "backup"),
+                ("last", 0, "last"),
+            )
+        ],
+        **options,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", (RequestAdmissionError, RequestAdmissionContextWindowExceededError))
+@pytest.mark.parametrize("surface", ("messages", "chat", "responses"))
+@pytest.mark.parametrize("stream", (False, True))
+async def test_admission_rejection_stops_recovery_without_cooling_deployment(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[RequestAdmissionError], surface: str, stream: bool
+) -> None:
+    rejection: Final = error_type(message="admission rejected", model="fixture", llm_provider="anthropic")
+    hook: Final = AdmissionVerdicts((rejection,))
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = _admission_router(
+        num_retries=2,
+        retry_policy=RetryPolicy(BadRequestErrorRetries=2),
+        fallbacks=[{"primary": ["backup", "last"]}],
+        context_window_fallbacks=[{"primary": ["backup", "last"]}],
+        fallback_on_unsupported_params=True,
+        enable_weighted_failover=True,
+        allowed_fails=0,
+    )
+    try:
+        request: Final[Awaitable[object]]
+        if surface == "messages":
+            request = router.anthropic_messages(
+                model="primary", messages=[{"role": "user", "content": "hi"}], max_tokens=10, stream=stream
+            )
+        elif surface == "chat":
+            request = router.acompletion(model="primary", messages=[{"role": "user", "content": "hi"}], stream=stream)
+        else:
+            request = router.aresponses(model="primary", input="hi", stream=stream)
+        with pytest.raises(RequestAdmissionError) as caught:
+            await request
+        assert caught.value is rejection
+        assert len(hook.calls) == 1
+        assert get_cooldown_deployments(router, parent_otel_span=None) == []
+        assert tuple(
+            get_deployment_failures_for_current_minute(router, identifier)
+            for identifier in ("primary", "secondary", "backup", "last")
+        ) == (0, 0, 0, 0)
+        response: Final = await router.anthropic_messages(
+            model="primary", messages=[{"role": "user", "content": "next request"}], max_tokens=10
+        )
+        assert response["content"][0]["text"] == "accepted"
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", (RequestAdmissionError, RequestAdmissionContextWindowExceededError))
+@pytest.mark.parametrize("recovery", ("retry", "fallback", "order", "weighted"))
+async def test_admission_rejection_on_later_attempt_stops_the_remaining_chain(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[RequestAdmissionError], recovery: str
+) -> None:
+    rejection: Final = error_type(message="admission rejected", model="fixture", llm_provider="anthropic")
+    hook: Final = AdmissionVerdicts((_make_rate_limit_error(), rejection))
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = _admission_router(
+        ordered=recovery == "order",
+        num_retries=2 if recovery == "retry" else 0,
+        retry_policy=RetryPolicy(BadRequestErrorRetries=2, RateLimitErrorRetries=2) if recovery == "retry" else None,
+        retry_after=0,
+        fallbacks=[{"primary": ["backup", "last"]}],
+        context_window_fallbacks=[{"primary": ["backup", "last"]}],
+        fallback_on_unsupported_params=True,
+        enable_weighted_failover=recovery == "weighted",
+        disable_cooldowns=True,
+    )
+    try:
+        with pytest.raises(RequestAdmissionError) as caught:
+            await router.acompletion(model="primary", messages=[{"role": "user", "content": "hi"}])
+        assert caught.value is rejection
+        assert len(hook.calls) == 2
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", (RequestAdmissionError, RequestAdmissionContextWindowExceededError))
+async def test_stream_retry_propagates_admission_rejection_before_fallback(
+    error_type: type[RequestAdmissionError],
+) -> None:
+    rejection: Final = error_type(message="admission rejected", model="fixture", llm_provider="anthropic")
+
+    async def rejected_attempt(**kwargs: object) -> object:
+        raise rejection
+
+    router: Final = _admission_router(num_retries=2, retry_after=0)
+    dropped_stream: Final = MidStreamFallbackError(
+        message="upstream disconnected",
+        model="primary",
+        llm_provider="anthropic",
+        original_exception=_make_rate_limit_error(),
+        is_pre_first_chunk=True,
+    )
+    try:
+        with pytest.raises(RequestAdmissionError) as caught:
+            await router._astream_retry_same_group(dropped_stream, {"model": "primary"}, rejected_attempt)
+        assert caught.value is rejection
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", (litellm.ContextWindowExceededError, litellm.RateLimitError))
+async def test_ordinary_provider_errors_still_reach_configured_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[litellm.ContextWindowExceededError] | type[litellm.RateLimitError],
+) -> None:
+    upstream_error: Final = error_type(message="upstream rejected", model="fixture", llm_provider="openai")
+    hook: Final = AdmissionVerdicts((upstream_error,))
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = _admission_router(
+        model="openai/admission-fixture",
+        num_retries=0,
+        fallbacks=[{"primary": ["backup"]}],
+        context_window_fallbacks=[{"primary": ["backup"]}],
+        disable_cooldowns=True,
+    )
+    try:
+        response: Final = await router.acompletion(model="primary", messages=[{"role": "user", "content": "hi"}])
+        assert response.choices[0].message.content == "accepted"
+        assert len(hook.calls) == 2
+        assert response._hidden_params["additional_headers"]["x-litellm-model-group"] == "backup"
+    finally:
+        router.reset()
 
 
 def _make_rate_limit_error(message="Rate limited"):

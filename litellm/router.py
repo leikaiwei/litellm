@@ -75,6 +75,7 @@ from litellm.constants import (
     RUNTIME_UPDATABLE_ROUTER_SETTINGS,
     SESSION_DEPLOYMENT_AFFINITY_TTL_METADATA_KEY,
 )
+from litellm.exceptions import RequestAdmissionError
 from litellm.integrations.custom_guardrail import is_guardrail_intervention
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.otel.routing import routing_decision_attributes
@@ -6222,6 +6223,8 @@ class Router:
             try:
                 response = await attempt_function(**retry_kwargs)
             except Exception as retry_error:  # noqa: BLE001  # the fallback chain judges the failed retry
+                if isinstance(retry_error, RequestAdmissionError):
+                    raise
                 wrapped = _stream_fallback_error_for_raised(retry_error, model_group, False, e.llm_provider)
                 if wrapped is None:
                     return _StreamRetriesExhausted(_stream_pre_content_error(retry_error, model_group, e.llm_provider))
@@ -7864,6 +7867,8 @@ class Router:
         }
         try:
             return await run_async_fallback(*args, **failover_kwargs)
+        except RequestAdmissionError:
+            raise
         except (openai.APIError, RouterRateLimitError, RouterRateLimitErrorBasic):
             # Expected model-level failure on the retried deployment. All
             # litellm provider errors derive from openai.APIError; if every
@@ -7907,7 +7912,8 @@ class Router:
             e, self.fallback_on_unsupported_params
         )
         if (
-            disable_fallbacks is True
+            isinstance(e, RequestAdmissionError)
+            or disable_fallbacks is True
             or original_model_group is None
             or is_guardrail_intervention(e)
             or unsupported_params_without_fallback
@@ -8126,6 +8132,8 @@ class Router:
 
                 return response
         except Exception as new_exception:
+            if isinstance(new_exception, RequestAdmissionError):
+                raise
             parent_otel_span: Final = get_parent_otel_span_from_kwargs(kwargs)
             fallback_failure_exception_str = truncate_fallback_error_detail(redact_string(str(new_exception)))
             cooldown_info: Final = await async_get_cooldown_deployments_with_debug_info(
@@ -8329,7 +8337,7 @@ class Router:
             response = add_retry_headers_to_response(response=response, attempted_retries=0, max_retries=None)
             return response
         except Exception as e:
-            if is_guardrail_intervention(e):
+            if isinstance(e, RequestAdmissionError) or is_guardrail_intervention(e):
                 raise
             current_attempt = None
             original_exception = e
@@ -8431,6 +8439,8 @@ class Router:
                     return response
 
                 except Exception as e:  # noqa: BLE001  # 重试统一处理各供应商异常，耗尽后仍向调用方抛出
+                    if isinstance(e, RequestAdmissionError):
+                        raise
                     # Always track the latest error so we raise the most
                     # recent exception instead of the first one.
                     original_exception = e
@@ -8884,6 +8894,9 @@ class Router:
         verbose_router_logger.debug("Router: Entering 'deployment_callback_on_failure'")
         try:
             exception: Final = kwargs.get("exception", None)
+
+            if isinstance(exception, RequestAdmissionError):
+                return False
 
             if is_advisor_orchestration_failure(exception):
                 verbose_router_logger.debug(

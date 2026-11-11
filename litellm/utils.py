@@ -482,6 +482,7 @@ from .exceptions import (
     OpenAIError,
     PermissionDeniedError,
     RateLimitError,
+    RequestAdmissionError,
     ServiceUnavailableError,
     Timeout,
     UnprocessableEntityError,
@@ -1963,7 +1964,7 @@ def client(original_function):
             # RETURN RESULT
             return result
         except Exception as e:
-            if call_type == CallTypes.completion.value:
+            if not isinstance(e, RequestAdmissionError) and call_type == CallTypes.completion.value:
                 num_retries = kwargs.get("num_retries", None) or litellm.num_retries or None
                 if kwargs.get("retry_policy", None):
                     get_num_retries_from_retry_policy: Callable[..., int | None] = (
@@ -2000,7 +2001,7 @@ def client(original_function):
                     else:
                         kwargs["model"] = context_window_fallback_dict[model]
                     return original_function(*args, **kwargs)
-            elif call_type == CallTypes.responses.value:
+            elif not isinstance(e, RequestAdmissionError) and call_type == CallTypes.responses.value:
                 num_retries = kwargs.get("num_retries", None) or litellm.num_retries or None
                 if kwargs.get("retry_policy", None):
                     get_num_retries_from_retry_policy = litellm_utils.get_num_retries_from_retry_policy
@@ -2287,6 +2288,8 @@ def client(original_function):
                 except Exception as e:
                     raise e
 
+            if isinstance(e, RequestAdmissionError):
+                raise
             retry_call_type: Final = _get_call_type_from_public_name(original_function.__name__)
             num_retries, kwargs = _get_wrapper_num_retries(kwargs=kwargs, exception=e)
             if retry_call_type == CallTypes.acompletion.value:

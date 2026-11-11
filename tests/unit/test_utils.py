@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePath
-from typing import Final, SupportsIndex, cast
+from typing import Final, NoReturn, SupportsIndex, cast
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -24,7 +24,7 @@ import respx
 from jsonschema import validate
 
 import litellm
-from litellm.exceptions import MidStreamFallbackError
+from litellm.exceptions import MidStreamFallbackError, RequestAdmissionContextWindowExceededError, RequestAdmissionError
 from litellm._internal_context import is_internal_call
 from litellm._logging import (
     CorrelationContextFilter,
@@ -57,7 +57,7 @@ from litellm.responses.main import aresponses, responses
 from litellm.types.caching import CachingSupportedCallTypes
 from litellm.types.integrations.custom_logger import HEADROOM_CONVERTED_STREAM_KEY, STREAM_OPTIONS_STASH_KEYS
 from litellm.types.llms.openai import ResponsesAPIResponse
-from litellm.types.router import CredentialLiteLLMParams, GenericLiteLLMParams, LiteLLM_Params
+from litellm.types.router import CredentialLiteLLMParams, GenericLiteLLMParams, LiteLLM_Params, RetryPolicy
 from litellm.types.utils import (
     ADDRESSED_RESPONSE_ID_FIELD,
     CallTypes,
@@ -9866,6 +9866,63 @@ async def test_completion_with_retry_policy(sync_mode):
         mock_completion_with_retries.assert_called_once()
         assert mock_completion_with_retries.call_args.kwargs["num_retries"] == retry_number
         assert retry_policy.ContentPolicyViolationErrorRetries == retry_number
+
+
+class AdmissionSDKAttempt:
+    def __init__(self, error: RequestAdmissionError) -> None:
+        self.error = error
+        self.calls = 0
+
+    def _reject(self) -> NoReturn:
+        self.calls += 1
+        raise self.error
+
+    def completion(self, **kwargs: object) -> NoReturn:
+        self._reject()
+
+    def responses(self, **kwargs: object) -> NoReturn:
+        self._reject()
+
+    async def acompletion(self, **kwargs: object) -> NoReturn:
+        self._reject()
+
+    async def aresponses(self, **kwargs: object) -> NoReturn:
+        self._reject()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", (RequestAdmissionError, RequestAdmissionContextWindowExceededError))
+@pytest.mark.parametrize("surface", ("chat", "responses"))
+@pytest.mark.parametrize("sync_mode", (True, False))
+@pytest.mark.parametrize("recovery", ("retry", "context_fallback"))
+async def test_sdk_admission_rejection_skips_retry_and_context_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[RequestAdmissionError],
+    surface: str,
+    sync_mode: bool,
+    recovery: str,
+) -> None:
+    monkeypatch.setattr(litellm, "callbacks", [])
+    rejection: Final = error_type(message="admission rejected", model="fixture", llm_provider="anthropic")
+    attempt: Final = AdmissionSDKAttempt(rejection)
+    arguments: Final = {
+        "model": "openai/admission-fixture",
+        "api_key": "unused",
+        "messages": [{"role": "user", "content": "hi"}],
+        "input": "hi",
+        "mock_response": "unexpected retry",
+        "num_retries": 2 if recovery == "retry" else 0,
+        "retry_policy": RetryPolicy(BadRequestErrorRetries=2) if recovery == "retry" else None,
+        "context_window_fallback_dict": {"openai/admission-fixture": "openai/backup"},
+    }
+    if sync_mode:
+        with pytest.raises(RequestAdmissionError) as caught:
+            client(attempt.completion if surface == "chat" else attempt.responses)(**arguments)
+    else:
+        with pytest.raises(RequestAdmissionError) as caught:
+            await client(attempt.acompletion if surface == "chat" else attempt.aresponses)(**arguments)
+    assert caught.value is rejection
+    assert attempt.calls == 1
 
 
 @pytest.mark.asyncio

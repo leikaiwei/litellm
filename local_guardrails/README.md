@@ -1,8 +1,8 @@
 # 本地自定义 guardrail
 
-放在这里的是**不修改 litellm 源码**的外部 guardrail。litellm 原生支持从 config.yaml
-同目录加载自定义 guardrail（`litellm/proxy/types_utils/utils.py` 的 `get_instance_fn`），
-所以升级 / 合并上游时这里零冲突。
+这里保存外部 guardrail 和 callback。LiteLLM 原生支持从 config.yaml 同目录加载自定义
+guardrail（`litellm/proxy/types_utils/utils.py` 的 `get_instance_fn`）。部分能力需要配套核心补丁，
+具体依赖和部署状态见各节；升级时仍需检查扩展接口兼容性
 
 跑测试：
 
@@ -693,10 +693,11 @@ chunk 的用量提上来（`utils.py:2143`），有它就说明字节已经出�
 
 ## request_admission 请求上下文准入
 
-`request_admission.py` 使用现有 `CustomLogger` 扩展点，不修改 Router 源码。它在异步候选部署
-筛选时检查输入长度，并在选定部署、向上游发送之前再次检查，覆盖直接指定 deployment ID 和
-fallback。注册后对 Chat Completions、Anthropic Messages 和 Responses 生效，不依赖客户端
-请求的模型名称。同步 SDK、批处理上传、Embedding 和文件上传不属于这条检测路径
+`request_admission.py` 使用现有 `CustomLogger` 扩展点，在异步候选部署筛选时检查输入长度，
+并在选定部署、向上游发送之前再次检查，覆盖直接指定 deployment ID 和 fallback。注册后对
+Chat Completions、Anthropic Messages 和 Responses 生效，不依赖客户端请求的模型名称。
+2026-11-11 Claude 候选方案另需核心异常与 Router 补丁，确保拒绝后停止重试和回退，详见下节。
+同步 SDK、批处理上传、Embedding 和文件上传不属于这条检测路径
 
 候选筛选根据部署自身 `model_info.mode` 或模型目录排除明确的非 Chat 类型，包括 Embedding、
 Rerank、音频转写和 evaluation，避免 Router 内部占位消息误触发检查。自定义非 Chat 部署应
@@ -706,9 +707,9 @@ Rerank、音频转写和 evaluation，避免 Router 内部占位消息误触发�
 输入上限优先使用部署已有 `model_info.max_input_tokens`，未声明时查现有模型目录。没有可解析
 正数上限的自定义模型被排除，所有候选都缺上限时返回配置错误，首次启用前应补齐该字段。
 唯一例外是内部固定响应 provider `claude_code_review_allow/allow`，不按价格为零豁免普通模型。
-等于或超过上限的
-候选部署被排除；全部候选超限时返回 `ContextWindowExceededError`，保留已有
-`context_window_fallbacks`。例如希望在 100 万处拒绝，可把相应部署的
+非 Claude 候选等于或超过上限时被排除；全部候选超限时返回 `ContextWindowExceededError`，
+保留已有 `context_window_fallbacks`。下述 Claude 候选方案的拒绝则终止整个请求，不走回退。
+例如希望在计数达到 100 万处拒绝，可把相应部署的
 `model_info.max_input_tokens` 设为 `1000000`，不需要改变供应商模型目录
 
 2026-11-07 已在 patch.4 镜像配套 `0b852acb03f` 外部插件上启用。百万级输入上限封顶
@@ -718,7 +719,7 @@ Rerank、音频转写和 evaluation，避免 Router 内部占位消息误触发�
 未启用下述 Claude 上游计数的部署复用 LiteLLM 的 tokenizer、Anthropic system 提取和 Responses 输入转换，包含 system、
 instructions、工具定义和工具历史，不重命名工具，不修改用户消息。计数失败或全局计数关闭时，
 返回明确的本地无法核验提示，建议 `/compact` 或开启新会话，不再把未知长度的请求继续发给
-上游。Responses 的正常加密推理和加密压缩历史除外，这类内容按下述规则保留并交由上游校验
+上游。非 Claude Responses 的正常加密推理和加密压缩历史除外，这类内容按下述规则保留并交由上游校验
 
 内嵌图片在受限后台线程里复用 Pillow 校验结构和压缩像素。解码前按现有
 `MAX_IMAGE_URL_DOWNLOAD_SIZE_MB` 限制分配，解码后遵守 Pillow 像素上限。返回错误时包含
@@ -728,9 +729,9 @@ instructions、工具定义和工具历史，不重命名工具，不修改用�
 图片大小和像素限制按单张应用，不是整条请求的累计图片预算。大量图片仍会增加解码 CPU 成本，
 候选筛选和最终部署校验都会执行；线程池只限制并发，不消除总处理时间
 
-计数副本中的远端图片使用已有 high-detail tile 上界估算，实际请求和 detail 参数保持原样；
+非 Claude 计数副本中的远端图片使用已有 high-detail tile 上界估算，实际请求和 detail 参数保持原样；
 本地图片继续使用已有尺寸计数。这仍是估算，不是所有供应商的精确视觉 token 公式。
-Responses 的 `reasoning`、`compaction` 输入项携带非空字符串 `encrypted_content` 时，不再因
+非 Claude Responses 的 `reasoning`、`compaction` 输入项携带非空字符串 `encrypted_content` 时，不再因
 密文不可本地读取而拒绝。仍通过共享转换器检查可读正文、推理摘要、系统指令、工具定义和工具
 历史，原始密文与请求保持不变。此时本地计数只覆盖可读部分，不代表完整上下文长度，密文的
 有效性和实际上下文上限由上游最终校验，不能用密文字符数代替 token 数。Messages 中的
@@ -745,14 +746,15 @@ Responses 的 `previous_response_id`、`conversation`、`item_reference`，以�
 模型 tokenizer 不一致、后端模板及供应商额外注入也可能造成计数误差，
 保守输入上限只能留出余量，不能证明上游绝不会报超限
 
-2026-11-09 加密历史兼容修复已随 patch.5 与 Claude 计数修复一同部署。
+以下为 2026-11-09 历史上线记录，非 Claude 加密历史行为仍保留；不表示 11-11 Claude 候选方案也允许密文历史。
+加密历史兼容修复已随 patch.5 与 Claude 计数修复一同部署。
 该修复只更新外部准入插件，不额外修改 LiteLLM 核心或 CPA。Opus 仍使用上游计数，计数失败
 仍拒绝请求，不因本项兼容修复退回本地估算
 
 本机隔离代理重放同一份失败请求，普通和流式调用真实上游均返回 HTTP 200，实际模型均为
 `gpt-6.1-terra`。普通响应输入 26065 tokens，输出限制 32 tokens；流式收到 `message_stop`
 且没有错误事件。169 项相关测试通过，覆盖加密历史转发、可读内容超限和 Opus 计数失败拒绝。
-部署时需使用本次提交的外部插件，不能继续使用此前已暂存的旧候选插件
+该次部署使用当时提交的外部插件，不能用这份历史验收代替新候选版本的验证
 
 已有复杂路由自动压缩处于 pending 时，候选筛选只校验图片，把长度复核留给压缩完成后的
 deployment hook。该路径有真实 Router 离线回归，不会新增自动压缩调用。Messages 的客户端
@@ -766,17 +768,70 @@ tokenizer 首次加载遵循 LiteLLM 既有配置。若部署要求禁止 Huggin
 
 ### Opus、Sonnet、Haiku 上游计数
 
-2026-11-10 候选插件修正计数与生成的身份差异，尚未部署。计数不再从原始请求的
-metadata、litellm_metadata 或 proxy_server_request 单独取 User-Agent、X-App 和 beta，
-而是使用实际出站的 headers、extra_headers 和当前供应商匹配的 provider_specific_header。
-没有显式身份头时，计数与生成共用 HTTP 客户端默认 User-Agent，功能 beta 仍按实际输入推导。
-身份头保留生成路径的原始键名和重复值顺序，不把不同大小写的同名头压成单值或拼成逗号字符串。
-原始客户端鉴权、Cookie 与无关头不会因此转发。生成请求保持原有行为，无需修改核心镜像
+#### 2026-11-11 保守准入候选，尚未部署
 
-此次发现 CPA 的计数与生成输入转换不一致会漏计历史 thinking，仅改计数身份不能修复旧 CPA。
-必须配套 CPA 的输入转换修复并完成完整历史请求验收后再部署。原生 Claude Code 的独立计数
-语义应保持不变，不能靠给所有计数请求伪造原生身份或统一增加固定 token 余量掩盖差异。
-下文客户端身份透传描述属于 2026-11-09 已部署版本的历史记录
+此方案继续使用官方 CPA，不依赖 CPA fork 或新增 CPA 插件。无法可靠核验的请求直接拒绝，
+即使实际未超限也不放行。适用部署按模型或 base_model 的 `claude-opus-`、`claude-sonnet-`、
+`claude-haiku-` 前缀识别，实际出站模型还须使用可核验的 Anthropic 协议
+
+在协议转换前检查原始历史，并检查转换后的计数正文。历史 thinking（包括 signed 和 redacted）、
+Responses reasoning/compaction、未知内容块、远端图片或文件引用、MCP、服务端工具及其他隐藏上下文
+均拒绝。Chat 的历史 reasoning/thinking 字段和 provider-specific history 同样拒绝，避免转换器
+删除或改写未知内容后，把较小计数当作完整输入。只检查协议字段，不递归误拦自定义工具参数中的
+普通同名 JSON 键。非空 container 和无法核验的 Claude Chat extra_body 继续拒绝
+
+这些限制同样影响短续聊。`/compact` 后若仍携带带签名的历史或 compaction 块，也会继续拒绝，
+建议使用纯文本摘要开启新会话。本地形状拒绝发生在计数之前，计数和生成调用均为零；不会为得到
+一个可接受计数而删除用户历史。普通和流式请求使用相同准入规则
+
+可读文本、自定义工具以及支持的内嵌 base64 媒体通过检查后，按选中部署自身的凭据、api_base
+和输入上限调用 `/v1/messages/count_tokens`，不重选部署、不退回本地估算。Responses 经既有
+Chat 桥接后计数，原生 Responses 透传仍拒绝。计数达到或超过上限，以及鉴权失败、超时、
+上游错误或无效计数，都直接终止请求，不触发组内重试、普通 fallback 或上下文 fallback
+
+中转地址必须由服务端环境 `CLAUDE_PREFLIGHT_VERIFIED_BASES` 声明已完成计数/生成一致性验收，
+格式为 JSON 数组，例如 `'["https://api.anthropic.com", "https://reviewed-cpa.example"]'`。
+未设置时只允许官方 Anthropic 直连；设置后整体替换默认列表，空数组表示全部拒绝。
+解析命名凭据和实际 Anthropic base 后才核对，客户端 kwargs 或 model_info 不能添加白名单。
+未登记中转或白名单格式错误直接拒绝，不发起鉴权交换、计数或生成。此声明不是远程配置审计，
+运营须先核验所有可选凭证有效关闭 cloaking、无影响正文的 payload rules，再登记对应地址。
+CPA 升级也必须先隔离验收，再切换并继续放行，不能把旧声明当成新版本已验证
+
+计数头取实际出站的 headers、extra_headers 和匹配供应商的 provider_specific_header，
+对齐 User-Agent、X-App、功能 beta 和支持的会话标识白名单。没有客户端身份时不伪造 Claude Code，
+不转发客户端 Authorization、x-api-key、Cookie 或无关请求头。生成请求保持原有行为
+
+此候选新增 `RequestAdmissionError`、`RequestAdmissionContextWindowExceededError` 和配套
+Router/重试异常处理，必须构建包含这些核心补丁的 LiteLLM 镜像并与外部插件一起发布，不能只把
+新插件替换到现有 patch.5。当前尚未部署，以下历史版本、哈希和验收记录均不能代表此候选已上线
+
+官方 CPA v8.0.66 的仅计数探测显式启用 `prefix_mismatch_behavior=error`，
+短文本返回 HTTP 200、`input_tokens=11`；原故障历史
+返回 HTTP 400、`signature_error/prefix_mismatch`。两项都只调用计数，生成调用为零。
+这不能证明其他账号或请求都会以同样方式拒绝，候选因此先在本地拒绝不可核验历史。
+复核 v8.0.66/67 还确认，非原生请求的 generation cloaking 会注入 CLI identity/currentDate，
+count 则不添加这些系统内容，纯文本也存在低计数路径。官方 CPA v8.0.66 隔离实例同时设置
+`upstream.claude.disable-claude-cloak-mode: true` 与账号副本 `cloak_mode: never`，普通客户端
+身份的短 system/user 请求计数返回 26，真实 Opus 5.5 生成输入同为 26、输出 5，正常结束。
+生产账号哈希未变化，隔离实例及凭据副本已删除。这是一份账号、一个短请求的验证，不能直接
+推定所有生产账号与后续版本兼容。强制 tool_choice 与有效 thinking/effort 并存也会在本地拒绝，
+避免 CPA 只在生成时删除这些参数。上游 count 仍是估算，不能宣称百万边界与最终生成严格相等
+或绝无超限差异。上线必须同步采用已验收 CPA 配置及白名单，不能只替换插件
+
+本地 HTTP 代理启用两次重试、普通 fallback 和上下文 fallback 后重放原故障请求，普通与流式
+均返回 400，计数与生成调用均为零。Chat inline opaque 和 Responses compaction 同样在本地
+拒绝。可读短文本完成一次计数和一次模拟生成；计数等于上限或计数接口返回 503 时均返回 400，
+各调用一次计数、零次生成。以上生成使用本机 fixture，不代表真实上游生成兼容性已验收
+
+候选最终合并回归 690 项通过，其中准入插件 338 项。完整 pre_commit_lint 检查通过，插件单独
+basedpyright 为零错误，Ruff 及格式检查通过。真实上游验证仅为上文关闭 cloaking 的一次小请求，
+未切换生产镜像、配置、插件或现有更新任务
+
+#### 2026-11-09 至 11-10 历史实现与上线记录
+
+以下保留旧版计数、加密历史和 fallback 的实现及上线记录。11-10 曾计划以 CPA fork 对齐
+计数和生成转换；11-11 候选改为拒绝不可核验历史，不再要求部署该 fork。旧版允许历史 thinking、
+计数失败或超限后按原路由回退、只替换外部插件等描述，不适用于上面的新候选
 
 2026-11-09 晚间 review 补充两项修复，Chat 计数改用生成路径的参数转换，遵守
 `additional_drop_params`，并保留输出预算参与 thinking 转换。按上游已合并的
@@ -787,7 +842,7 @@ metadata、litellm_metadata 或 proxy_server_request 单独取 User-Agent、X-Ap
 
 晚间修复后，全部外部插件及相关核心回归合计 786 项通过，新增用例已验证旧实现失败、新实现通过。
 以今天改动前的 `cd630e62698` 为基线运行完整 `scripts/pre_commit_lint.sh` 通过，五项 lint gate
-均未超出基线，插件单独 basedpyright 为零错误。当前插件 SHA256 为
+均未超出基线，插件单独 basedpyright 为零错误。当时插件 SHA256 为
 `99b7ba1cd607f1387ee60128d46d5868e57f4cca55c0875e5dddd63ad6a0ab82`。
 这些是本地源码验收结果。随后已构建并预拉取 `v1.108.0-fork.patch.5`，源码 `3b0a3d4a6e9`，
 镜像 digest 为 `sha256:30a88b8e23a89cce022ed042c54259b25ab99376cf910237fea58b6c9a17a4ee`。
@@ -825,7 +880,7 @@ Responses 在外层检查图片和隐藏历史，再由现有 Chat 桥接后的 
 
 计数最多等待 30 秒，鉴权失败、超时、上游错误或缺少有效的正整数 `input_tokens` 都拒绝当前
 Claude 请求，不回退本地估算。错误只显示异常类型，不回显上游正文或凭据。供应商计数也有延迟、
-限流和可用性成本；中转是否真正调用官方计数取决于供应商实现。原有 Router fallback 策略不变
+限流和可用性成本；中转是否真正调用官方计数取决于供应商实现。该历史版本保留原有 Router fallback 策略
 
 计数请求由计数处理器统一添加单个 `Content-Type: application/json`，移除功能头准备阶段
 产生的同名大小写变体，避免重复类型头让严格的 JSON 网关返回 422。User-Agent、X-App
@@ -874,8 +929,9 @@ extra_body，计数保持相同语义，不将它拍平覆盖顶层参数。两�
 CPA v8.0.61 对未识别为原生客户端的计数请求重建基础 beta，导致 display updates 等字段的
 功能头丢失；它已有原生 Claude Code 透传机制。保留真实客户端的 User-Agent、X-App 和
 原始 beta 后，两份实际失败请求在未修改的 CPA 上均返回 200，计数为 52176 和 171941。
-因此当前 Claude Code 场景无需修改 CPA 源码或全局配置，也不需要新增 CPA 插件。不得伪造
-缺失的客户端身份，也不得将客户端 Authorization、x-api-key 或 Cookie 转发到上游
+这些当时的 Claude Code 样本无需修改 CPA 源码或全局配置，也不需要新增 CPA 插件，但未覆盖
+后来发现的历史 thinking 漏计。不得伪造缺失的客户端身份，也不得将客户端 Authorization、
+x-api-key 或 Cookie 转发到上游
 
 候选计数插件仅从原始 proxy_server_request.headers、litellm_metadata.headers 或
 metadata.headers 读取上述三个白名单头，生成请求头保持不变。缺失原始身份时不合成 CLI
@@ -900,7 +956,8 @@ litellm_settings:
     - request_admission.callback
 ```
 
-首次注册和移除需要重新加载服务配置。模型输入限额仍走已有模型管理配置，不需要改插件。
+首次注册和移除需要重新加载服务配置。11-11 候选须先具备上文要求的核心补丁镜像，并配套发布插件。
+模型输入限额仍走已有模型管理配置，不需要改插件。
 该插件不会随镜像构建自动启用。多模型候选只对不同 tokenizer 模型分别计数，最终发出前还会
 复核实际部署，因此对大请求有额外 CPU 开销，使用 LiteLLM 既有计数线程并发限制控制负载
 
@@ -910,9 +967,10 @@ litellm_settings:
 LITELLM_LOCAL_MODEL_COST_MAP=True .venv/bin/python -m pytest local_guardrails/test_request_admission.py -q
 ```
 
-测试禁止 TCP，覆盖三协议图片、上下文边界、system/tools 计数、合法服务端工具历史、计数失败、
-模型候选过滤、直接 deployment ID、上下文 fallback，以及已有自动压缩后发送的真实 Router
-流程。模拟 provider 验证被拒请求没有到达后端，不代表真实供应商精确计数已经通过验收
+测试禁止 TCP。Claude 候选回归需覆盖三协议普通/流式的原始未知历史拒绝、可读输入计数、
+计数失败和超限后停止重试/回退，并断言本地形状拒绝的计数与生成调用均为零。非 Claude 的
+加密历史透传、上下文 fallback 和已有自动压缩行为继续保留原有回归。模拟 provider 验证
+不代表真实供应商精确计数或生产端到端验收已经通过
 
 ## claude_code_review: Claude Code 两种审核模式
 

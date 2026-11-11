@@ -11,6 +11,7 @@ import httpx
 
 import litellm
 from litellm._logging import verbose_router_logger
+from litellm.exceptions import RequestAdmissionError
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.core_helpers import get_metadata_variable_name_from_kwargs, safe_deep_copy
 from litellm.litellm_core_utils.get_llm_provider_logic import inferred_provider
@@ -65,6 +66,8 @@ def _trigger_cooldown_for_failed_deployment(
     blocks all subsequent failure callbacks. This helper ensures every failed
     fallback deployment is evaluated for cooldown regardless.
     """
+    if isinstance(exception, RequestAdmissionError):
+        return
     try:
         if is_advisor_orchestration_failure(exception):
             verbose_router_logger.debug(
@@ -848,6 +851,8 @@ async def run_async_fallback(
             )
             return response
         except Exception as e:
+            if isinstance(e, RequestAdmissionError):
+                raise
             error_from_fallbacks = e
             fallback_errors = fallback_errors + (get_fallback_error_info(e),)
             await log_failure_fallback_event(

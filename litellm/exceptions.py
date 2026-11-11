@@ -317,6 +317,10 @@ class MalformedRequestFieldError(BadRequestError):
     pass
 
 
+class RequestAdmissionError(BadRequestError):
+    """Request rejected before inference, without retry, fallback, or deployment cooldown."""
+
+
 class UnprocessableEntityError(openai.UnprocessableEntityError):
     def __init__(
         self,
@@ -587,6 +591,10 @@ class ContextWindowExceededError(BadRequestError):
         if self.max_retries:
             _message += f", LiteLLM Max Retries: {self.max_retries}"
         return _message
+
+
+class RequestAdmissionContextWindowExceededError(ContextWindowExceededError, RequestAdmissionError):
+    pass
 
 
 class PaymentRequiredError(BadRequestError):
