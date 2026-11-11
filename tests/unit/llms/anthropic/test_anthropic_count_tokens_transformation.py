@@ -473,25 +473,3 @@ async def test_handler_sends_the_leading_system_run_as_system_not_as_a_message(h
         "system": [{"type": "text", "text": "Be terse"}],
         "messages": [{"role": "user", "content": "Hello, how are you?"}],
     }
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "thinking",
-    (
-        {"type": "adaptive", "display": "invalid-fixture"},
-        {"type": "disabled", "display": "summarized"},
-        {"type": "between_tools", "display": "updates"},
-    ),
-)
-async def test_count_rejects_incompatible_display_without_http(thinking: dict[str, JsonValue]) -> None:
-    with respx.mock(assert_all_called=False) as transport:
-        with pytest.raises(litellm.ConfirmedUnsupportedParameterError, match=r"thinking\.display"):
-            await AnthropicCountTokensHandler().handle_count_tokens_request(
-                model="claude-sonnet-5-5",
-                messages=[{"role": "user", "content": "Hello"}],
-                auth_header={"x-api-key": "fixture"},
-                api_base="https://counter.invalid",
-                optional_params={"thinking": thinking},
-            )
-        assert not transport.calls

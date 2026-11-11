@@ -14,7 +14,6 @@ from litellm._logging import verbose_router_logger
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.core_helpers import get_metadata_variable_name_from_kwargs, safe_deep_copy
 from litellm.litellm_core_utils.get_llm_provider_logic import inferred_provider
-from litellm.litellm_core_utils.parameter_compatibility import confirmed_parameter_error
 from litellm.litellm_core_utils.sensitive_data_masker import mask_sensitive_structure
 from litellm.router_utils.add_retry_fallback_headers import (
     add_fallback_headers_to_response,
@@ -849,8 +848,6 @@ async def run_async_fallback(
             )
             return response
         except Exception as e:
-            if (parameter_error := confirmed_parameter_error(e, original_model_group)) is not None:
-                raise parameter_error
             error_from_fallbacks = e
             fallback_errors = fallback_errors + (get_fallback_error_info(e),)
             await log_failure_fallback_event(

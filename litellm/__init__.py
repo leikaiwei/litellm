@@ -1422,7 +1422,6 @@ from .exceptions import (
     BadRequestError,
     ImageFetchError,
     MalformedRequestFieldError as MalformedRequestFieldError,
-    ConfirmedUnsupportedParameterError as ConfirmedUnsupportedParameterError,
     VectorStoreSearchError,
     NotFoundError,
     PermissionDeniedError,

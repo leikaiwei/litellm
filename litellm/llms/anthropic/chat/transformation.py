@@ -23,7 +23,6 @@ from litellm.constants import (
     RESPONSE_FORMAT_TOOL_NAME,
 )
 from litellm.litellm_core_utils.core_helpers import map_finish_reason
-from litellm.litellm_core_utils.parameter_compatibility import validate_anthropic_thinking
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     sanitize_input_schema_for_anthropic,
 )
@@ -151,7 +150,6 @@ _ANTHROPIC_TOOL_NAME_INVALID_CHARS: Final = re.compile(r"[^a-zA-Z0-9_-]")
 _ANTHROPIC_TOOL_NAME_MAX_LEN: Final = 128
 _DEFER_LOADING_ADAPTER: Final = TypeAdapter(bool)
 _TOOL_FIELDS_ADAPTER: Final = TypeAdapter(Mapping[str, object])
-_REQUEST_FIELDS_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 _TOOLS_ADAPTER: Final = TypeAdapter(list[object])
 
 
@@ -2396,8 +2394,6 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
         }
 
         self._apply_output_config(data=data, model=model, optional_params=optional_params)
-        if self._resolved_provider == "anthropic":
-            validate_anthropic_thinking(_REQUEST_FIELDS_ADAPTER.validate_python(data), model)
 
         return data
 

@@ -103,7 +103,6 @@ from litellm.litellm_core_utils.hidden_params import (
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.litellm_core_utils.llm_cost_calc.utils import SERVICE_TIER_COST_KEY_SUFFIXES
-from litellm.litellm_core_utils.parameter_compatibility import confirmed_parameter_error
 from litellm.litellm_core_utils.ptu_pricing import (
     PTU_COST_ATTRIBUTION_ENV_VAR,
     declares_ptu,
@@ -6094,8 +6093,6 @@ class Router:
         names this error, else the plain budget, with whether a policy governs the retry: a committed budget
         is kept whichever deployment the retry lands on, as async_function_with_retries keeps its own.
         """
-        if confirmed_parameter_error(trigger, _request_model_group(kwargs) or "") is not None:
-            return 0, False
         policy_retries: Final = self._anthropic_messages_policy_retries(trigger, kwargs)
         committed_budget: Final = committed_retry_budget_for_request(kwargs)
         if committed_budget is not None:
@@ -6203,8 +6200,6 @@ class Router:
         last_error = e  # rebind-ok: the newest failure is what the fallback chain and the caller see
         for attempt in range(attempted_retries_for_request(initial_kwargs), budget):
             trigger = _mid_stream_retry_trigger(last_error)
-            if confirmed_parameter_error(trigger, model_group) is not None:
-                return _StreamRetriesExhausted(last_error)
             if not policy_applies and not self._stream_should_retry(
                 trigger, healthy_deployments, all_deployments, initial_kwargs
             ):
@@ -7869,8 +7864,6 @@ class Router:
         }
         try:
             return await run_async_fallback(*args, **failover_kwargs)
-        except litellm.ConfirmedUnsupportedParameterError:
-            raise
         except (openai.APIError, RouterRateLimitError, RouterRateLimitErrorBasic):
             # Expected model-level failure on the retried deployment. All
             # litellm provider errors derive from openai.APIError; if every
@@ -7899,9 +7892,6 @@ class Router:
         if verbose_router_logger.isEnabledFor(logging.DEBUG):
             verbose_router_logger.debug("Traceback%s", redact_string(traceback.format_exc()))
         original_exception: Final = e
-        parameter_error: Final = confirmed_parameter_error(e, model_group or "")
-        if parameter_error is not None:
-            raise parameter_error
         fallback_model_group = None
         original_model_group: Final[str | None] = kwargs.get("model")
         fallback_walk: Final = attempted_fallback_targets_from(kwargs)  # pyright: ignore[reportUnknownArgumentType]  # keep legacy kwargs untyped
@@ -8136,9 +8126,6 @@ class Router:
 
                 return response
         except Exception as new_exception:
-            fallback_parameter_error: Final = confirmed_parameter_error(new_exception, model_group or "")
-            if fallback_parameter_error is not None:
-                raise fallback_parameter_error
             parent_otel_span: Final = get_parent_otel_span_from_kwargs(kwargs)
             fallback_failure_exception_str = truncate_fallback_error_detail(redact_string(str(new_exception)))
             cooldown_info: Final = await async_get_cooldown_deployments_with_debug_info(
@@ -8342,9 +8329,6 @@ class Router:
             response = add_retry_headers_to_response(response=response, attempted_retries=0, max_retries=None)
             return response
         except Exception as e:
-            parameter_error: Final = confirmed_parameter_error(e, model_group if isinstance(model_group, str) else "")
-            if parameter_error is not None:
-                raise parameter_error
             if is_guardrail_intervention(e):
                 raise
             current_attempt = None
@@ -8447,12 +8431,6 @@ class Router:
                     return response
 
                 except Exception as e:  # noqa: BLE001  # 重试统一处理各供应商异常，耗尽后仍向调用方抛出
-                    if (
-                        retry_parameter_error := confirmed_parameter_error(
-                            e, model_group if isinstance(model_group, str) else ""
-                        )
-                    ) is not None:
-                        raise retry_parameter_error
                     # Always track the latest error so we raise the most
                     # recent exception instead of the first one.
                     original_exception = e

@@ -116,27 +116,3 @@ def test_wif_token_exchange_reaches_only_anthropic_not_minimax_or_tencent(
         assert config._allows_workload_identity is False
 
     assert len(poster.requests) == 1
-
-
-@pytest.mark.parametrize("display", ("invalid-fixture", "updates"))
-def test_messages_thinking_display_compatibility(display: str) -> None:
-    from litellm.exceptions import ConfirmedUnsupportedParameterError
-    from litellm.types.router import GenericLiteLLMParams
-
-    if display == "invalid-fixture":
-        with pytest.raises(ConfirmedUnsupportedParameterError, match=r"thinking\.display"):
-            AnthropicMessagesConfig().transform_anthropic_messages_request(
-                model="claude-sonnet-5-5", messages=[{"role": "user", "content": "Hello"}],
-                anthropic_messages_optional_request_params={
-                    "max_tokens": 10, "thinking": {"type": "adaptive", "display": display},
-                },
-                litellm_params=GenericLiteLLMParams(), headers={},
-            )
-        return
-    assert AnthropicMessagesConfig().transform_anthropic_messages_request(
-        model="claude-sonnet-5-5", messages=[{"role": "user", "content": "Hello"}],
-        anthropic_messages_optional_request_params={
-            "max_tokens": 10, "thinking": {"type": "adaptive", "display": display},
-        },
-        litellm_params=GenericLiteLLMParams(), headers={},
-    )["thinking"]["display"] == display

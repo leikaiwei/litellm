@@ -25,7 +25,6 @@ from litellm.llms.custom_llm import CustomLLM
 from litellm.router_strategy.complexity_router.context_compaction import compaction_executor
 from litellm.types.llms.anthropic import ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER
 from litellm.types.llms.openai import AllMessageValues
-from litellm.types.router import RetryPolicy
 from litellm.types.utils import CallTypes, Choices, CredentialItem
 from litellm.utils import custom_llm_setup
 from local_guardrails import request_admission
@@ -783,78 +782,6 @@ def _install_count_transport(monkeypatch: pytest.MonkeyPatch, transport: CountTr
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stream", (False, True))
-@pytest.mark.parametrize(
-    "thinking",
-    (
-        {"type": "adaptive", "display": "invalid-fixture"},
-        {"type": "between_tools", "display": "updates"},
-    ),
-)
-async def test_incompatible_thinking_stops_before_count_and_fallback(
-    monkeypatch: pytest.MonkeyPatch, thinking: dict[str, str], stream: bool
-) -> None:
-    transport: Final = CountTransport({"input_tokens": 75})
-    client: Final = _install_count_transport(monkeypatch, transport)
-    monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
-    router: Final = litellm.Router(
-        model_list=[_claude_deployment(), {**_claude_deployment(), "model_name": "backup"}],
-        fallbacks=[{"claude-fixture": ["backup"]}],
-        num_retries=2,
-        retry_policy=RetryPolicy(BadRequestErrorRetries=2),
-    )
-    try:
-        with pytest.raises(litellm.ConfirmedUnsupportedParameterError, match=r"thinking\.display"):
-            await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
-                model="claude-fixture", messages=_messages(), max_tokens=10, thinking=thinking, stream=stream
-            )
-        assert not transport.requests
-    finally:
-        router.reset()
-        await client.client.aclose()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("stream", (False, True))
-@pytest.mark.parametrize("structured", (False, True))
-async def test_confirmed_count_parameter_error_stops_after_one_count(
-    monkeypatch: pytest.MonkeyPatch, stream: bool, structured: bool
-) -> None:
-    error: Final = (
-        {
-            "type": "invalid_request_error",
-            "code": "unsupported_request_parameter",
-            "param": "thinking.display",
-            "message": "参数不兼容",
-        }
-        if structured
-        else {
-            "type": "invalid_request_error",
-            "message": "thinking.adaptive.display: Input should be 'summarized', 'omitted'",
-        }
-    )
-    transport: Final = CountTransport({"type": "error", "error": error}, 400)
-    client: Final = _install_count_transport(monkeypatch, transport)
-    monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
-    router: Final = litellm.Router(
-        model_list=[_claude_deployment(), {**_claude_deployment(), "model_name": "backup"}],
-        fallbacks=[{"claude-fixture": ["backup"]}],
-        num_retries=2,
-        retry_policy=RetryPolicy(BadRequestErrorRetries=2),
-    )
-    try:
-        with pytest.raises(litellm.ConfirmedUnsupportedParameterError):
-            await router.anthropic_messages(  # pyright: ignore[reportUnknownMemberType]  # 上游动态路由参数未标注
-                model="claude-fixture", messages=_messages(), max_tokens=10, stream=stream,
-                thinking={"type": "adaptive", "display": "updates"},
-            )
-        assert tuple(request.url.path for request in transport.requests) == ("/v1/messages/count_tokens",)
-    finally:
-        router.reset()
-        await client.client.aclose()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("call_type", (CallTypes.aanthropic_messages, CallTypes.acompletion))
 async def test_opus_provider_count_preserves_named_credentials_system_tools_and_options(
     monkeypatch: pytest.MonkeyPatch, call_type: CallTypes
@@ -1271,17 +1198,6 @@ async def test_rejected_claude_request_does_not_cool_down_the_next_request(
         ({"cache_control": {"type": "ephemeral"}}, False),
         ({"compaction": {"type": "summarize", "instructions": "Keep important details"}}, False),
         ({"thinking": {"type": "adaptive"}, "additional_drop_params": ["thinking"]}, False),
-        (
-            {"thinking": {"type": "adaptive", "display": "invalid-fixture"}, "additional_drop_params": ["thinking"]},
-            False,
-        ),
-        (
-            {
-                "thinking": {"type": "adaptive", "display": "invalid-fixture"},
-                "additional_drop_params": ["thinking.display"],
-            },
-            False,
-        ),
         (
             {
                 "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},

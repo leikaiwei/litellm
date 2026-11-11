@@ -17,7 +17,6 @@ from litellm.litellm_core_utils.bug_report import (
     should_report_bug,
 )
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
-from litellm.litellm_core_utils.parameter_compatibility import confirmed_parameter_error
 from litellm.litellm_core_utils.secret_redaction import redact_string as redact_secret_string
 from litellm.types.utils import LlmProviders
 
@@ -2428,13 +2427,6 @@ def exception_type(
     extra_kwargs={},
 ):
     """Maps an LLM Provider Exception to OpenAI Exception Format"""
-    parameter_error: Final = (
-        confirmed_parameter_error(original_exception, model if isinstance(model, str) else "")
-        if isinstance(original_exception, Exception)
-        else None
-    )
-    if parameter_error is not None:
-        return parameter_error
     if any(isinstance(original_exception, exc_type) for exc_type in litellm.LITELLM_EXCEPTION_TYPES):
         return original_exception
     if _is_guardrail_block(original_exception):

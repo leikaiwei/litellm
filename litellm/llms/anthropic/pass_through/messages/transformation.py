@@ -7,7 +7,6 @@ from litellm._logging import verbose_logger
 from litellm.anthropic_beta_headers_manager import is_beta_header_supported_by_bundled_config
 from litellm.exceptions import AuthenticationError
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
-from litellm.litellm_core_utils.parameter_compatibility import validate_anthropic_thinking
 from litellm.llms.base_llm.anthropic_messages.transformation import (
     BaseAnthropicMessagesConfig,
 )
@@ -664,8 +663,6 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             model=model,
             **anthropic_messages_optional_request_params,
         )
-        if self._resolved_provider == "anthropic":
-            validate_anthropic_thinking(anthropic_messages_request, model)
         return dict(anthropic_messages_request)
 
     def transform_anthropic_messages_response(
