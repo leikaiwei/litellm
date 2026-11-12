@@ -2,11 +2,11 @@
 
 Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础上打了以下补丁：
 
-2026-11-12 已同步上游稳定版 [v1.109.0](https://github.com/BerriAI/litellm/releases/tag/v1.109.0)，发布源码为 `4972faa706f`，[v1.109.0-fork 镜像构建](https://github.com/leikaiwei/litellm/actions/runs/43062709338)成功。生产核验仍为 `v1.108.0-fork.patch.5`，外部准入插件仍是该次发布版本，本次升级尚未部署
+2026-11-13 已将上游稳定版 [v1.109.0](https://github.com/BerriAI/litellm/releases/tag/v1.109.0) 的 fork 部署到生产，发布源码为 `4972faa706f`，[v1.109.0-fork 镜像构建](https://github.com/leikaiwei/litellm/actions/runs/43062709338)成功。主代理和 usage-api 使用同一固定镜像，外部准入及审核插件已配套更新
 
 Claude 预检查命中输入上限时抛出 `ContextWindowExceededError`，不发送该部署的生成请求，保留既有 fallback。当前生产 `num_retries=0`，全局及模型组重试策略均未设置，因此不会在该模型上重复尝试。若以后显式设置 `BadRequestErrorRetries` 等策略，上游允许它覆盖默认的不重试行为，不能把本插件描述成无条件禁止重试
 
-预检查仍可能低估 CPA 改写后的完整输入。2026-11-11 已决定保留 CPA 的现有改写，并接受部分超长输入漏过预检查的边界，候选的 950,000 上限尚未上线。它只提供余量，不保证所有百万 token 超限都在生成前被识别。身份头对齐代码与生产挂载文件仍有差异，本次发布需明确使用的插件和限额，不能把本地测试通过当作线上已经修复
+预检查仍可能低估 CPA 改写后的完整输入。2026-11-13 已按确认范围将六个 Opus、Sonnet、Haiku 部署的输入上限设为 `950000`，并启用计数与生成身份头对齐，CPA 保持现有改写。Haiku 5.5 的[官方窗口为 100 万](https://platform.claude.com/docs/en/models/haiku-5-5/whats-new-haiku-5-5)，此次同时替换两个部署遗留的 20 万输入上限。其他模型的较小限额和既有禁用状态保持不变。95 万只提供余量，不保证所有百万 token 超限都在生成前被识别
 
 2026-11-06 发布范围调整，撤回 `27e276c5112` 和 `0d923ebc042` 的请求准入及错误路径补丁，保留 1.108.0 升级和此前旧补丁。`v1.108.0-fork.patch.1` 已含准入修改，`v1.108.0-fork.patch.2` 进一步包含错误路径修改，两者均不作为本次上线候选，也不移动既有标签
 
@@ -50,7 +50,7 @@ Claude 预检查命中输入上限时抛出 `ContextWindowExceededError`，不�
 
 **2026-11-09 已部署补丁，Claude 上游计数与加密历史兼容**
 
-2026-11-10 外部插件候选修复让准入计数使用实际生成的出站身份与功能头，避免计数独自透传原始 Claude Code 身份而生成仍使用 LiteLLM 身份。默认 User-Agent 继续由共享 HTTP 客户端提供，显式 headers、extra_headers 与供应商专属身份头保持一致。该修改尚未部署，当时无需重建核心镜像。若要求消除 CPA 输入转换差异，需要配套修复并完成真实验收。2026-11-11 后续决定接受部分漏拦，沿用本文开头说明的边界。下面的客户端身份透传行为记录 patch.5 发布时状态
+2026-11-10 外部插件候选修复让准入计数使用实际生成的出站身份与功能头，避免计数独自透传原始 Claude Code 身份而生成仍使用 LiteLLM 身份。默认 User-Agent 继续由共享 HTTP 客户端提供，显式 headers、extra_headers 与供应商专属身份头保持一致。该修改已于 2026-11-13 随 1.109 升级启用。若要求消除 CPA 输入转换差异，需要配套修复并完成真实验收。2026-11-11 后续决定接受部分漏拦，沿用本文开头说明的边界。下面的客户端身份透传行为记录 patch.5 发布时状态
 
 Opus、Sonnet、Haiku 按实际部署调用现有 Anthropic `count_tokens` 处理器，使用该部署的凭据和输入上限，计数失败不退回本地估算。原生 Messages 与缓存预测共用请求转换，Chat 复用生成路径的参数转换，包含 `additional_drop_params` 和输出预算对 thinking 的影响。保留真实客户端 User-Agent、X-App 和功能 beta，只发送一个 Content-Type，不转发客户端鉴权头，也不伪造客户端身份。无需修改 CPA，现有路由与 fallback 保持原配置
 
@@ -178,7 +178,9 @@ Anthropic 模块按上游移动到 `messages/native` 和 `messages/adapters`，�
 
 108.0 到 109.0 新增 5 份数据库迁移，旧迁移未改，没有 SpendLogs DDL 或数据重写。两个并发索引涉及的既有表在上线前只读核验中均无数据，另有配置 revision trigger、账本和订阅账户新表。仍由启动时正常迁移，不绕过迁移检查
 
-发布镜像固定为 `leikaiwei/litellm@sha256:d533be118fdf405b127ced8c87e3bbe76e57f9c37849a3588a94a90dc63f2ef2`，最终源码的 `make check BASE_REF=v1.109.0` 及相关回归通过。正式镜像的 25 个补丁模块和准入插件哈希与发布源码一致，Pillow、参数删除、结构化输出和加密历史检查通过。禁网容器内使用模拟上游，经实际 HTTP 入口验证三系列正常请求、超限拒绝、计数失败拒绝及跨模型 fallback。默认重试次数设为 3 时，两种拒绝均只计数一次，没有 Claude 生成请求。尚未进行本次生产切换或真实供应商验收
+发布镜像固定为 `leikaiwei/litellm@sha256:d533be118fdf405b127ced8c87e3bbe76e57f9c37849a3588a94a90dc63f2ef2`，最终源码的 `make check BASE_REF=v1.109.0` 及相关回归通过。正式镜像的 25 个补丁模块和准入插件哈希与发布源码一致，Pillow、参数删除、结构化输出和加密历史检查通过。禁网容器内使用模拟上游，经实际 HTTP 入口验证三系列正常请求、超限拒绝、计数失败拒绝及跨模型 fallback。默认重试次数设为 3 时，两种拒绝均只计数一次，没有 Claude 生成请求
+
+2026-11-13 UTC+8 01:47 完成生产切换，探测到约 138 秒不可用。5 项迁移全部成功，readiness healthy、数据库 connected，回调和 guardrail 注册齐全，usage-api 查询正常。六个 Claude 部署在数据库和运行 API 中均为 950,000，运行容器内注入计数的边界检查确认 949,999 放行、950,000 拒绝。模型其他字段、全局配置和无关挂载未变，其余四个基础容器未重启。管理员页面及静态资源通过直连检查，公网健康入口返回 200。旧镜像、插件、限额快照和成对回滚入口已保留，本次未发起付费模型或长历史真实供应商验收
 
 已移除的补丁（保留记录，便于回溯）：
 

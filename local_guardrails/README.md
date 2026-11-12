@@ -60,7 +60,7 @@ guardrails:
 本次备份与回滚脚本在 `/root/litellm/backup-parameter-scope-20261111T084044Z/`
 
 参数拦截不代表上下文计数已经修复。当前生产 CPA 的 count 与 generation 转换仍存在已知差异，
-LiteLLM 外部准入插件的身份头对齐修改也尚未上线。仅更新此名单不能消除 token 低估，亦未验证
+当次未包含 LiteLLM 外部准入插件的身份头对齐修改，该修改后于 11 月 13 日随 1.109 启用。仅更新此名单不能消除 token 低估，亦未验证
 关闭 CPA cloak 或任意降低上限能可靠解决该问题。本次没有修改计数插件、CPA 或上下文上限
 
 验证使用禁网测试与进程内 HTTP 请求，经过真实 `ProxyLogging.pre_call_hook`，断言命中时
@@ -773,7 +773,7 @@ tokenizer 首次加载遵循 LiteLLM 既有配置。若部署要求禁止 Huggin
 
 ### Opus、Sonnet、Haiku 上游计数
 
-2026-11-10 候选插件修正计数与生成的身份差异，尚未部署。计数不再从原始请求的
+2026-11-10 候选插件修正计数与生成的身份差异，已于 2026-11-13 随 1.109 部署。计数不再从原始请求的
 metadata、litellm_metadata 或 proxy_server_request 单独取 User-Agent、X-App 和 beta，
 而是使用实际出站的 headers、extra_headers 和当前供应商匹配的 provider_specific_header。
 没有显式身份头时，计数与生成共用 HTTP 客户端默认 User-Agent，功能 beta 仍按实际输入推导。
@@ -783,7 +783,11 @@ metadata、litellm_metadata 或 proxy_server_request 单独取 User-Agent、X-Ap
 此次发现 CPA 的计数与生成输入转换不一致会漏计历史 thinking，仅改计数身份不能修复旧 CPA。
 若要求消除此类转换差异，需要配套 CPA 的输入转换修复并完成完整历史请求验收。
 2026-11-11 后续运营决策保留 CPA 现有改写，只优化 LiteLLM，并接受部分超长输入漏过预检。
-候选上限 950,000 尚未上线，原有更小上限保留，不能将这项余量描述成完整解决漏计。
+2026-11-13 已将六个 Opus、Sonnet、Haiku 部署的输入上限设为 950,000。Haiku 5.5 的
+[官方窗口已为 100 万](https://platform.claude.com/docs/en/models/haiku-5-5/whats-new-haiku-5-5)，
+此次替换两个部署遗留的 20 万输入上限，其他模型较小限额和既有禁用状态不变。
+运行 API 与数据库读回一致，运行容器内注入计数验证 949,999 放行、950,000 拒绝。
+不能将这项余量描述成完整解决漏计，本次没有付费生成或长历史真实供应商验收。
 原生 Claude Code 的独立计数语义应保持不变，不能靠伪造原生身份或固定倍率宣称精确计数。
 下文客户端身份透传描述属于 2026-11-09 已部署版本的历史记录
 
