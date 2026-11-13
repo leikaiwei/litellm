@@ -2,6 +2,10 @@
 
 Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础上打了以下补丁：
 
+2026-11-14 外部准入插件新增 Claude 按阈值远程复核候选，尚未部署。以本地 `700000` 为触发线，低于触发线维持本地检查，达到触发线时优先复用有效计数，否则调用部署对应的 `count_tokens`。远程计数达到部署输入上限时拒绝，计数失败时不发送该部署的生成请求。现有 `950000` 输入上限和 CPA 改写保持不变
+
+原生 Messages 的完整响应会提供真实输入与输出用量，供同一历史的后续小段文本增量复用。历史、身份或部署改变，新增未知 thinking、图片，以及接近输入上限时重新远程复核。记录按内容摘要隔离并保留五分钟，通过已有 Redis 在 worker 间共享，不保存会话正文或凭据。详细边界与验证见[插件说明](local_guardrails/README.md#request_admission-请求上下文准入)
+
 2026-11-13 已将上游稳定版 [v1.109.0](https://github.com/BerriAI/litellm/releases/tag/v1.109.0) 的 fork 部署到生产，发布源码为 `4972faa706f`，[v1.109.0-fork 镜像构建](https://github.com/leikaiwei/litellm/actions/runs/43062709338)成功。主代理和 usage-api 使用同一固定镜像，外部准入及审核插件已配套更新
 
 Claude 预检查命中输入上限时抛出 `ContextWindowExceededError`，不发送该部署的生成请求，保留既有 fallback。当前生产 `num_retries=0`，全局及模型组重试策略均未设置，因此不会在该模型上重复尝试。若以后显式设置 `BadRequestErrorRetries` 等策略，上游允许它覆盖默认的不重试行为，不能把本插件描述成无条件禁止重试
@@ -45,7 +49,7 @@ Claude 预检查命中输入上限时抛出 `ContextWindowExceededError`，不�
 
 **请求上下文严格准入**：[request_admission callback](local_guardrails/README.md#request_admission-请求上下文准入)
 - 复用候选部署过滤与发送前 hook，不再修改 Router 核心。支持异步 Chat Completions、Messages、Responses，包含直接 deployment ID、fallback 与已有路由自动压缩后的复核。按部署或目录中的 mode 排除明确非 Chat 模型，避免 Router 为转写、重排生成的占位参数误触发准入，未知类型仍严格检查
-- 使用部署已有 `model_info.max_input_tokens`，例如设为 `1000000`，在估算值达到上限时拒绝。计数失败、计数关闭或部署无可用上限均不继续发送，损坏内嵌图片在本地返回字段路径，使用已有 tokenizer 和受限计数线程
+- 使用部署已有 `model_info.max_input_tokens`，例如设为 `1000000`，按上述 Claude 复核策略或其他模型的本地估算判断是否达到上限。计数失败、计数关闭或部署无可用上限均不继续发送，损坏内嵌图片在本地返回字段路径，使用已有 tokenizer 和受限计数线程
 - 严格模式会拒绝无法本地核验的有效历史，包括服务端加密搜索结果和有状态 Responses 引用。它是可选运营策略，不改变上游默认兼容性。计数仍有模型与图片公式差异，阈值余量不能保证供应商绝不报超限。批量大图仍有 CPU 开销
 
 1.108 已含 [#44544](https://github.com/BerriAI/litellm/pull/44544)，上游有意在计数失败时继续其他筛选，并不保证阻止超长输入，因此把严格策略放到外部插件。system/tools 和 Responses 基础计数已有 [#39663](https://github.com/BerriAI/litellm/pull/39663)、[#33706](https://github.com/BerriAI/litellm/pull/33706)，本次复用现有转换。原始超长请求的离线复放可在本地拒绝，没有发出付费调用；生产已按上述限额启用。正式镜像的断网 HTTP 验收确认超长输入与损坏图片均在本地返回 400，生产只读取健康和配置，未发起付费测试

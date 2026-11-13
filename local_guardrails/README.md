@@ -693,14 +693,47 @@ chunk 的用量提上来（`utils.py:2143`），有它就说明字节已经出�
 
 ## request_admission 请求上下文准入
 
-2026-11-13 取消生成前自动追加的 Claude 上游计数。Opus、Sonnet、Haiku 与其他模型统一使用
-现有本地 tokenizer，不再因远程 `count_tokens` 故障拒绝生成或触发 fallback。客户端主动调用
-独立计数端点仍由 LiteLLM 原有接口处理，`parameter-compatibility` 的 `thinking.display`
-限制继续保留。模型输入限额、普通生成及既有 fallback 配置不变
+2026-11-14 候选插件按本地 `700000` tokens 触发 Claude 远程复核，尚未部署。
+2026-11-13 已部署版本取消了逐请求远程计数，生产仍使用该版本。本次只修改外部插件，
+已有部署输入限额、CPA 改写和 fallback 配置不变，不需要构建核心镜像
 
-本地估算达到部署的 `max_input_tokens` 时仍拦截，已配置的 950,000 上限不变。
-本地 tokenizer、隐藏 thinking 及 CPA 改写与上游实际计数可能有偏差，这项检查不保证所有
-真实超限输入都能提前拦截。上游仍负责最终上下文校验
+Claude Opus、Sonnet、Haiku 的本地估算低于 700000 时继续本地检查。达到触发线时先查有效
+计数记录，没有可复用的记录才调用该部署的 `count_tokens`，以远程返回值判断是否达到
+`model_info.max_input_tokens`。例如现有上限为 950000，远程返回 950000 即拒绝生成。
+本地即使已超过 950000 也会先远程复核，避免把本地高估当成最终拒绝依据。
+远程计数失败时不使用本地低估值继续发送，保留既有错误与 fallback 处理
+
+同一内容的远程计数保留五分钟。复用范围同时核对调用方、部署、上游模型、认证及出站身份，
+再核对 system、tools、上下文选项和完整消息前缀，不依赖客户端声明的会话 ID 或 call ID。
+记录只含摘要、token 数、消息数和过期时间，不保存正文、图片、thinking 签名或原始凭据。
+插件复用代理已有 coordination Redis 共享已完成的计数，不依赖是否开启认证结果的 Redis
+缓存，没有 Redis 时只在当前 worker 内复用。插件不创建或关闭共享连接。
+同一 worker 的并发相同请求合并计数，跨 worker 同时冷启动仍可能各计数一次
+
+原生 Messages 的完整成功响应可更新历史基准，用现有标准 usage 中的完整输入加输出作为
+已知前缀用量。输入已包含 cache read 与 cache creation，不能再次相加；输出包含真实推理
+用量，不能只数展示出来的 thinking 文本。普通响应读取实际返回的内容，流式使用现有适配器
+还原内容，并要求流已经完整结束。未结束的流、缺用量、缓存响应、服务端多轮工具，以及要求
+压缩或清理上下文的请求不能提供这类基准。保留全部 thinking 的
+`clear_thinking_20251015/keep=all` 可复用。普通响应若报告实际清理则跳过基准，
+`applied_edits=[]` 表示没有执行清理。现有流式适配器不保留响应的 `applied_edits`，因此流式
+只能核对请求的清理设置，无法额外检测 CPA 自行加入的清理，这仍是增量估算的边界
+
+后续历史严格匹配，且新增内容仅为 user 文本或纯文本 tool result 时，可用该基准加本地增量。
+增量按本次历史的真实与本地计数比例校准，比例至少为 1。新增本地计数超过 20000，或估算值
+距离输入上限不足 50000 时，重新远程复核。普通和流式 Messages 的每次完整响应都能刷新
+基准，因此无须在首次计数后每轮必然再 count。Chat 和 Responses 桥接可复用相同请求的计数，
+目前不从它们的响应建立新的 assistant 前缀基准。新图片、未知 thinking、历史改写、工具或
+系统提示改变均重新核验，不把密文长度当作 token 数
+
+已知完整失败样本的本地估算为 840688，上游报告输入 1273454，因此没有把触发线提高至
+800000。700000 以下仍是本地估算，增量复用也保留误差，CPA 的计数与生成转换仍可能不同。
+950000 只提供余量，不保证所有真实超限输入都能提前拦截，上游仍负责最终上下文校验。
+本次核对的 [CPA v8.0.69 原生 Claude 计数路径](https://github.com/router-for-me/CLIProxyAPI/blob/v8.0.69/internal/runtime/executor/claude_executor_tokens.go)
+继续调用 Anthropic 的计数接口，并非 CPA 本地 tokenizer
+
+客户端主动调用的独立计数端点仍由 LiteLLM 原有接口处理，`parameter-compatibility` 的
+`thinking.display` 限制继续保留。非 Claude 模型仍只使用原有本地 tokenizer 检查
 
 `request_admission.py` 使用现有 `CustomLogger` 扩展点，不修改 Router 源码。它在异步候选部署
 筛选时检查输入长度，并在选定部署、向上游发送之前再次检查，覆盖直接指定 deployment ID 和
@@ -715,8 +748,8 @@ Rerank、音频转写和 evaluation，避免 Router 内部占位消息误触发�
 输入上限优先使用部署已有 `model_info.max_input_tokens`，未声明时查现有模型目录。没有可解析
 正数上限的自定义模型被排除，所有候选都缺上限时返回配置错误，首次启用前应补齐该字段。
 唯一例外是内部固定响应 provider `claude_code_review_allow/allow`，不按价格为零豁免普通模型。
-等于或超过上限的
-候选部署被排除；全部候选超限时返回 `ContextWindowExceededError`，保留已有
+非 Claude 或低于远程触发线的候选，在本地估算等于或超过上限时被排除。需要远程复核的
+Claude 候选保留到选定部署后检查；全部候选超限时返回 `ContextWindowExceededError`，保留已有
 `context_window_fallbacks`。例如希望在 100 万处拒绝，可把相应部署的
 `model_info.max_input_tokens` 设为 `1000000`，不需要改变供应商模型目录
 
@@ -776,10 +809,10 @@ tokenizer 首次加载遵循 LiteLLM 既有配置。若部署要求禁止 Huggin
 Claude 的非空 `container` 隐藏上下文仍无法本地核验，继续拒绝。Claude Chat 的非空
 `extra_body` 也继续拒绝，应使用原生 Messages 或顶层参数，避免无法读取的输入绕过本地检查
 
-### Opus、Sonnet、Haiku 上游计数历史，已停用
+### Opus、Sonnet、Haiku 逐请求上游计数历史
 
-本节保留此前远程计数的调查与上线记录。2026-11-13 已移除这条生成前远程调用路径，以下
-计数失败拒绝、身份头转换和强制 Chat 桥接的描述均为历史行为，不代表当前插件
+本节保留此前远程计数的调查与上线记录。2026-11-13 移除了逐请求远程调用路径，
+2026-11-14 候选改为本节开头描述的按阈值与历史记录复核。以下内容记录当时行为
 
 2026-11-10 候选插件修正计数与生成的身份差异，已于 2026-11-13 随 1.109 部署。计数不再从原始请求的
 metadata、litellm_metadata 或 proxy_server_request 单独取 User-Agent、X-App 和 beta，
@@ -933,9 +966,36 @@ LITELLM_LOCAL_MODEL_COST_MAP=True .venv/bin/python -m pytest local_guardrails/te
 
 测试禁止 TCP，覆盖三协议图片、上下文边界、system/tools 计数、合法服务端工具历史、本地计数失败、
 模型候选过滤、直接 deployment ID、上下文 fallback，以及已有自动压缩后发送的真实 Router
-流程。Claude 回归覆盖三个系列及 Messages、Chat、Responses，验证计数端点不可用时生成仍
-成功且只发出生成请求，本地边界仍在候选筛选与最终部署两处生效。模拟 provider 验证被拒请求
-没有到达后端，不代表真实供应商精确计数已经通过验收
+流程。Claude 回归覆盖三个系列及 Messages、Chat、Responses，验证低于 700000 时不调用计数，
+达到触发线时以远程值为准，计数失败或超限不发送生成。普通和流式 Messages 的连续三轮
+签名 thinking 历史验证计数复用，缓存读写输入与输出均纳入后续基准，接近上限时重新计数。
+模拟 provider 验证被拒请求没有到达后端，不代表真实供应商精确计数已经通过验收
+
+2026-11-14 在生产相同的 1.109 fork 镜像中完成独立 HTTP 前后对照，使用两个真实 worker 和
+专用带认证 Redis。两个阶段仅替换外部插件，模型配置和合成输入保持一致，后端是隔离网络内的
+模拟 Anthropic 服务，没有向 CPA 或模型供应商发送请求，也没有改动生产服务
+
+| 实际 HTTP 用例 | 旧插件 | 新插件 |
+| --- | --- | --- |
+| 小请求 | 计数 0 次，生成成功 | 计数 0 次，生成成功 |
+| 本地 710016，模拟远程 1273454 | 计数 0 次，生成 1 次 | 计数 1 次，生成 0 次，HTTP 400 |
+| 普通 Messages 连续三轮 | 计数 0 次，生成 3 次 | 计数 1 次，生成 3 次 |
+| 流式 Messages 连续三轮 | 计数 0 次，生成 3 次 | 计数 1 次，生成 3 次 |
+| 大请求遇到计数 503 | 计数 0 次，生成 1 次 | 计数 1 次，生成 0 次，HTTP 400 |
+| 预热后六次相同请求，两个 worker 均服务 | 计数 0 次，生成 6 次 | 计数 1 次，生成 6 次 |
+
+合成输入的 710016 使用实际本地 tokenizer 计算，没有替换触发线。三轮响应包含签名 thinking
+和缓存读写用量，第二轮起重放实际响应内容。初轮跨 worker 验收发现认证缓存没有连接 Redis，
+插件已改为复用已有 coordination Redis 后通过，未开启认证缓存或新建连接。
+请求开始时的远程记录过期不妨碍长时间生成后的完整新用量刷新基准，记录有效期从计数或响应
+成功时计算。未完成流、普通响应实际清理上下文、过期记录及大增量另有禁网回归
+
+完整失败样本也已离线重放，本地仍为 840688，达到 700000 后进入远程复核分支。
+将历史生成错误中的 1273454 注入为远程结果时会拒绝。这只证明触发与拒绝逻辑，
+不是重新调用真实 `count_tokens` 得到该值，不能据此承诺 CPA 对这份历史会返回相同计数
+
+最终 `local_guardrails/` 的 695 项测试通过，修改文件的 Ruff 与 Basedpyright 检查通过。
+`make check` 对外部插件目录没有匹配的检查，不能把其空运行当作 lint 验证，上述检查均单独执行
 
 ## claude_code_review: Claude Code 两种审核模式
 
