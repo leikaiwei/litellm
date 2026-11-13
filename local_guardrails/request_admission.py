@@ -1,8 +1,6 @@
-import asyncio
 import base64
 import binascii
-import copy
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Final, cast
@@ -10,51 +8,27 @@ from typing import Final, cast
 from openai.types.responses.response_create_params import ResponseInputParam
 from opentelemetry.trace import Span
 from PIL import Image
-from pydantic import JsonValue, TypeAdapter
+from pydantic import TypeAdapter
 
 import litellm
-from litellm.constants import DEFAULT_CHAT_COMPLETION_PARAM_VALUES, MAX_IMAGE_URL_DOWNLOAD_SIZE_MB
+from litellm.constants import MAX_IMAGE_URL_DOWNLOAD_SIZE_MB
 from litellm.exceptions import MalformedRequestFieldError
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
-from litellm.litellm_core_utils.get_provider_specific_headers import ProviderSpecificHeaderUtils
 from litellm.litellm_core_utils.token_counter import (
     calculate_img_tokens,
     high_detail_image_token_upper_bound,
     offload_token_count,
     token_counter,  # pyright: ignore[reportUnknownVariableType]  # 上游 custom_tokenizer 包含裸 dict
 )
-from litellm.llms.anthropic.chat.transformation import AnthropicConfig
-from litellm.llms.anthropic.common_utils import AnthropicModelInfo, merge_anthropic_beta_headers
-from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
-from litellm.llms.anthropic.count_tokens.transformation import COUNT_TOKEN_OPTION_NAMES
-from litellm.llms.anthropic.messages.native.transformation import (
-    AnthropicMessagesConfig,
-    messages_carry_output_config,
-)
-from litellm.llms.anthropic.messages.native.utils import (
-    anthropic_system_to_openai_message,
-    prepare_native_request_body,
-)
+from litellm.llms.anthropic.messages.native.utils import anthropic_system_to_openai_message
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig as ResponsesConfig,
 )
 from litellm.router_strategy.complexity_router.context_compaction import compaction_pending
-from litellm.types.llms.anthropic import ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
-from litellm.types.utils import CallTypes, ProviderSpecificHeader
-from litellm.utils import (
-    get_optional_params,  # pyright: ignore[reportUnknownVariableType]  # 上游参数转换器仍包含裸类型
-)
+from litellm.types.utils import CallTypes
 
 _OBJECT: Final = TypeAdapter(dict[str, object])
-_JSON_OBJECT: Final = TypeAdapter(dict[str, JsonValue])
-_JSON_MESSAGES: Final = TypeAdapter(list[dict[str, JsonValue]])
-_OPTIONAL_STRING: Final = TypeAdapter[str | None](str | None)
-_HEADERS: Final = TypeAdapter(dict[str, str])
-_PROVIDER_HEADERS: Final[TypeAdapter[ProviderSpecificHeader | tuple[ProviderSpecificHeader, ...] | None]] = TypeAdapter(
-    ProviderSpecificHeader | tuple[ProviderSpecificHeader, ...] | None
-)
 _ITEMS: Final = TypeAdapter(tuple[object, ...])
 _MESSAGES: Final = TypeAdapter(tuple[dict[str, object], ...])
 _TOOL_CHOICE: Final = TypeAdapter[str | dict[str, object] | None](str | dict[str, object] | None)
@@ -334,128 +308,8 @@ def _raise_context(model: str, counts: Sequence[tuple[Candidate, int]]) -> None:
     )
 
 
-def _is_counted_claude(model: str) -> bool:
+def _is_claude(model: str) -> bool:
     return model.removeprefix("anthropic/").startswith(("claude-opus-", "claude-sonnet-", "claude-haiku-"))
-
-
-def _claude_body(data: Mapping[str, object], model: str, call_type: CallTypes) -> dict[str, JsonValue]:
-    if call_type in (CallTypes.anthropic_messages, CallTypes.aanthropic_messages):
-        return _JSON_OBJECT.validate_python(
-            prepare_native_request_body(data, model, headers=_generation_count_headers(data, call_type))
-        )
-    config: Final = AnthropicConfig()
-    keys: Final = frozenset(DEFAULT_CHAT_COMPLETION_PARAM_VALUES) | frozenset(COUNT_TOKEN_OPTION_NAMES)
-    request_options: Final = {
-        key: copy.deepcopy(value)
-        for key, value in data.items()
-        if key in keys and key not in ("model", "custom_llm_provider", "messages", "metadata")
-    }
-    options: Final = _JSON_OBJECT.validate_python(
-        get_optional_params(
-            model=model,
-            custom_llm_provider="anthropic",
-            **request_options,  # pyright: ignore[reportArgumentType]  # 共享参数转换器负责校验输入，出口验证类型
-        )
-    )
-    return _JSON_OBJECT.validate_python(
-        config.transform_request(  # pyright: ignore[reportUnknownMemberType]  # 上游转换器仍返回裸 dict，出口验证类型
-            model=model,
-            messages=cast(  # cast-ok: 共享消息转换器返回 Chat 形状，供应商转换器继续校验
-                list[AllMessageValues], copy.deepcopy(list(_messages(data)))
-            ),
-            optional_params=options,
-            litellm_params={
-                **data,
-                **{
-                    key: copy.deepcopy(data[key])
-                    for key in ("metadata", "litellm_metadata", "model_info")
-                    if key in data
-                },
-            },
-            headers={},
-        )
-    )
-
-
-def _generation_count_headers(data: Mapping[str, object], call_type: CallTypes) -> dict[str, str]:
-    scoped: Final = ProviderSpecificHeaderUtils.get_provider_specific_headers(
-        _PROVIDER_HEADERS.validate_python(data.get("provider_specific_header")),
-        "anthropic",
-        native_anthropic_messages=call_type in (CallTypes.anthropic_messages, CallTypes.aanthropic_messages),
-    )
-    outgoing: Final = {**_mapping(data.get("headers")), **_mapping(data.get("extra_headers")), **scoped}
-    return {
-        **{
-            key: value
-            for key, value in outgoing.items()
-            if key.lower() in ("user-agent", "x-app") and isinstance(value, str)
-        },
-        "anthropic-beta": merge_anthropic_beta_headers(
-            None,
-            tuple(
-                value for key, value in outgoing.items() if key.lower() == "anthropic-beta" and isinstance(value, str)
-            ),
-        ),
-    }
-
-
-async def _count_claude(data: Mapping[str, object], call_type: CallTypes) -> int:
-    credential_name: Final = data.get("litellm_credential_name")
-    credentials: Final = (
-        CredentialAccessor.get_credential_values(credential_name) if isinstance(credential_name, str) else {}
-    )
-    params: Final = {**credentials, **data}
-    model: Final = str(params.get("model", "")).removeprefix("anthropic/")
-    provider: Final = params.get("custom_llm_provider")
-    if provider not in (None, "anthropic") or not _is_counted_claude(model):
-        raise ValueError("Claude 部署不是可核验的 Anthropic 上游")
-    base: Final = _OPTIONAL_STRING.validate_python(params.get("api_base"))
-    async with asyncio.timeout(30):
-        auth: Final = await AnthropicModelInfo.aget_auth_header(
-            api_key=_OPTIONAL_STRING.validate_python(params.get("api_key")) or litellm.anthropic_key or litellm.api_key,
-            api_base=base,
-            litellm_params=params,
-            allow_workload_identity=True,
-        )
-        if auth is None:
-            raise ValueError("Claude 上游计数缺少凭据")
-        body: Final = await offload_token_count(_claude_body)(params, model, call_type)
-        generation_headers: Final = _generation_count_headers(params, call_type)
-        messages: Final = _JSON_MESSAGES.validate_python(body.get("messages"))
-        per_turn_betas: Final = (
-            (ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER,)
-            if messages_carry_output_config(messages)
-            else ()
-        )
-        config: Final = AnthropicMessagesConfig()
-        count_headers: Final = _HEADERS.validate_python(
-            config.finalize_messages_headers(  # pyright: ignore[reportUnknownMemberType]  # 复用功能头
-                headers={
-                    **{key: value for key, value in generation_headers.items() if key != "anthropic-beta"},
-                    **auth,
-                    "anthropic-beta": merge_anthropic_beta_headers(
-                        auth.get("anthropic-beta"),
-                        (generation_headers.get("anthropic-beta", ""), *per_turn_betas),
-                    ),
-                },
-                optional_params=body,
-                messages=list[object](messages),
-            )
-        )
-        response: Final = await AnthropicCountTokensHandler().handle_count_tokens_request(
-            model=model,
-            messages=messages,
-            auth_header={key: value for key, value in count_headers.items() if key.lower() != "content-type"},
-            api_base=base,
-            timeout=30,
-            tools=_JSON_MESSAGES.validate_python(body["tools"]) if body.get("tools") is not None else None,
-            system=body.get("system"),
-            optional_params={key: body[key] for key in COUNT_TOKEN_OPTION_NAMES if key in body},
-        )
-    count: Final = response.get("input_tokens")
-    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
-        raise ValueError("Claude 上游未返回有效 input_tokens")
-    return count
 
 
 def _admit(
@@ -473,9 +327,7 @@ def _admit(
         )
     if pending_compaction:
         return [candidate.deployment for candidate in bounded]
-    models: Final = frozenset(
-        candidate.model for candidate in bounded if candidate.limit is not None and not _is_counted_claude(candidate.model)
-    )
+    models: Final = frozenset(candidate.model for candidate in bounded if candidate.limit is not None)
     counts: Final = {counted_model: _count(data, counted_model) for counted_model in models}
     for count in counts.values():
         if isinstance(count, AdmissionProblem):
@@ -485,7 +337,6 @@ def _admit(
         candidate.deployment
         for candidate in bounded
         if candidate.local_response
-        or _is_counted_claude(candidate.model)
         or (candidate.limit is not None and cast(int, counts[candidate.model]) < candidate.limit)
     ]
     if candidates and not allowed:
@@ -494,10 +345,6 @@ def _admit(
 
 
 class RequestAdmission(CustomLogger):
-    def __init__(self, claude_counter: Callable[[Mapping[str, object], CallTypes], Awaitable[int]] = _count_claude) -> None:
-        super().__init__()  # pyright: ignore[reportUnknownMemberType]  # 上游 callback 构造器的 kwargs 尚未注解
-        self._claude_counter = claude_counter
-
     async def async_filter_deployments(
         self,
         model: str,
@@ -525,52 +372,19 @@ class RequestAdmission(CustomLogger):
         deployment: Final = {"litellm_params": kwargs, "model_info": kwargs.get("model_info")}
         candidate: Final = _candidate(deployment)
         await offload_token_count(_admit)(kwargs, (candidate,), model if isinstance(model, str) else "")
-        if not _is_counted_claude(candidate.model):
+        if not _is_claude(candidate.model):
             return None
         if kwargs.get("container") or _mapping(kwargs.get("extra_body")).get("container"):
             _raise_invalid(
-                AdmissionProblem("container", "Claude 上游计数不支持 container，无法核验隐藏上下文", False),
+                AdmissionProblem("container", "Claude container 的隐藏上下文无法本地核验", False),
                 candidate.model,
             )
         if call_type in (CallTypes.completion, CallTypes.acompletion) and kwargs.get("extra_body"):
             _raise_invalid(
-                AdmissionProblem("extra_body", "Claude Chat 无法核验 extra_body，请使用 Messages 或顶层参数", False),
-                candidate.model,
-            )
-        problem: Final = (
-            _responses_problem(kwargs) if call_type in (CallTypes.responses, CallTypes.aresponses) else None
-        )
-        if problem is not None:
-            _raise_invalid(problem, candidate.model)
-        if call_type in (CallTypes.responses, CallTypes.aresponses):
-            endpoints: Final = _mapping(kwargs.get("model_info")).get("supported_endpoints")
-            native: Final = isinstance(endpoints, (list, tuple)) and "/v1/responses" in endpoints
-            if (
-                kwargs.get("custom_llm_provider") not in (None, "anthropic")
-                or not isinstance(model, str)
-                or not _is_counted_claude(model)
-                or (native and kwargs.get("use_chat_completions_api") is not True)
-            ):
-                _raise_invalid(
-                    AdmissionProblem("input", "Claude 原生 Responses 无法核验，请使用 Messages 或 Chat 桥接", False),
-                    candidate.model,
-                )
-            return None
-        try:
-            count: Final = await self._claude_counter(kwargs, call_type)
-        except Exception as error:
-            _raise_invalid(
                 AdmissionProblem(
-                    "count_tokens", f"Claude 上游计数失败（{type(error).__name__}），请求未发送，请稍后重试", False
+                    "extra_body", "Claude Chat 无法本地核验 extra_body，请使用 Messages 或顶层参数", False
                 ),
                 candidate.model,
-            )
-            return None
-        if candidate.limit is not None and count >= candidate.limit:
-            raise litellm.ContextWindowExceededError(
-                message=f"Claude 上游计数 {count} tokens，达到输入上限 {candidate.limit}。请先 /compact 或开启新会话",
-                model=candidate.model,
-                llm_provider="anthropic",
             )
         return None
 

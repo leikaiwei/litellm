@@ -693,12 +693,14 @@ chunk 的用量提上来（`utils.py:2143`），有它就说明字节已经出�
 
 ## request_admission 请求上下文准入
 
-1.109 升级适配沿用外部插件和发送前检查，改用上游 `messages/native` 公共路径及
-`finalize_messages_headers`。计数与缓存预测共用原生请求转换，在转换正文前推导功能头，
-并复用部署的 reasoning effort 映射，避免功能字段在计数时被误删。空 `context_management`
-沿用上游计数规范化，Responses 压缩历史使用上游共享的编码与转换。超限及计数失败在普通
-重试配置下直接报错或进入已有 fallback；显式 `BadRequestErrorRetries` 或 `DefaultRetries`
-仍遵循上游优先级，可以覆盖这一行为
+2026-11-13 取消生成前自动追加的 Claude 上游计数。Opus、Sonnet、Haiku 与其他模型统一使用
+现有本地 tokenizer，不再因远程 `count_tokens` 故障拒绝生成或触发 fallback。客户端主动调用
+独立计数端点仍由 LiteLLM 原有接口处理，`parameter-compatibility` 的 `thinking.display`
+限制继续保留。模型输入限额、普通生成及既有 fallback 配置不变
+
+本地估算达到部署的 `max_input_tokens` 时仍拦截，已配置的 950,000 上限不变。
+本地 tokenizer、隐藏 thinking 及 CPA 改写与上游实际计数可能有偏差，这项检查不保证所有
+真实超限输入都能提前拦截。上游仍负责最终上下文校验
 
 `request_admission.py` 使用现有 `CustomLogger` 扩展点，不修改 Router 源码。它在异步候选部署
 筛选时检查输入长度，并在选定部署、向上游发送之前再次检查，覆盖直接指定 deployment ID 和
@@ -722,7 +724,7 @@ Rerank、音频转写和 evaluation，避免 Router 内部占位消息误触发�
 `1000000`，当前 DeepSeek V4.1 Flash 同源部署为 `970000`，保留其他已有较小上限。
 两个暂不使用的本地 LM Studio 模型保持原配置，未按未经核验的记忆值补写容量
 
-未启用下述 Claude 上游计数的部署复用 LiteLLM 的 tokenizer、Anthropic system 提取和 Responses 输入转换，包含 system、
+所有部署复用 LiteLLM 的 tokenizer、Anthropic system 提取和 Responses 输入转换，包含 system、
 instructions、工具定义和工具历史，不重命名工具，不修改用户消息。计数失败或全局计数关闭时，
 返回明确的本地无法核验提示，建议 `/compact` 或开启新会话，不再把未知长度的请求继续发给
 上游。Responses 的正常加密推理和加密压缩历史除外，这类内容按下述规则保留并交由上游校验
@@ -753,8 +755,8 @@ Responses 的 `previous_response_id`、`conversation`、`item_reference`，以�
 保守输入上限只能留出余量，不能证明上游绝不会报超限
 
 2026-11-09 加密历史兼容修复已随 patch.5 与 Claude 计数修复一同部署。
-该修复只更新外部准入插件，不额外修改 LiteLLM 核心或 CPA。Opus 仍使用上游计数，计数失败
-仍拒绝请求，不因本项兼容修复退回本地估算
+该修复只更新外部准入插件，不额外修改 LiteLLM 核心或 CPA。当时 Opus 仍使用上游计数，计数失败
+仍拒绝请求。2026-11-13 已按上述说明改为本地估算
 
 本机隔离代理重放同一份失败请求，普通和流式调用真实上游均返回 HTTP 200，实际模型均为
 `gpt-6.1-terra`。普通响应输入 26065 tokens，输出限制 32 tokens；流式收到 `message_stop`
@@ -771,7 +773,13 @@ tokenizer 首次加载遵循 LiteLLM 既有配置。若部署要求禁止 Huggin
 `litellm_settings.disable_hf_tokenizer_download: true`，但这会让相关模型回落到通用 tokenizer，
 需要接受估算精度变化。本插件不临时改动进程级 tokenizer 开关，也不发起模型生成请求
 
-### Opus、Sonnet、Haiku 上游计数
+Claude 的非空 `container` 隐藏上下文仍无法本地核验，继续拒绝。Claude Chat 的非空
+`extra_body` 也继续拒绝，应使用原生 Messages 或顶层参数，避免无法读取的输入绕过本地检查
+
+### Opus、Sonnet、Haiku 上游计数历史，已停用
+
+本节保留此前远程计数的调查与上线记录。2026-11-13 已移除这条生成前远程调用路径，以下
+计数失败拒绝、身份头转换和强制 Chat 桥接的描述均为历史行为，不代表当前插件
 
 2026-11-10 候选插件修正计数与生成的身份差异，已于 2026-11-13 随 1.109 部署。计数不再从原始请求的
 metadata、litellm_metadata 或 proxy_server_request 单独取 User-Agent、X-App 和 beta，
@@ -923,9 +931,11 @@ litellm_settings:
 LITELLM_LOCAL_MODEL_COST_MAP=True .venv/bin/python -m pytest local_guardrails/test_request_admission.py -q
 ```
 
-测试禁止 TCP，覆盖三协议图片、上下文边界、system/tools 计数、合法服务端工具历史、计数失败、
+测试禁止 TCP，覆盖三协议图片、上下文边界、system/tools 计数、合法服务端工具历史、本地计数失败、
 模型候选过滤、直接 deployment ID、上下文 fallback，以及已有自动压缩后发送的真实 Router
-流程。模拟 provider 验证被拒请求没有到达后端，不代表真实供应商精确计数已经通过验收
+流程。Claude 回归覆盖三个系列及 Messages、Chat、Responses，验证计数端点不可用时生成仍
+成功且只发出生成请求，本地边界仍在候选筛选与最终部署两处生效。模拟 provider 验证被拒请求
+没有到达后端，不代表真实供应商精确计数已经通过验收
 
 ## claude_code_review: Claude Code 两种审核模式
 

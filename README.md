@@ -6,7 +6,11 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 Claude 预检查命中输入上限时抛出 `ContextWindowExceededError`，不发送该部署的生成请求，保留既有 fallback。当前生产 `num_retries=0`，全局及模型组重试策略均未设置，因此不会在该模型上重复尝试。若以后显式设置 `BadRequestErrorRetries` 等策略，上游允许它覆盖默认的不重试行为，不能把本插件描述成无条件禁止重试
 
-预检查仍可能低估 CPA 改写后的完整输入。2026-11-13 已按确认范围将六个 Opus、Sonnet、Haiku 部署的输入上限设为 `950000`，并启用计数与生成身份头对齐，CPA 保持现有改写。Haiku 5.5 的[官方窗口为 100 万](https://platform.claude.com/docs/en/models/haiku-5-5/whats-new-haiku-5-5)，此次同时替换两个部署遗留的 20 万输入上限。其他模型的较小限额和既有禁用状态保持不变。95 万只提供余量，不保证所有百万 token 超限都在生成前被识别
+2026-11-13 取消外部准入插件在每次 Claude 生成前追加的远程 `count_tokens`，Opus、Sonnet、Haiku 统一复用现有本地 tokenizer 检查输入长度。客户端主动调用的计数端点和 `thinking.display=updates` 参数限制保留，已有部署输入上限及路由不变。该改动只更新外部插件，不需要重建镜像
+
+生产插件已替换并重启验证。隔离代理的真实普通、流式请求均确认自动计数为零，计数端点模拟 503 时生成仍成功。上线后普通和流式请求均返回 200，`thinking.display=updates` 仍返回 400
+
+本地预检查仍可能低估 CPA 改写后的完整输入。同日凌晨上线时已将六个 Opus、Sonnet、Haiku 部署的输入上限设为 `950000`，CPA 保持现有改写。Haiku 5.5 的[官方窗口为 100 万](https://platform.claude.com/docs/en/models/haiku-5-5/whats-new-haiku-5-5)，当时同时替换两个部署遗留的 20 万输入上限。95 万只提供余量，不保证所有百万 token 超限都在生成前被识别
 
 2026-11-06 发布范围调整，撤回 `27e276c5112` 和 `0d923ebc042` 的请求准入及错误路径补丁，保留 1.108.0 升级和此前旧补丁。`v1.108.0-fork.patch.1` 已含准入修改，`v1.108.0-fork.patch.2` 进一步包含错误路径修改，两者均不作为本次上线候选，也不移动既有标签
 
@@ -49,6 +53,8 @@ Claude 预检查命中输入上限时抛出 `ContextWindowExceededError`，不�
 历史工具名跨供应商不兼容暂不做全局重命名。[#47434](https://github.com/BerriAI/litellm/pull/47434) 和 [#42963](https://github.com/BerriAI/litellm/pull/42963) 分别涉及 guardrail 恢复和 Bedrock 长度，未确认覆盖此次同一问题。修改名称还需保证声明、调用和结果关联，以及不同目的供应商往返一致，不能用某一供应商的修复宣称通用兼容
 
 **2026-11-09 已部署补丁，Claude 上游计数与加密历史兼容**
+
+以下远程计数行为为历史记录，2026-11-13 已取消生成前自动计数，当前行为见本文开头和[插件说明](local_guardrails/README.md#request_admission-请求上下文准入)
 
 2026-11-10 外部插件候选修复让准入计数使用实际生成的出站身份与功能头，避免计数独自透传原始 Claude Code 身份而生成仍使用 LiteLLM 身份。默认 User-Agent 继续由共享 HTTP 客户端提供，显式 headers、extra_headers 与供应商专属身份头保持一致。该修改已于 2026-11-13 随 1.109 升级启用。若要求消除 CPA 输入转换差异，需要配套修复并完成真实验收。2026-11-11 后续决定接受部分漏拦，沿用本文开头说明的边界。下面的客户端身份透传行为记录 patch.5 发布时状态
 
