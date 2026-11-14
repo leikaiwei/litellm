@@ -2,7 +2,7 @@ import asyncio
 import base64
 import copy
 import json
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping
 from io import BytesIO
 from time import time
 from types import SimpleNamespace
@@ -34,6 +34,7 @@ from litellm.llms.custom_llm import CustomLLM
 from litellm.proxy.common_utils import config_sync_pubsub
 from litellm.responses.litellm_completion_transformation.compaction_items import summary_only_compaction_content
 from litellm.router_strategy.complexity_router.context_compaction import compaction_executor
+from litellm.types.llms.anthropic import ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.proxy.auth.user_api_key_auth import UserAPIKeyAuth
 from litellm.types.utils import CallTypes, Choices
@@ -836,11 +837,33 @@ async def test_real_router_claude_generates_without_remote_counting(
 async def test_claude_local_admission_preserves_generation_request(
     monkeypatch: pytest.MonkeyPatch, model: str, route: str
 ) -> None:
-    transport: Final = ClaudeTransport()
-    client: Final = _install_claude_transport(monkeypatch, transport)
+    transport: Final = HybridTransport(remote_tokens=75)
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        response: Final = transport(request)
+        if request.url.path != "/v1/messages/count_tokens":
+            return response
+        body: Final = TypeAdapter(dict[str, object]).validate_json(request.content)
+        messages: Final = TypeAdapter(list[dict[str, object]]).validate_python(body["messages"])
+        beta: Final = request.headers["anthropic-beta"] if "anthropic-beta" in request.headers else ""
+        betas: Final = frozenset(beta.split(","))
+        if (
+            any("output_config" in message for message in messages)
+            and ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER not in betas
+        ):
+            return httpx.Response(
+                400, json={"error": {"type": "invalid_request_error", "message": "缺少逐轮配置 beta"}}
+            )
+        return response
+
+    client: Final = _install_hybrid_transport(monkeypatch, upstream)
     router: Final = litellm.Router(model_list=[_claude_deployment(limit=10000, model=model)], num_retries=0)
     schema: Final = {"type": "object", "properties": {"query": {"type": "string"}}}
-    headers: Final = {"user-agent": "configured-inference/1.0", "x-app": "configured-inference"}
+    headers: Final = {
+        "user-agent": "configured-inference/1.0",
+        "x-app": "configured-inference",
+        "anthropic-beta": "fixture-original-beta",
+    }
 
     async def request() -> None:
         if route == "messages":
@@ -893,10 +916,27 @@ async def test_claude_local_admission_preserves_generation_request(
         await request()
         monkeypatch.setattr(litellm, "callbacks", [RequestAdmission()])
         await request()
-        assert tuple(request.url.path for request in transport.requests) == ("/v1/messages", "/v1/messages")
-        baseline, admitted = transport.requests
+        generation: Final = tuple(request for request in transport.requests if request.url.path == "/v1/messages")
+        assert len(generation) == 2
+        assert sum(request.url.path == "/v1/messages/count_tokens" for request in transport.requests) == int(
+            route == "messages"
+        )
+        baseline, admitted = generation
         assert admitted.headers == baseline.headers
         assert admitted.content == baseline.content
+        if route == "messages":
+            counted: Final = next(
+                request for request in transport.requests if request.url.path.endswith("count_tokens")
+            )
+            count_body: Final = TypeAdapter(dict[str, object]).validate_json(counted.content)
+            generation_body: Final = TypeAdapter(dict[str, object]).validate_json(admitted.content)
+            assert count_body["messages"] == generation_body["messages"]
+            assert count_body["output_config"] == generation_body["output_config"]
+            count_messages: Final = TypeAdapter(list[dict[str, object]]).validate_python(count_body["messages"])
+            assert tuple(message["output_config"] for message in count_messages if "output_config" in message) == (
+                {"effort": "high"},
+            )
+            assert "fixture-original-beta" in counted.headers["anthropic-beta"].split(",")
     finally:
         router.reset()
         await client.client.aclose()
@@ -923,6 +963,35 @@ async def test_claude_local_boundary_checks_candidates_and_selected_deployment(m
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefixed", (False, True))
+@pytest.mark.parametrize("headroom", (0, 1))
+async def test_claude_provider_prefix_preserves_local_context_boundary(prefixed: bool, headroom: int) -> None:
+    messages: Final = _messages(
+        '{"request_id":"lookup-context","enabled":true,"parameters":{"query":"hello world","limit":100}}\n' * 20
+    )
+    count: Final = litellm.token_counter(  # pyright: ignore[reportUnknownMemberType]  # 上游计数器仍有未注解参数
+        model=_OPUS, messages=messages
+    )
+    model: Final = f"anthropic/{_OPUS}" if prefixed else _OPUS
+    info: Final = {"id": "prefix-boundary-fixture", "max_input_tokens": count + headroom}
+    deployment: Final[dict[str, object]] = {
+        "model_name": "claude-fixture",
+        "litellm_params": {"model": model},
+        "model_info": info,
+    }
+    selected: Final[dict[str, object]] = {"model": model, "messages": messages, "model_info": info}
+    hook: Final = RequestAdmission()
+    if headroom:
+        assert await hook.async_filter_deployments("claude-fixture", [deployment], messages) == [deployment]
+        assert await hook.async_pre_call_deployment_hook(selected, CallTypes.aanthropic_messages) is None
+    else:
+        with pytest.raises(litellm.ContextWindowExceededError):
+            await hook.async_filter_deployments("claude-fixture", [deployment], messages)
+        with pytest.raises(litellm.ContextWindowExceededError):
+            await hook.async_pre_call_deployment_hook(selected, CallTypes.aanthropic_messages)
 
 
 class HybridCounter:
@@ -962,7 +1031,7 @@ def _hybrid_request(**overrides: object) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("local_tokens, expected_calls", ((699_999, 0), (700_000, 1), (950_000, 1)))
+@pytest.mark.parametrize("local_tokens, expected_calls", ((499_999, 0), (500_000, 1), (950_000, 1)))
 async def test_hybrid_remote_threshold_and_authoritative_remote_count(local_tokens: int, expected_calls: int) -> None:
     counter: Final = HybridCounter(local_tokens=local_tokens)
     hook: Final = RequestAdmission(
@@ -1054,16 +1123,6 @@ async def test_hybrid_known_prefix_reuses_count_for_small_plain_user_increment()
         {"messages": [*_messages("Changed history"), *_messages("Short new turn")]},
         {
             "messages": [
-                *_messages("Original history"),
-                {
-                    "role": "assistant",
-                    "content": [{"type": "thinking", "thinking": "", "signature": "unobserved-signature"}],
-                },
-                *_messages("Short new turn"),
-            ]
-        },
-        {
-            "messages": [
                 {"role": "assistant", "content": [{"type": "compaction", "content": "Compacted history"}]},
                 *_messages("Short new turn"),
             ]
@@ -1080,7 +1139,6 @@ async def test_hybrid_known_prefix_reuses_count_for_small_plain_user_increment()
         "forwarded-auth",
         "clearing",
         "history",
-        "thinking",
         "compaction",
     ),
 )
@@ -1194,11 +1252,13 @@ class HybridTransport:
 
 
 def _install_hybrid_transport(
-    monkeypatch: pytest.MonkeyPatch, transport: Callable[[httpx.Request], httpx.Response]
+    monkeypatch: pytest.MonkeyPatch,
+    transport: Callable[[httpx.Request], httpx.Response]
+    | Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
 ) -> AsyncHTTPHandler:
     client: Final = AsyncHTTPHandler(transport=httpx.MockTransport(transport))
 
-    def get_client(llm_provider: object) -> AsyncHTTPHandler:
+    def get_client(llm_provider: object, params: object = None, shared_session: object = None) -> AsyncHTTPHandler:
         return client
 
     monkeypatch.setattr(count_handler, "get_async_httpx_client", get_client)
@@ -1326,7 +1386,11 @@ async def _hybrid_native_payload(response: object, stream: bool, allow_incomplet
 
 
 async def _hybrid_native_round(
-    router: litellm.Router, history: tuple[dict[str, object], ...], stream: bool, allow_incomplete: bool = False
+    router: litellm.Router,
+    history: tuple[dict[str, object], ...],
+    stream: bool,
+    allow_incomplete: bool = False,
+    caller: str = "fixture-caller",
 ) -> tuple[dict[str, object], ...]:
     response: Final = cast(
         object,
@@ -1337,7 +1401,7 @@ async def _hybrid_native_round(
             tools=[{"name": "lookup", "input_schema": {"type": "object"}}],
             thinking={"type": "adaptive"},
             context_management={"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
-            litellm_metadata={"user_api_key_hash": "fixture-caller"},
+            litellm_metadata={"user_api_key_hash": caller},
             max_tokens=8192,
             stream=stream,
         ),
@@ -1351,6 +1415,497 @@ async def _hybrid_native_round(
     await asyncio.sleep(0)
     await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
     return (*history, {"role": "user", "content": "A short follow-up"}, {"role": "assistant", "content": content})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("local_tokens", (499_000, 524_451))
+@pytest.mark.parametrize("append_kind", ("plain", "fallback", "assistant_reordered"))
+async def test_hybrid_real_usage_blocks_growing_history_without_lower_remote_override(
+    monkeypatch: pytest.MonkeyPatch, stream: bool, local_tokens: int, append_kind: str
+) -> None:
+    transport: Final = HybridTransport(
+        remote_tokens=800_000,
+        signed_thinking=True,
+        usage={
+            "input_tokens": 4,
+            "cache_read_input_tokens": 995_821,
+            "cache_creation_input_tokens": 1027,
+            "output_tokens": 2605,
+        },
+    )
+    client: Final = _install_hybrid_transport(monkeypatch, transport)
+    counter: Final = HybridCounter(local_tokens=local_tokens)
+    hook: Final = RequestAdmission(local_counter=counter.local_count, cache=DualCache())
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = litellm.Router(model_list=[_claude_deployment(limit=950_000)], num_retries=0)
+    try:
+        first: Final = await _hybrid_native_round(router, (), stream)
+        content: Final = TypeAdapter(list[dict[str, object]]).validate_python(first[-1]["content"])
+        history: Final[tuple[dict[str, object], ...]] = (
+            (*first[:-1], {"role": "assistant", "content": list(reversed(content))})
+            if append_kind == "assistant_reordered"
+            else first
+        )
+        for turn in range(6):
+            with pytest.raises(litellm.ContextWindowExceededError, match="compact"):
+                await _hybrid_native_round(
+                    router,
+                    (
+                        *history,
+                        *(
+                            dict[str, object](
+                                role="assistant" if append_kind != "plain" and index % 2 else "user",
+                                content="Fallback reply"
+                                if append_kind != "plain" and index % 2
+                                else "A short follow-up",
+                            )
+                            for index in range(turn * 2)
+                        ),
+                    ),
+                    stream,
+                )
+        assert sum(request.url.path == "/v1/messages" for request in transport.requests) == 1
+        assert sum(request.url.path == "/v1/messages/count_tokens" for request in transport.requests) == int(
+            local_tokens >= 500_000
+        )
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", (False, True))
+async def test_hybrid_native_usage_survives_crossing_threshold_without_extra_calls(
+    monkeypatch: pytest.MonkeyPatch, stream: bool
+) -> None:
+    transport: Final = HybridTransport(
+        signed_thinking=True,
+        usage={"input_tokens": 400_000, "output_tokens": 1000},
+    )
+    client: Final = _install_hybrid_transport(monkeypatch, transport)
+
+    def local_count(data: Mapping[str, object], model: str) -> int:
+        if frozenset(data) == frozenset(("messages",)):
+            return 1000
+        messages: Final = TypeAdapter(list[dict[str, object]]).validate_python(data["messages"])
+        return 499_000 if len(messages) <= 2 else 524_451
+
+    hook: Final = RequestAdmission(local_counter=local_count, cache=DualCache())
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = litellm.Router(model_list=[_claude_deployment(limit=950_000)], num_retries=0)
+    try:
+        first: Final = await _hybrid_native_round(router, (), stream)
+        second: Final = await _hybrid_native_round(router, first, stream)
+        await _hybrid_native_round(router, second, stream)
+        assert sum(request.url.path == "/v1/messages" for request in transport.requests) == 3
+        assert not any(request.url.path == "/v1/messages/count_tokens" for request in transport.requests)
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("oversized", (False, True))
+async def test_hybrid_success_usage_remains_effective_when_completed_history_cannot_be_recounted(
+    monkeypatch: pytest.MonkeyPatch, stream: bool, oversized: bool
+) -> None:
+    transport: Final = HybridTransport(
+        remote_tokens=776_998,
+        signed_thinking=True,
+        usage={"input_tokens": 949_500 if oversized else 400_000, "output_tokens": 1000},
+    )
+
+    def local_count(data: Mapping[str, object], model: str) -> int:
+        if frozenset(data) == frozenset(("messages",)):
+            return 1000
+        messages: Final = TypeAdapter(list[dict[str, object]]).validate_python(data["messages"])
+        if messages[-1].get("role") == "assistant":
+            raise TimeoutError("fixture completed history recount timed out")
+        return 499_000
+
+    client: Final = _install_hybrid_transport(monkeypatch, transport)
+    hook: Final = RequestAdmission(local_counter=local_count, cache=DualCache())
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = litellm.Router(model_list=[_claude_deployment(limit=950_000)], num_retries=0)
+    try:
+        first: Final = await _hybrid_native_round(router, (), stream)
+        if oversized:
+            with pytest.raises(litellm.ContextWindowExceededError, match="compact"):
+                await _hybrid_native_round(router, first, stream)
+        else:
+            second: Final = await _hybrid_native_round(router, first, stream)
+            await _hybrid_native_round(router, second, stream)
+        assert sum(request.url.path == "/v1/messages" for request in transport.requests) == (1 if oversized else 3)
+        assert not any(request.url.path == "/v1/messages/count_tokens" for request in transport.requests)
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt_tokens,increment_tokens,accepted", ((996_852, 1000, False), (940_000, 10_000, False), (400_000, 1000, True))
+)
+async def test_hybrid_late_success_usage_overrides_existing_remote_count_for_the_next_request(
+    monkeypatch: pytest.MonkeyPatch, prompt_tokens: int, increment_tokens: int, accepted: bool
+) -> None:
+    backend: Final = HybridTransport(
+        remote_tokens=800_000, signed_thinking=True, usage={"input_tokens": prompt_tokens, "output_tokens": 2605}
+    )
+    release_first: Final = asyncio.Event()
+    first_history: Final[asyncio.Future[tuple[dict[str, object], ...]]] = asyncio.get_running_loop().create_future()
+
+    async def transport(request: httpx.Request) -> httpx.Response:
+        response: Final = backend(request)
+        if request.url.path == "/v1/messages/count_tokens":
+            return response
+        body: Final = TypeAdapter(dict[str, object]).validate_json(request.content)
+        messages: Final = TypeAdapter(list[dict[str, object]]).validate_python(body["messages"])
+        if len(messages) != 1:
+            return (
+                response
+                if release_first.is_set()
+                else httpx.Response(
+                    400, json={"error": {"type": "invalid_request_error", "message": "fixture generation rejected"}}
+                )
+            )
+        payload: Final = TypeAdapter(dict[str, object]).validate_python(response.json())
+        first_history.set_result((*messages, {"role": "assistant", "content": payload["content"]}))
+        await release_first.wait()
+        return response
+
+    def local_count(data: Mapping[str, object], model: str) -> int:
+        if frozenset(data) == frozenset(("messages",)):
+            return increment_tokens
+        return 524_451 if release_first.is_set() else 499_000
+
+    client: Final = _install_hybrid_transport(monkeypatch, transport)
+    hook: Final = RequestAdmission(local_counter=local_count, cache=DualCache())
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = litellm.Router(model_list=[_claude_deployment(limit=950_000)], num_retries=0)
+    first: Final = asyncio.create_task(_hybrid_native_round(router, (), False))
+    try:
+        history: Final = await asyncio.wait_for(first_history, timeout=5)
+        with pytest.raises(litellm.BadRequestError, match="fixture generation rejected"):
+            await _hybrid_native_round(router, history, False)
+        release_first.set()
+        await asyncio.wait_for(first, timeout=5)
+        if accepted:
+            await _hybrid_native_round(router, history, False)
+        else:
+            with pytest.raises(litellm.ContextWindowExceededError, match="compact"):
+                await _hybrid_native_round(router, history, False)
+        assert sum(request.url.path == "/v1/messages" for request in backend.requests) == 2 + int(accepted)
+        assert sum(request.url.path == "/v1/messages/count_tokens" for request in backend.requests) == 1
+    finally:
+        release_first.set()
+        await asyncio.wait_for(first, timeout=5)
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("hidden_history", (False, True))
+async def test_hybrid_provider_overflow_blocks_retries_and_growth_until_history_changes(
+    monkeypatch: pytest.MonkeyPatch, stream: bool, hidden_history: bool
+) -> None:
+    backend: Final = HybridTransport(remote_tokens=776_998, signed_thinking=True)
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        response: Final = backend(request)
+        if request.url.path == "/v1/messages/count_tokens":
+            return response
+        body: Final = TypeAdapter(dict[str, object]).validate_json(request.content)
+        messages: Final = TypeAdapter(list[dict[str, object]]).validate_python(body["messages"])
+        if messages[0].get("content") == "Recovered compact summary":
+            return response
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "prompt is too long: 1003389 tokens > 1000000 maximum",
+                }
+            },
+        )
+
+    client: Final = _install_hybrid_transport(monkeypatch, transport)
+    counter: Final = HybridCounter(local_tokens=499_000 if hidden_history else 524_451)
+    hook: Final = RequestAdmission(local_counter=counter.local_count, cache=DualCache())
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = litellm.Router(model_list=[_claude_deployment(limit=950_000)], num_retries=0)
+    history: Final[tuple[dict[str, object], ...]] = (
+        {"role": "user", "content": "A long earlier request"},
+        *(
+            (
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "Summary", "signature": "fixture-history-signature"}],
+                },
+            )
+            if hidden_history
+            else ()
+        ),
+    )
+    try:
+        with pytest.raises(litellm.ContextWindowExceededError, match="1003389"):
+            await _hybrid_native_round(router, history, stream)
+        await asyncio.sleep(0)
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+        for turn in range(6):
+            with pytest.raises(litellm.ContextWindowExceededError, match="compact"):
+                await _hybrid_native_round(
+                    router,
+                    (*history, *(dict[str, object](role="user", content="A short follow-up") for _ in range(turn * 2))),
+                    stream,
+                )
+        assert sum(request.url.path == "/v1/messages" for request in backend.requests) == 1
+        assert sum(request.url.path == "/v1/messages/count_tokens" for request in backend.requests) == 1
+        await _hybrid_native_round(router, ({"role": "user", "content": "Recovered compact summary"},), stream)
+        assert sum(request.url.path == "/v1/messages" for request in backend.requests) == 2
+        assert sum(request.url.path == "/v1/messages/count_tokens" for request in backend.requests) == 1 + int(
+            not hidden_history
+        )
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    (
+        "fixture normal rejection",
+        "prompt is too long: 999999 tokens > 1000000 maximum",
+        "prompt is too long: provider omitted the numeric bound",
+    ),
+)
+async def test_hybrid_unconfirmed_provider_error_does_not_mark_history_as_oversized(
+    monkeypatch: pytest.MonkeyPatch, message: str
+) -> None:
+    backend: Final = HybridTransport(remote_tokens=776_998)
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        response: Final = backend(request)
+        if request.url.path == "/v1/messages/count_tokens":
+            return response
+        return httpx.Response(400, json={"error": {"type": "invalid_request_error", "message": message}})
+
+    client: Final = _install_hybrid_transport(monkeypatch, transport)
+    counter: Final = HybridCounter(local_tokens=524_451)
+    hook: Final = RequestAdmission(local_counter=counter.local_count, cache=DualCache())
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = litellm.Router(model_list=[_claude_deployment(limit=950_000)], num_retries=0)
+    try:
+        for _ in range(2):
+            with pytest.raises(litellm.BadRequestError, match=message):
+                await _hybrid_native_round(router, (), False)
+            await asyncio.sleep(0)
+            await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+        assert sum(request.url.path == "/v1/messages" for request in backend.requests) == 2
+        assert sum(request.url.path == "/v1/messages/count_tokens" for request in backend.requests) == 1
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_hybrid_fallback_overflow_does_not_poison_the_original_claude_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend: Final = HybridTransport(remote_tokens=776_998, signed_thinking=True)
+    fallback_called: Final = asyncio.Event()
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/v1/chat/completions", "/v1/responses"):
+            fallback_called.set()
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "context_length_exceeded",
+                        "message": "maximum context length exceeded, prompt is too long: 1003389 tokens > 1000000 maximum",
+                    }
+                },
+            )
+        response: Final = backend(request)
+        if (
+            request.url.path == "/v1/messages"
+            and sum(item.url.path == "/v1/messages" for item in backend.requests) == 1
+        ):
+            return httpx.Response(
+                400, json={"error": {"type": "invalid_request_error", "message": "fixture unrelated rejection"}}
+            )
+        return response
+
+    client: Final = _install_hybrid_transport(monkeypatch, transport)
+    counter: Final = HybridCounter(local_tokens=524_451)
+    hook: Final = RequestAdmission(local_counter=counter.local_count, cache=DualCache())
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = litellm.Router(
+        model_list=[
+            _claude_deployment(limit=950_000),
+            {
+                "model_name": "fallback-fixture",
+                "litellm_params": {
+                    "model": "openai/gpt-6.1-sol",
+                    "api_key": "fixture-fallback-key",
+                    "api_base": "https://fallback.invalid/v1",
+                },
+                "model_info": {"id": "fallback-fixture", "max_input_tokens": 950_000},
+            },
+        ],
+        fallbacks=[{"claude-fixture": ["fallback-fixture"]}],
+        num_retries=0,
+    )
+    try:
+        with pytest.raises(litellm.BadRequestError):
+            await _hybrid_native_round(router, (), False)
+        await asyncio.sleep(0)
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+        assert fallback_called.is_set()
+        await _hybrid_native_round(router, (), False)
+        assert sum(request.url.path == "/v1/messages" for request in backend.requests) == 2
+        assert sum(request.url.path == "/v1/messages/count_tokens" for request in backend.requests) == 1
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("hidden_kind", ("thinking", "redacted_thinking"))
+@pytest.mark.parametrize("remote_cached", (False, True))
+async def test_hybrid_large_unknown_hidden_history_is_rejected_even_with_a_low_remote_cache(
+    monkeypatch: pytest.MonkeyPatch, stream: bool, hidden_kind: str, remote_cached: bool
+) -> None:
+    backend: Final = HybridTransport(remote_tokens=776_998)
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        response: Final = backend(request)
+        if request.url.path == "/v1/messages/count_tokens":
+            return response
+        return httpx.Response(
+            400, json={"error": {"type": "invalid_request_error", "message": "fixture generation rejected"}}
+        )
+
+    def local_count(data: Mapping[str, object], model: str) -> int:
+        priming: Final = remote_cached and not any(request.url.path == "/v1/messages" for request in backend.requests)
+        return 499_999 if priming else 500_000
+
+    client: Final = _install_hybrid_transport(monkeypatch, transport)
+    hook: Final = RequestAdmission(local_counter=local_count, cache=DualCache())
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = litellm.Router(model_list=[_claude_deployment(limit=950_000)], num_retries=0)
+    hidden: Final = (
+        {"type": "thinking", "thinking": "Summary", "signature": "fixture-unverified-history"}
+        if hidden_kind == "thinking"
+        else {"type": "redacted_thinking", "data": "fixture-unverified-history"}
+    )
+    history: Final[tuple[dict[str, object], ...]] = (
+        {"role": "user", "content": "An earlier request"},
+        {"role": "assistant", "content": [hidden, {"type": "text", "text": "An earlier answer"}]},
+    )
+    try:
+        if remote_cached:
+            with pytest.raises(litellm.BadRequestError, match="fixture generation rejected"):
+                await _hybrid_native_round(router, history, stream)
+            await asyncio.sleep(0)
+            await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+        with pytest.raises(litellm.ContextWindowExceededError, match="compact"):
+            await _hybrid_native_round(router, history, stream)
+        assert sum(request.url.path == "/v1/messages/count_tokens" for request in backend.requests) == int(
+            remote_cached
+        )
+        assert sum(request.url.path == "/v1/messages" for request in backend.requests) == int(remote_cached)
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("hidden_kind", ("thinking", "redacted_thinking"))
+@pytest.mark.parametrize("remote_tokens,count_status", ((800_000, 200), (950_000, 200), (800_000, 503)))
+async def test_hybrid_unknown_hidden_history_requires_remote_count_below_local_threshold(
+    monkeypatch: pytest.MonkeyPatch, stream: bool, hidden_kind: str, remote_tokens: int, count_status: int
+) -> None:
+    transport: Final = HybridTransport(remote_tokens=remote_tokens, count_status=count_status, signed_thinking=True)
+    client: Final = _install_hybrid_transport(monkeypatch, transport)
+    counter: Final = HybridCounter(local_tokens=499_000)
+    hook: Final = RequestAdmission(local_counter=counter.local_count, cache=DualCache())
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = litellm.Router(model_list=[_claude_deployment(limit=950_000)], num_retries=0)
+    hidden: Final = (
+        {"type": "thinking", "thinking": "A summary", "signature": "fixture-unknown-signature"}
+        if hidden_kind == "thinking"
+        else {"type": "redacted_thinking", "data": "fixture-unknown-ciphertext"}
+    )
+    history: Final[tuple[dict[str, object], ...]] = (
+        {"role": "user", "content": "An earlier request"},
+        {"role": "assistant", "content": [hidden, {"type": "text", "text": "An earlier reply"}]},
+    )
+    accepted: Final = count_status == 200 and remote_tokens < 950_000
+    try:
+        if accepted:
+            await _hybrid_native_round(router, history, stream)
+        else:
+            with pytest.raises(litellm.BadRequestError, match="count_tokens|compact"):
+                await _hybrid_native_round(router, history, stream)
+        assert sum(request.url.path == "/v1/messages/count_tokens" for request in transport.requests) == 1
+        assert sum(request.url.path == "/v1/messages" for request in transport.requests) == int(accepted)
+    finally:
+        router.reset()
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("changed", ("history", "caller"))
+@pytest.mark.parametrize("local_tokens", (499_000, 524_451))
+async def test_hybrid_changed_history_or_identity_does_not_reuse_old_usage_rejection(
+    monkeypatch: pytest.MonkeyPatch, stream: bool, changed: str, local_tokens: int
+) -> None:
+    transport: Final = HybridTransport(
+        remote_tokens=800_000,
+        signed_thinking=True,
+        usage={"input_tokens": 996_852, "output_tokens": 2605},
+    )
+    client: Final = _install_hybrid_transport(monkeypatch, transport)
+    counter: Final = HybridCounter(local_tokens=local_tokens)
+    hook: Final = RequestAdmission(local_counter=counter.local_count, cache=DualCache())
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    router: Final = litellm.Router(model_list=[_claude_deployment(limit=950_000)], num_retries=0)
+    try:
+        first: Final = await _hybrid_native_round(router, (), stream)
+        history: Final[tuple[dict[str, object], ...]] = (
+            ({"role": "user", "content": "Compacted earlier instructions"}, *first[1:])
+            if changed == "history"
+            else first
+        )
+        caller: Final = "different-caller" if changed == "caller" else "fixture-caller"
+        strict: Final = local_tokens >= 500_000
+        if strict:
+            with pytest.raises(litellm.ContextWindowExceededError, match="compact"):
+                await _hybrid_native_round(router, history, stream, caller=caller)
+        else:
+            await _hybrid_native_round(router, history, stream, caller=caller)
+        assert sum(request.url.path == "/v1/messages" for request in transport.requests) == (1 if strict else 2)
+        assert sum(request.url.path == "/v1/messages/count_tokens" for request in transport.requests) == 1
+        await _hybrid_native_round(
+            router, ({"role": "user", "content": "Compacted fresh history"},), stream, caller=caller
+        )
+        assert sum(request.url.path == "/v1/messages" for request in transport.requests) == (2 if strict else 3)
+        assert sum(request.url.path == "/v1/messages/count_tokens" for request in transport.requests) == (
+            2 if strict else 1
+        )
+    finally:
+        router.reset()
+        await client.client.aclose()
 
 
 @pytest.mark.asyncio
@@ -1480,9 +2035,9 @@ async def test_hybrid_count_uses_the_same_explicit_auth_and_beta_sources_as_gene
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "stream, context_management, complete_stream, expected_counts",
+    "stream, context_management, complete_stream, usable_usage",
     (
-        (False, {"applied_edits": []}, True, 1),
+        (False, {"applied_edits": []}, True, True),
         (
             False,
             {
@@ -1491,10 +2046,10 @@ async def test_hybrid_count_uses_the_same_explicit_auth_and_beta_sources_as_gene
                 ]
             },
             True,
-            2,
+            False,
         ),
-        (True, {"applied_edits": []}, True, 1),
-        (True, {"applied_edits": []}, False, 2),
+        (True, {"applied_edits": []}, True, True),
+        (True, {"applied_edits": []}, False, False),
     ),
     ids=("ordinary-no-edit", "ordinary-edited", "stream-complete", "stream-without-message-stop"),
 )
@@ -1503,7 +2058,7 @@ async def test_hybrid_native_usage_requires_complete_unedited_response(
     stream: bool,
     context_management: dict[str, object],
     complete_stream: bool,
-    expected_counts: int,
+    usable_usage: bool,
 ) -> None:
     transport: Final = HybridTransport(
         signed_thinking=True,
@@ -1518,9 +2073,13 @@ async def test_hybrid_native_usage_requires_complete_unedited_response(
     router: Final = litellm.Router(model_list=[_claude_deployment(limit=950_000)], num_retries=0)
     try:
         first: Final = await _hybrid_native_round(router, (), stream, allow_incomplete=not complete_stream)
-        await _hybrid_native_round(router, first, stream, allow_incomplete=not complete_stream)
-        assert sum(request.url.path == "/v1/messages" for request in transport.requests) == 2
-        assert sum(request.url.path == "/v1/messages/count_tokens" for request in transport.requests) == expected_counts
+        if usable_usage:
+            await _hybrid_native_round(router, first, stream)
+        else:
+            with pytest.raises(litellm.ContextWindowExceededError, match="compact"):
+                await _hybrid_native_round(router, first, stream, allow_incomplete=not complete_stream)
+        assert sum(request.url.path == "/v1/messages" for request in transport.requests) == (2 if usable_usage else 1)
+        assert sum(request.url.path == "/v1/messages/count_tokens" for request in transport.requests) == 1
     finally:
         router.reset()
         await client.client.aclose()

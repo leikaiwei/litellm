@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -40,11 +41,11 @@ from litellm.litellm_core_utils.token_counter import (
     token_counter,  # pyright: ignore[reportUnknownVariableType]  # 上游 custom_tokenizer 包含裸 dict
 )
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
-from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+from litellm.llms.anthropic.common_utils import AnthropicModelInfo, merge_anthropic_beta_headers
 from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
 from litellm.llms.anthropic.count_tokens.transformation import COUNT_TOKEN_OPTION_NAMES
 from litellm.llms.anthropic.messages.adapters.transformation import LiteLLMAnthropicMessagesAdapter
-from litellm.llms.anthropic.messages.native.transformation import AnthropicMessagesConfig
+from litellm.llms.anthropic.messages.native.transformation import AnthropicMessagesConfig, messages_carry_output_config
 from litellm.llms.anthropic.messages.native.utils import (
     anthropic_system_to_openai_message,
     prepare_native_request_body,
@@ -56,6 +57,7 @@ from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig as ResponsesConfig,
 )
 from litellm.router_strategy.complexity_router.context_compaction import compaction_pending
+from litellm.types.llms.anthropic import ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
 from litellm.types.proxy.auth.user_api_key_auth import UserAPIKeyAuth
 from litellm.types.utils import CallTypes, CallTypesLiteral, ModelResponse, ProviderSpecificHeader
@@ -74,7 +76,7 @@ _PROVIDER_HEADERS: Final[TypeAdapter[ProviderSpecificHeader | tuple[ProviderSpec
 _ITEMS: Final = TypeAdapter(tuple[object, ...])
 _MESSAGES: Final = TypeAdapter(tuple[dict[str, object], ...])
 _TOOL_CHOICE: Final = TypeAdapter[str | dict[str, object] | None](str | dict[str, object] | None)
-_REMOTE_THRESHOLD: Final = 700_000
+_REMOTE_THRESHOLD: Final = 500_000
 _RECHECK_MARGIN: Final = 50_000
 _MAX_LOCAL_INCREMENT: Final = 20_000
 _CACHE_TTL: Final = 300
@@ -328,7 +330,7 @@ def _count(data: Mapping[str, object], model: str) -> int | AdmissionProblem:
         tools: Final = list(_MESSAGES.validate_python(raw_tools)) if raw_tools is not None else None
         return (
             token_counter(
-                model=model,
+                model=model.removeprefix("anthropic/") if _is_claude(model) else model,
                 messages=cast(Sequence[AllMessageValues], messages),  # cast-ok: 计数器支持三种协议，类型声明仅列出 Chat
                 tools=cast(list[ChatCompletionToolParam] | None, tools),  # cast-ok: 计数器统一格式化三种协议的工具定义
                 tool_choice=_TOOL_CHOICE.validate_python(data.get("tool_choice")),
@@ -489,11 +491,23 @@ async def _prepare_claude(data: Mapping[str, object], call_type: CallTypes) -> P
 
 async def _send_count(prepared: PreparedClaudeRequest) -> int:
     body: Final = prepared.body
+    messages: Final = _JSON_MESSAGES.validate_python(body.get("messages"))
+    headers: Final = {key.lower(): value for key, value in prepared.headers.items() if key.lower() != "content-type"}
+    count_headers: Final = (
+        {
+            **headers,
+            "anthropic-beta": merge_anthropic_beta_headers(
+                headers.get("anthropic-beta"), ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER
+            ),
+        }
+        if messages_carry_output_config(messages)
+        else headers
+    )
     async with asyncio.timeout(30):
         response: Final = await AnthropicCountTokensHandler().handle_count_tokens_request(
             model=prepared.model,
-            messages=_JSON_MESSAGES.validate_python(body.get("messages")),
-            auth_header={key: value for key, value in prepared.headers.items() if key.lower() != "content-type"},
+            messages=messages,
+            auth_header=count_headers,
             api_base=prepared.api_base,
             timeout=30,
             tools=_JSON_MESSAGES.validate_python(body["tools"]) if body.get("tools") is not None else None,
@@ -559,6 +573,13 @@ class CountRecord(BaseModel):
     source: Literal["remote", "usage"]
 
 
+@dataclass(frozen=True, slots=True)
+class CountEstimate:
+    tokens: int
+    source: Literal["remote", "usage"]
+    reusable: bool
+
+
 class PendingObservation(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -566,7 +587,9 @@ class PendingObservation(BaseModel):
     root: str
     prefix: str
     model: str
-    local_model: str
+    local_tokens: int
+    messages: int
+    observable: bool
 
 
 class ObservedUsage(BaseModel):
@@ -662,8 +685,8 @@ def _count_scope(
     )
 
 
-def _count_key(scope: str, fingerprint: str) -> str:
-    return f"claude-admission:v1:{scope}:{fingerprint}"
+def _count_key(scope: str, fingerprint: str, source: Literal["remote", "usage"]) -> str:
+    return f"claude-admission:v2:{source}:{scope}:{fingerprint}"
 
 
 def _plain_content(content: object) -> bool:
@@ -695,6 +718,20 @@ def _plain_increment(messages: Sequence[Mapping[str, JsonValue]]) -> bool:
         and not frozenset(message) - {"role", "content"}
         and _plain_content(message.get("content"))
         for message in messages
+    )
+
+
+def _has_hidden_thinking(value: object) -> bool:
+    if isinstance(value, (list, tuple)):
+        return any(_has_hidden_thinking(item) for item in _ITEMS.validate_python(value))
+    if not isinstance(value, Mapping):
+        return False
+    block: Final = _OBJECT.validate_python(value)
+    return (
+        block.get("type") == "redacted_thinking"
+        or (block.get("type") == "thinking" and bool(block.get("signature")))
+        or _has_hidden_thinking(block.get("content"))
+        or _has_hidden_thinking(block.get("thinking_blocks"))
     )
 
 
@@ -753,8 +790,10 @@ class RequestAdmission(CustomLogger):
         )
         return [deployment for deployment in healthy_deployments if deployment not in checked or deployment in admitted]
 
-    async def _cached_count(self, scope: str, fingerprint: str) -> CountRecord | None:
-        value: Final = await self._cache.async_get_cache(_count_key(scope, fingerprint))  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # 缓存出口在下方用模型校验
+    async def _cached_count(
+        self, scope: str, fingerprint: str, source: Literal["remote", "usage"] = "remote"
+    ) -> CountRecord | None:
+        value: Final = await self._cache.async_get_cache(_count_key(scope, fingerprint, source))  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # 缓存出口在下方用模型校验
         try:
             record: Final = (
                 CountRecord.model_validate_json(value) if isinstance(value, str) else CountRecord.model_validate(value)
@@ -765,37 +804,73 @@ class RequestAdmission(CustomLogger):
 
     async def _save_count(self, scope: str, fingerprint: str, record: CountRecord) -> None:
         await self._cache.async_set_cache(  # pyright: ignore[reportUnknownMemberType]  # 旧缓存接口未注解，值已序列化
-            _count_key(scope, fingerprint), record.model_dump(mode="json"), ttl=_CACHE_TTL
+            _count_key(scope, fingerprint, record.source), record.model_dump(mode="json"), ttl=_CACHE_TTL
         )
 
     async def _reuse_count(
         self, scope: str, fingerprints: tuple[str, ...], body: Mapping[str, JsonValue], model: str, limit: int
-    ) -> int | None:
-        exact: Final = await self._cached_count(scope, fingerprints[-1])
-        if exact is not None and exact.source == "remote":
-            return exact.tokens
+    ) -> CountEstimate | None:
         if not _can_observe(body):
-            return None
+            exact_only: Final = await self._cached_count(scope, fingerprints[-1])
+            return CountEstimate(exact_only.tokens, "remote", True) if exact_only is not None else None
         messages: Final = _JSON_MESSAGES.validate_python(body.get("messages"))
-        for position in range(len(messages) - 1, max(-1, len(messages) - 9), -1):
-            if (
-                estimate := await self._increment_count(scope, fingerprints[position], messages, position, model, limit)
-            ) is not None:
+        positions: Final = tuple(range(len(messages), max(-1, len(messages) - 9), -1))
+        observations: Final = await asyncio.gather(
+            *(self._cached_count(scope, fingerprints[position], "usage") for position in positions)
+        )
+        for position, record in zip(positions, observations):
+            if record is not None and record.messages == position and record.tokens >= limit:
+                return CountEstimate(record.tokens, "usage", True)
+        usage_estimates: Final = tuple(
+            await asyncio.gather(
+                *(
+                    self._increment_count(record, messages, position, model, limit)
+                    for position, record in zip(positions[1:], observations[1:])
+                )
+            )
+        )
+        for estimate in usage_estimates:
+            if estimate is not None and estimate.tokens >= limit:
                 return estimate
+        exact_usage: Final = observations[0]
+        if exact_usage is not None:
+            return CountEstimate(exact_usage.tokens, "usage", True)
+        exact_remote: Final = await self._cached_count(scope, fingerprints[-1])
+        if exact_remote is not None and exact_remote.tokens >= limit:
+            return CountEstimate(exact_remote.tokens, "remote", True)
+        for usage_estimate in usage_estimates:
+            if usage_estimate is not None:
+                return usage_estimate
+        if exact_remote is not None:
+            return CountEstimate(exact_remote.tokens, "remote", True)
+        for prefix_position in positions[1:]:
+            if (
+                remote_estimate := await self._increment_count(
+                    await self._cached_count(scope, fingerprints[prefix_position]),
+                    messages,
+                    prefix_position,
+                    model,
+                    limit,
+                )
+            ) is not None:
+                return remote_estimate
         return None
 
     async def _increment_count(
-        self, scope: str, fingerprint: str, messages: list[dict[str, JsonValue]], position: int, model: str, limit: int
-    ) -> int | None:
-        record: Final = await self._cached_count(scope, fingerprint)
+        self, record: CountRecord | None, messages: list[dict[str, JsonValue]], position: int, model: str, limit: int
+    ) -> CountEstimate | None:
         suffix: Final = messages[position:]
-        if record is None or record.messages != position or not _plain_increment(suffix):
+        if record is None or record.messages != position:
+            return None
+        if not _plain_increment(suffix):
             return None
         increment: Final = await offload_token_count(self._local_counter)({"messages": suffix}, model)
-        if isinstance(increment, AdmissionProblem) or increment > _MAX_LOCAL_INCREMENT:
+        if isinstance(increment, AdmissionProblem):
             return None
         estimate: Final = record.tokens + math.ceil(increment * max(1.0, record.tokens / record.local_tokens))
-        return estimate if estimate < limit - _RECHECK_MARGIN else None
+        return CountEstimate(
+            estimate, record.source, increment <= _MAX_LOCAL_INCREMENT and estimate < limit - _RECHECK_MARGIN
+        )
 
     async def _check_claude(
         self, data: Mapping[str, object], call_type: CallTypes, candidate: Candidate, local_tokens: int
@@ -813,16 +888,35 @@ class RequestAdmission(CustomLogger):
                 if scope is not None
                 else None
             )
+            hidden_thinking: Final = _has_hidden_thinking(body.get("messages"))
+            if local_tokens >= _REMOTE_THRESHOLD and hidden_thinking and (reused is None or reused.source != "usage"):
+                verbose_proxy_logger.info(
+                    "Claude 加密历史缺少可信用量，请求=%s，本地=%s，已拒绝",
+                    data.get("litellm_call_id"),
+                    local_tokens,
+                )
+                raise litellm.ContextWindowExceededError(
+                    message=f"Claude 本地估算 {local_tokens} tokens，达到 {_REMOTE_THRESHOLD}，"
+                    "加密 thinking 历史缺少可复用的真实用量。请先 /compact 或开启新会话",
+                    model=candidate.model,
+                    llm_provider="anthropic",
+                )
+            usage_oversize: Final = reused is not None and reused.source == "usage" and reused.tokens >= limit
+            use_record: Final = reused is not None and (reused.reusable or usage_oversize)
+            needs_remote: Final = local_tokens >= _REMOTE_THRESHOLD or hidden_thinking or reused is not None
+            remote_called: Final = not use_record and needs_remote
             count: Final = (
-                reused
-                if reused is not None
+                reused.tokens
+                if reused is not None and use_record
+                else local_tokens
+                if not needs_remote
                 else await _send_count(prepared)
                 if self._claude_counter is None
                 else await self._claude_counter(data, call_type)
             )
             if isinstance(count, bool) or count <= 0:
                 raise ValueError("Claude 上游未返回有效 input_tokens")
-            if reused is None and scope is not None:
+            if (remote_called or usage_oversize) and scope is not None:
                 await self._save_count(
                     scope,
                     fingerprints[-1],
@@ -831,12 +925,23 @@ class RequestAdmission(CustomLogger):
                         local_tokens=local_tokens,
                         messages=len(fingerprints) - 1,
                         expires_at=time.time() + _CACHE_TTL,
-                        source="remote",
+                        source="usage" if usage_oversize else "remote",
                     ),
                 )
+        source: Final = reused.source if use_record and reused is not None else "remote" if remote_called else "local"
+        if source != "local":
+            verbose_proxy_logger.info(
+                "Claude 上下文预检，请求=%s，本地=%s，核验=%s，来源=%s，拒绝=%s",
+                data.get("litellm_call_id"),
+                local_tokens,
+                count,
+                source,
+                count >= limit,
+            )
         if count >= limit:
             raise litellm.ContextWindowExceededError(
-                message=f"Claude 上游计数 {count} tokens，达到输入上限 {limit}。请先 /compact 或开启新会话",
+                message=f"Claude {'历史真实用量校准' if source == 'usage' else '上游计数'} {count} tokens，"
+                f"达到输入上限 {limit}。请先 /compact 或开启新会话",
                 model=candidate.model,
                 llm_provider="anthropic",
             )
@@ -855,12 +960,11 @@ class RequestAdmission(CustomLogger):
                 root=fingerprints[0],
                 prefix=fingerprints[-1],
                 model=prepared.model,
-                local_model=candidate.model,
+                local_tokens=local_tokens,
+                messages=len(fingerprints) - 1,
+                observable=_can_observe(body),
             )
             logging_obj.model_call_details = {**logging_obj.model_call_details, "_claude_admission_observation": seed}
-        verbose_proxy_logger.debug(
-            "Claude 上下文预检，本地=%s，核验=%s，复用=%s", local_tokens, count, reused is not None
-        )
 
     async def async_pre_call_deployment_hook(
         self, kwargs: dict[str, object], call_type: CallTypes | None
@@ -905,9 +1009,11 @@ class RequestAdmission(CustomLogger):
         if isinstance(count, AdmissionProblem):
             _raise_invalid(count, candidate.model)
             return None
-        if count is None or count < _REMOTE_THRESHOLD:
+        if count is None:
             return None
         if call_type in (CallTypes.responses, CallTypes.aresponses):
+            if count < _REMOTE_THRESHOLD:
+                return None
             endpoints: Final = _mapping(kwargs.get("model_info")).get("supported_endpoints")
             native: Final = isinstance(endpoints, (list, tuple)) and "/v1/responses" in endpoints
             if kwargs.get("custom_llm_provider") not in (None, "anthropic") or (
@@ -919,6 +1025,10 @@ class RequestAdmission(CustomLogger):
                     ),
                     candidate.model,
                 )
+            return None
+        metadata: Final = _mapping(kwargs.get("litellm_metadata") or kwargs.get("metadata"))
+        tracked: Final = bool(metadata.get("user_api_key_hash") and _mapping(kwargs.get("model_info")).get("id"))
+        if count < _REMOTE_THRESHOLD and not tracked and not _has_hidden_thinking(kwargs.get("messages")):
             return None
         try:
             await self._check_claude(kwargs, call_type, candidate, count)
@@ -932,6 +1042,36 @@ class RequestAdmission(CustomLogger):
                 candidate.model,
             )
         return None
+
+    async def async_log_failure_event(
+        self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
+    ) -> None:
+        seed: Final = kwargs.get("_claude_admission_observation")
+        error: Final = kwargs.get("exception")
+        if (
+            not isinstance(seed, PendingObservation)
+            or not seed.observable
+            or not isinstance(error, litellm.ContextWindowExceededError)
+        ):
+            return
+        provider: Final[object] = getattr(error, "llm_provider", None)
+        model: Final[object] = getattr(error, "model", None)
+        if provider != "anthropic" or not isinstance(model, str) or model.removeprefix("anthropic/") != seed.model:
+            return
+        match: Final = re.search(r"prompt is too long: ([0-9]+) tokens > ([0-9]+) maximum", str(error))
+        if match is None or int(match[1]) <= int(match[2]):
+            return
+        await self._save_count(
+            seed.scope,
+            seed.prefix,
+            CountRecord(
+                tokens=int(match[1]),
+                local_tokens=seed.local_tokens,
+                messages=seed.messages,
+                expires_at=time.time() + _CACHE_TTL,
+                source="usage",
+            ),
+        )
 
     async def async_log_success_event(
         self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
@@ -976,19 +1116,25 @@ class RequestAdmission(CustomLogger):
                 or result.get("context_management") not in (None, {}, {"applied_edits": []})
             ):
                 return
+            await self._save_count(
+                seed.scope,
+                seed.prefix,
+                CountRecord(
+                    tokens=usage.prompt_tokens,
+                    local_tokens=seed.local_tokens,
+                    messages=len(fingerprints) - 1,
+                    expires_at=time.time() + _CACHE_TTL,
+                    source="usage",
+                ),
+            )
             assistant: Final[dict[str, JsonValue]] = {"role": "assistant", "content": content}
-            messages: Final = _JSON_MESSAGES.validate_python(body.get("messages"))
-            next_body: Final = {**body, "messages": [*messages, assistant]}
-            local_tokens: Final = await offload_token_count(self._local_counter)(next_body, seed.local_model)
-            if isinstance(local_tokens, AdmissionProblem) or local_tokens <= 0:
-                return
             await self._save_count(
                 seed.scope,
                 _extend_digest(seed.prefix, _message_digest(assistant)),
                 CountRecord(
                     tokens=usage.prompt_tokens + usage.completion_tokens,
-                    local_tokens=local_tokens,
-                    messages=len(messages) + 1,
+                    local_tokens=seed.local_tokens,
+                    messages=len(fingerprints),
                     expires_at=time.time() + _CACHE_TTL,
                     source="usage",
                 ),
