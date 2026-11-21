@@ -4,6 +4,8 @@ Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础
 
 2026-11-21 同步上游稳定版 [v1.110.2](https://github.com/BerriAI/litellm/releases/tag/v1.110.2)，生产主代理和 usage-api 的切换另行执行
 
+`v1.110.2-fork` 对应提交 `e3fc0f2e964`，已发布到 Docker Hub 和 GHCR。服务器升级可固定使用 `leikaiwei/litellm@sha256:64ad8228d4b35f23b9499c22c0d356494d6fe07445c1b96b881604ce1a65e51f`。[GitHub 构建记录](https://github.com/leikaiwei/litellm/actions/runs/44879592469)
+
 空回复缓存读写及 Anthropic 服务端工具计数已采用上游实现。[缓存修复](https://github.com/BerriAI/litellm/pull/50057) 同时覆盖缓存中已有的空回复。[工具计数](https://github.com/BerriAI/litellm/pull/51334) 支持搜索及代码执行结果，只计算可读字段。升级时要同步替换外置 `request_admission.py`，否则严格准入会放行含加密搜索正文或加密标准输出的工具历史。现网插件的 50 万复核线、可信用量复用和部署输入上限继续生效
 
 Anthropic Messages 转发 `mcp_servers` 时保留新版对支持路由的透传，以及 fork 对 `custom_openai` 的参数过滤。强制本地计费也覆盖新版零费用判定，避免上游报零把缺少本地价格的请求记成免费
