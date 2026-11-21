@@ -19,9 +19,7 @@ from litellm.llms.anthropic.messages.native import handler
 from litellm.llms.anthropic.messages.native.handler import (
     _native_messages_config as native_messages_config,  # pyright: ignore[reportPrivateUsage]  # the handler's own config lookup
 )
-from litellm.llms.anthropic.messages.native.handler import (
-    _with_deployment_output_effort as _deployment_output_effort,  # pyright: ignore[reportPrivateUsage]  # the handler's own effort rounding
-)
+from litellm.llms.anthropic.messages.native.utils import with_deployment_output_effort
 from litellm.llms.anthropic.messages.utils import is_reasoning_auto_summary_enabled
 from litellm.rust_bridge import failures
 from litellm.rust_bridge.host import callbacks_legacy_python
@@ -101,7 +99,7 @@ def _with_deployment_effort(params: Mapping[str, object], request: Mapping[str, 
         )
     except litellm.BadRequestError:
         return params
-    return _deployment_output_effort(
+    return with_deployment_output_effort(
         params,
         model=model,
         custom_llm_provider=provider,
