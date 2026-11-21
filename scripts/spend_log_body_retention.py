@@ -50,12 +50,17 @@ BEGIN
     IF v IN ('null'::jsonb, '{}'::jsonb, '[]'::jsonb) THEN RETURN v; END IF;
     RETURN '{}'::jsonb;
   END IF;
+  IF context = 'usage' THEN
+    RETURN CASE WHEN jsonb_typeof(v) = 'object' THEN v - 'attribution' ELSE v END;
+  END IF;
   IF context = 'response' THEN
     IF v IN ('null'::jsonb, '{}'::jsonb, '[]'::jsonb) THEN RETURN v; END IF;
     IF jsonb_typeof(v) <> 'object' THEN RETURN '{}'::jsonb; END IF;
-    RETURN (CASE WHEN v ? 'usage' THEN jsonb_build_object('usage', v->'usage') ELSE '{}'::jsonb END)
+    RETURN (CASE WHEN v ? 'usage' THEN jsonb_build_object('usage', pg_temp.retention_clean(v->'usage', 'usage'))
+                 ELSE '{}'::jsonb END)
       || (CASE WHEN jsonb_typeof(v->'message') = 'object' AND (v->'message') ? 'usage'
-          THEN jsonb_build_object('message', jsonb_build_object('usage', v#>'{message,usage}'))
+          THEN jsonb_build_object('message',
+            jsonb_build_object('usage', pg_temp.retention_clean(v#>'{message,usage}', 'usage')))
           ELSE '{}'::jsonb END);
   END IF;
   IF context = 'guardrail_response' THEN
@@ -71,6 +76,8 @@ BEGIN
   IF jsonb_typeof(v) <> 'object' THEN RETURN v; END IF;
   RETURN (SELECT COALESCE(jsonb_object_agg(key,
     CASE
+      WHEN context = 'metadata' AND key IN ('usage_object', 'additional_usage_values')
+        THEN pg_temp.retention_clean(value, 'usage')
       WHEN context = 'metadata' AND key = 'proxy_server_request' THEN 'null'::jsonb
       WHEN context = 'metadata' AND key IN ('guardrail_information', 'error_information',
         'mcp_tool_call_metadata', 'vector_store_request_metadata', 'eval_information')
@@ -93,6 +100,21 @@ BEGIN
       ELSE value
     END), '{}'::jsonb) FROM jsonb_each(v));
 END $fn$;
+
+CREATE OR REPLACE FUNCTION pg_temp.retention_body_has_content(v jsonb) RETURNS boolean
+LANGUAGE sql IMMUTABLE AS $fn$
+ SELECT CASE WHEN pg_column_size(v) > 64 THEN true
+             ELSE v IS NOT NULL AND v NOT IN ('null'::jsonb, '{}'::jsonb, '[]'::jsonb) END
+$fn$;
+
+DO $base$
+DECLARE columns text;
+BEGIN
+  SELECT string_agg(format('%I', attname), ', ' ORDER BY attnum) INTO columns
+  FROM pg_attribute WHERE attrelid = '"LiteLLM_SpendLogs"'::regclass AND attnum > 0 AND NOT attisdropped
+    AND attname NOT IN ('messages', 'response', 'proxy_server_request', 'metadata');
+  EXECUTE format('CREATE OR REPLACE TEMP VIEW retention_base_rows AS SELECT %s FROM "LiteLLM_SpendLogs"', columns);
+END $base$;
 """
 
 
@@ -117,6 +139,7 @@ class Options:
     cutoff: datetime | None
     apply: bool
     min_free_gib: float
+    not_before: datetime | None = None
 
 
 def literal(value: str) -> str:
@@ -127,6 +150,10 @@ def object_value(value: Json) -> dict[str, Json]:
     if not isinstance(value, dict):
         raise ValueError("数据库返回格式不正确")
     return value
+
+
+def read_state(path: Path) -> dict[str, Json]:
+    return object_value(cast(Json, json.loads(path.read_text())))  # cast-ok: 标准库解析后只返回 JSON 值
 
 
 def run_sql(options: Options, sql: str) -> dict[str, Json]:
@@ -176,32 +203,28 @@ def select_batch_sql(
     minimum: Final = f'AND "startTime" >= {literal(lower_bound)}::timestamp' if lower_bound else ""
     return f"""
 WITH scanned AS MATERIALIZED (
-  SELECT * FROM "LiteLLM_SpendLogs"
+  SELECT s.request_id, s."startTime", s.messages, s.proxy_server_request, s.response, s.metadata,
+         s.xmin::text AS revision FROM "LiteLLM_SpendLogs" s
   WHERE "startTime" < {literal(cutoff)}::timestamp {minimum} {after}
   ORDER BY "startTime", request_id LIMIT {batch_size}
-), marked AS (
-  SELECT s.*, pg_temp.retention_clean(messages::jsonb, 'body') AS clean_messages,
-    pg_temp.retention_clean(response::jsonb, 'response') AS clean_response,
-    pg_temp.retention_clean(proxy_server_request::jsonb, 'body') AS clean_request,
-    pg_temp.retention_clean(metadata::jsonb, 'metadata') AS clean_metadata
-  FROM scanned s
 ), changed AS (
-  SELECT * FROM marked WHERE messages::jsonb IS DISTINCT FROM clean_messages
-    OR response::jsonb IS DISTINCT FROM clean_response
-    OR proxy_server_request::jsonb IS DISTINCT FROM clean_request
-    OR metadata::jsonb IS DISTINCT FROM clean_metadata
+  SELECT request_id FROM scanned WHERE
+      pg_temp.retention_body_has_content(messages)
+      OR pg_temp.retention_body_has_content(proxy_server_request)
+      OR response IS DISTINCT FROM pg_temp.retention_clean(response, 'response')
+      OR metadata IS DISTINCT FROM pg_temp.retention_clean(metadata, 'metadata')
 )
 SELECT jsonb_build_object(
  'scanned', (SELECT count(*) FROM scanned),
- 'metadata_unparsed', (SELECT count(*) FROM scanned WHERE jsonb_typeof(metadata::jsonb) = 'string'
-   AND pg_temp.retention_parse(metadata::jsonb) IS NULL),
+ 'metadata_unparsed', (SELECT count(*) FROM scanned WHERE jsonb_typeof(metadata) = 'string'
+   AND pg_temp.retention_parse(metadata) IS NULL),
  'cursor', (SELECT jsonb_build_object('start_time', "startTime", 'request_id', request_id)
    FROM scanned ORDER BY "startTime" DESC, request_id DESC LIMIT 1),
  'rows', COALESCE((SELECT jsonb_agg(jsonb_build_object('request_id', s.request_id, 'start_time', s."startTime",
-   'fingerprint', md5(to_jsonb(s)::text),
-   'base_fingerprint', md5((to_jsonb(s) - ARRAY['messages','response','proxy_server_request','metadata'])::text))
+   'fingerprint', s.revision, 'base_fingerprint', md5(to_jsonb(b)::text))
      {body_fields})
-   FROM scanned s JOIN changed c USING (request_id, "startTime")), '[]'::jsonb));
+   FROM scanned s JOIN changed c USING (request_id)
+   JOIN pg_temp.retention_base_rows b ON b.request_id = s.request_id), '[]'::jsonb));
 """
 
 
@@ -215,12 +238,13 @@ CREATE TEMP TABLE retention_snapshot ON COMMIT DROP AS
  SELECT * FROM jsonb_to_recordset({payload}::jsonb)
  AS x(request_id text, start_time timestamp, fingerprint text);
 CREATE TEMP TABLE retention_before ON COMMIT DROP AS
- SELECT s.request_id, s."startTime", to_jsonb(s) - ARRAY['messages','response','proxy_server_request','metadata']
-   AS base_projection, pg_temp.retention_clean(s.metadata::jsonb, 'metadata') AS expected_metadata,
+ SELECT s.request_id, s."startTime", to_jsonb(base) AS base_projection,
+   pg_temp.retention_clean(s.metadata::jsonb, 'metadata') AS expected_metadata,
    pg_temp.retention_clean(s.response::jsonb, 'response') AS expected_response
  FROM "LiteLLM_SpendLogs" s JOIN retention_snapshot b
    ON s.request_id = b.request_id AND s."startTime" = b.start_time
- WHERE md5(to_jsonb(s)::text) = b.fingerprint AND s."startTime" < {literal(cutoff)}::timestamp
+ JOIN pg_temp.retention_base_rows base ON base.request_id = s.request_id
+ WHERE s.xmin::text = b.fingerprint AND s."startTime" < {literal(cutoff)}::timestamp
  FOR UPDATE OF s;
 DO $assert$ BEGIN
  IF (SELECT count(*) FROM retention_before) <> (SELECT count(*) FROM retention_snapshot) THEN
@@ -228,21 +252,22 @@ DO $assert$ BEGIN
  END IF;
 END $assert$;
 UPDATE "LiteLLM_SpendLogs" s SET
- messages = pg_temp.retention_clean(s.messages::jsonb, 'body'),
+ messages = CASE WHEN pg_temp.retention_body_has_content(s.messages) THEN '{{}}'::jsonb ELSE s.messages END,
  response = pg_temp.retention_clean(s.response::jsonb, 'response'),
- proxy_server_request = pg_temp.retention_clean(s.proxy_server_request::jsonb, 'body'),
+ proxy_server_request = CASE WHEN pg_temp.retention_body_has_content(s.proxy_server_request)
+                             THEN '{{}}'::jsonb ELSE s.proxy_server_request END,
  metadata = pg_temp.retention_clean(s.metadata::jsonb, 'metadata')
  FROM retention_before b WHERE s.request_id = b.request_id AND s."startTime" = b."startTime";
 DO $assert$ BEGIN
  IF EXISTS (SELECT 1 FROM retention_before b LEFT JOIN "LiteLLM_SpendLogs" s
      ON s.request_id = b.request_id AND s."startTime" = b."startTime"
+   LEFT JOIN pg_temp.retention_base_rows base ON base.request_id = b.request_id
    WHERE s.request_id IS NULL
-     OR to_jsonb(s) - ARRAY['messages','response','proxy_server_request','metadata']
-       IS DISTINCT FROM b.base_projection
+     OR to_jsonb(base) IS DISTINCT FROM b.base_projection
      OR s.metadata::jsonb IS DISTINCT FROM b.expected_metadata
      OR s.response::jsonb IS DISTINCT FROM b.expected_response
-     OR s.messages::jsonb IS DISTINCT FROM pg_temp.retention_clean(s.messages::jsonb, 'body')
-     OR s.proxy_server_request::jsonb IS DISTINCT FROM pg_temp.retention_clean(s.proxy_server_request::jsonb, 'body')) THEN
+     OR pg_temp.retention_body_has_content(s.messages)
+     OR pg_temp.retention_body_has_content(s.proxy_server_request)) THEN
    RAISE EXCEPTION '账单明细校验失败，本批回滚';
  END IF;
 END $assert$;
@@ -325,11 +350,7 @@ def run(options: Options) -> int:
 
 
 def run_locked(options: Options) -> int:
-    state: Final = (
-        object_value(cast(Json, json.loads(options.state_file.read_text())))
-        if options.apply and options.state_file.exists()
-        else {}
-    )
+    state: Final = read_state(options.state_file) if options.apply and options.state_file.exists() else {}
     identity: Final = f"{options.container}/{options.database}/{options.retention_days}"
     if state and state.get("identity") != identity:
         raise ValueError("状态文件与当前数据库或保留期不匹配")
@@ -342,21 +363,38 @@ def run_locked(options: Options) -> int:
         .replace(tzinfo=None)
         .isoformat()
     )
+    floor: Final = (
+        options.not_before.astimezone(timezone.utc).replace(tzinfo=None) if options.not_before is not None else None
+    )
+    if floor is not None:
+        safe_cutoff: Final = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=options.retention_days)
+        boundary: Final = datetime.fromisoformat(cutoff)
+        if boundary > safe_cutoff:
+            raise ValueError("截止时间超过保留期边界")
+        if boundary <= floor:
+            LOGGER.info("切换后的请求尚未到期")
+            return 0
     completed_cutoff: Final = state.get("completed_cutoff")
-    lower_bound: Final = (
+    overlap_bound: Final = (
         cast(str | None, state.get("lower_bound"))
         if state.get("cursor")
         else (datetime.fromisoformat(str(completed_cutoff)) - timedelta(days=1)).isoformat()
         if completed_cutoff
         else None
     )
+    lower_bound: Final = (
+        max(floor, datetime.fromisoformat(overlap_bound) if overlap_bound else floor).isoformat()
+        if floor is not None
+        else overlap_bound
+    )
     cursor = read_cursor(state.get("cursor"))
     deadline: Final = time.monotonic() + options.run_budget_seconds
     count = 0
     updated = 0
     while time.monotonic() < deadline and count < options.max_batches:
-        if shutil.disk_usage(options.state_file.parent).free < options.min_free_gib * 1024**3:
-            raise RuntimeError("磁盘可用空间低于保护水位，停止本次清理")
+        free_gib: Final = shutil.disk_usage(options.state_file.parent).free / 1024**3
+        if free_gib < options.min_free_gib:
+            raise RuntimeError(f"磁盘可用 {free_gib:.1f} GiB 低于保护水位 {options.min_free_gib:g} GiB，停止本次清理")
         result: Final = run_sql(
             options, select_batch_sql(cutoff, cursor, options.batch_size, bool(options.backup_dir), lower_bound)
         )
@@ -441,24 +479,28 @@ def parse_options(argv: list[str] | None = None) -> Options:
     parser.add_argument("--max-batches", type=int, default=1000)
     parser.add_argument("--retention-days", type=int, default=90)
     parser.add_argument("--cutoff", type=datetime.fromisoformat)
+    parser.add_argument("--not-before", type=datetime.fromisoformat, help="只处理该切换时刻及以后的请求，必须包含时区")
     parser.add_argument("--min-free-gib", type=float, default=20)
     parser.add_argument("--apply", action="store_true")
-    args: Final = parser.parse_args(argv)
+    args: Final = Options(**vars(parser.parse_args(argv)))
     if not 1 <= args.batch_size <= 1000 or args.run_budget_seconds <= 0 or args.sleep_seconds < 0:
         parser.error("批量必须为 1 至 1000，预算必须大于 0，间隔不可为负数")
     if args.retention_days < 1 or args.max_batches < 1 or args.min_free_gib < 0:
         parser.error("保留天数和批次必须大于 0，磁盘水位不可为负数")
     if args.cutoff is not None and args.cutoff.tzinfo is None:
         parser.error("截止时间必须包含时区")
-    return Options(**vars(args))
+    if args.not_before is not None and args.not_before.tzinfo is None:
+        parser.error("切换时间必须包含时区")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     try:
         return run(parse_options(argv))
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
-        LOGGER.error("正文清理未完成，已停止且未推进失败批次游标，请核查维护记录")
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        # 这些异常文本只含退出码、路径或固定说明，不含正文，可直接记录失败原因
+        LOGGER.error("正文清理未完成：%s；已停止且未推进失败批次游标", error)
         return 1
 
 

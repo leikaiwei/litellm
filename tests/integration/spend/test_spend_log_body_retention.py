@@ -16,6 +16,8 @@ import time
 import unittest
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import PurePath
 from typing import Final, TypeAlias, cast
 
 Json: TypeAlias = "None | bool | int | float | str | list[Json] | dict[str, Json]"
@@ -254,14 +256,24 @@ CASES: Final = (
         _row(
             "b-old-encoded",
             "2026-06-01T00:00:00",
-            metadata=json.dumps(METADATA),
-            response=json.dumps({"usage": USAGE, "text": BODY}),
+            metadata=json.dumps(
+                {
+                    **METADATA,
+                    "usage_object": json.dumps({"units": 7, "attribution": BODY}),
+                    "additional_usage_values": {"units": 8, "attribution": BODY},
+                }
+            ),
+            response=json.dumps(
+                {"usage": {**USAGE, "attribution": BODY}, "message": {"usage": {"units": 9, "attribution": BODY}}}
+            ),
         ),
         {
             "messages": {},
             "proxy_server_request": {},
-            "response": json.dumps({"usage": USAGE}),
-            "metadata": json.dumps(CLEAN_METADATA),
+            "response": json.dumps({"usage": USAGE, "message": {"usage": {"units": 9}}}),
+            "metadata": json.dumps(
+                {**CLEAN_METADATA, "usage_object": json.dumps({"units": 7}), "additional_usage_values": {"units": 8}}
+            ),
         },
     ),
     FixtureCase(
@@ -632,6 +644,68 @@ FOR EACH ROW WHEN (OLD.request_id='c-old-legacy') EXECUTE FUNCTION fixture_corru
                 else {}
             )
             self.assertEqual(_normalized(after[request_id]), _normalized({**row, **changes}), request_id)
+
+    def test_cutover_excludes_older_requests_during_preview_resume_and_overlap(self) -> None:
+        floor: Final = (datetime.now(timezone.utc) - timedelta(days=31)).replace(microsecond=0)
+        _ = self.sql(f"""UPDATE "LiteLLM_SpendLogs" SET "startTime" = '{floor.isoformat()}'::timestamp +
+            CASE request_id WHEN 'a-old-object' THEN interval '-1 second' WHEN 'b-old-encoded' THEN interval '0'
+            WHEN 'c-old-legacy' THEN interval '1 second' ELSE interval '2 seconds' END""")
+        opts: Final = ("--retention-days", "30", "--not-before", floor.isoformat())
+        cutoff: Final = (floor + timedelta(seconds=2)).isoformat()
+        before: Final = self.snapshot()
+        _ = self.cleanup(*opts, "--apply", "--cutoff", floor.isoformat())
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotEqual(self.command(("test", "-e", self.state)).returncode, 0)
+        _ = self.cleanup(*opts, "--apply", "--cutoff", (floor + timedelta(days=2)).isoformat(), success=False)
+        self.assertEqual(self.snapshot(), before)
+        preview: Final = self.cleanup(*opts, "--cutoff", cutoff)
+        self.assertIn("扫描 2 条，正文 2 条", preview.stdout)
+        self.assertEqual(self.snapshot(), before)
+        _ = self.cleanup(*opts, "--apply", "--cutoff", cutoff, "--batch-size", "1", "--max-batches", "1")
+        self.assertEqual(self.snapshot()["c-old-legacy"], before["c-old-legacy"])
+        _ = self.cleanup(*opts, "--apply", "--cutoff", cutoff)
+        after: Final = self.snapshot()
+        changes: Final = {str(case.row["request_id"]): case.changes for case in CASES if case.changes}
+        expected: Final = {
+            **before,
+            "b-old-encoded": {**before["b-old-encoded"], **changes["b-old-encoded"]},
+            "c-old-legacy": {**before["c-old-legacy"], **changes["c-old-legacy"]},
+        }
+        self.assertEqual(
+            {key: _normalized(row) for key, row in after.items()},
+            {key: _normalized(row) for key, row in expected.items()},
+        )
+        overlap: Final = self.cleanup(*opts, "--apply", "--cutoff", cutoff)
+        self.assertIn("扫描 2 条，正文 0 条", overlap.stdout)
+        self.assertEqual(self.snapshot(), after)
+
+    def test_init_reuses_cutover_without_resetting_an_advanced_cursor(self) -> None:
+        directory: Final = self.directory + "/window"
+        script: Final = str(PurePath(self.script).with_name("initialize_retention.py"))
+        init: Final = ("python3", script, "--directory", directory, "--cutover")
+        floor: Final = datetime.now(timezone.utc) - timedelta(days=1)
+        first: Final = self.command((*init, floor.isoformat()))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        state: Final = directory + "/state.json"
+        original: Final = {
+            "identity": "litellm_db/litellm/30",
+            "completed_cutoff": floor.replace(tzinfo=None).isoformat(),
+        }
+        self.assertEqual(json.loads(self.command(("cat", state)).stdout), original)
+        advanced: Final = json.dumps({**original, "cursor": {"start_time": floor.isoformat(), "request_id": "test"}})
+        write: Final = self.command(
+            ("python3", "-c", "import sys,pathlib; pathlib.Path(sys.argv[1]).write_text(sys.stdin.read())", state),
+            stdin=advanced,
+        )
+        self.assertEqual(write.returncode, 0, write.stderr)
+        same: Final = self.command((*init, floor.astimezone(timezone(timedelta(hours=8))).isoformat()))
+        self.assertEqual(same.returncode, 0, same.stderr)
+        other: Final = self.command((*init, (floor - timedelta(seconds=1)).isoformat()))
+        self.assertNotEqual(other.returncode, 0)
+        self.assertEqual(self.command(("cat", state)).stdout, advanced)
+        self.assertEqual(
+            self.command(("cat", directory + "/window.env")).stdout, f"SPENDLOGS_CUTOVER_UTC={floor.isoformat()}\n"
+        )
 
     def test_existing_file_lock_prevents_concurrent_run(self) -> None:
         before: Final = self.snapshot()
