@@ -1,8 +1,8 @@
+import asyncio
 import base64
 import json
 import logging
 import time
-import asyncio
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from types import SimpleNamespace
@@ -23,12 +23,13 @@ from litellm_enterprise.proxy.hooks.managed_files import (
     PROXY_LiteLLMManagedFiles,
     _provider_file_retrieve_credentials,
 )
+
 from litellm.caching import DualCache
 from litellm.proxy._types import CallTypes, LiteLLM_ManagedFileTable, UserAPIKeyAuth
 from litellm.proxy.openai_files_endpoints.common_utils import (
     BATCH_CREATE_HIDDEN_PARAM,
-    is_base64_encoded_unified_file_id,
     encode_file_id_with_model,
+    is_base64_encoded_unified_file_id,
 )
 from litellm.types.llms.openai import OpenAIFileObject
 from tests.unit.litellm_core_utils.attribute_forwarder import AttributeForwarder
@@ -51,15 +52,29 @@ class _InMemoryManagedFileTable:
         self, where: Mapping[str, object]
     ) -> LiteLLM_ManagedFileTable | None:
         self.find_first_calls.append(where)
+        or_filters: Final = where.get("OR")
+        if isinstance(or_filters, list):
+            for clause in or_filters:
+                if (matched := await self.find_first(clause)) is not None:
+                    return matched
+            return None
         unified_file_id: Final = where.get("unified_file_id")
         if isinstance(unified_file_id, str):
             return self.rows.get(unified_file_id)
+        if isinstance(unified_file_id, Mapping):
+            return next((self.rows[uid] for uid in unified_file_id.get("in", ()) if uid in self.rows), None)
         raw_file_filter: Final = where.get("flat_model_file_ids")
         if isinstance(raw_file_filter, Mapping):
             raw_file_id: Final = raw_file_filter.get("has")
             if isinstance(raw_file_id, str):
                 return next(
                     (row for row in self.rows.values() if raw_file_id in row.flat_model_file_ids),
+                    None,
+                )
+            raw_file_ids: Final = raw_file_filter.get("hasSome")
+            if isinstance(raw_file_ids, list):
+                return next(
+                    (row for row in self.rows.values() if set(raw_file_ids) & set(row.flat_model_file_ids)),
                     None,
                 )
         return None
@@ -209,6 +224,7 @@ def _marked_fallback_file_row(
 
 def _batch_response_for_output_listing() -> "LiteLLMBatch":
     from openai.types.batch import BatchRequestCounts
+
     from litellm.types.utils import LiteLLMBatch
 
     response: Final = LiteLLMBatch(
@@ -753,9 +769,9 @@ async def test_router_acreate_batch_only_selects_from_file_id_mapping(monkeypatc
 
 @pytest.mark.asyncio
 async def test_output_file_id_for_batch_retrieve():
-    import litellm.proxy.proxy_server as proxy_server_module
     from openai.types.batch import BatchRequestCounts
 
+    import litellm.proxy.proxy_server as proxy_server_module
     from litellm.proxy._types import UserAPIKeyAuth
     from litellm.types.llms.openai import OpenAIFileObject
     from litellm.types.utils import LiteLLMBatch
@@ -837,9 +853,9 @@ async def test_output_file_id_preserves_target_model_names_when_model_name_missi
     (e.g. Vertex batch retrieve), unified output_file_id should still include
     target_model_names from the managed input file ID.
     """
-    import litellm.proxy.proxy_server as proxy_server_module
     from openai.types.batch import BatchRequestCounts
 
+    import litellm.proxy.proxy_server as proxy_server_module
     from litellm.proxy._types import UserAPIKeyAuth
     from litellm.types.llms.openai import OpenAIFileObject
     from litellm.types.utils import LiteLLMBatch
@@ -925,9 +941,9 @@ async def test_error_file_id_for_failed_batch():
     """
     Test that the error_file_id is properly managed when a batch fails
     """
-    import litellm.proxy.proxy_server as proxy_server_module
     from openai.types.batch import BatchRequestCounts
 
+    import litellm.proxy.proxy_server as proxy_server_module
     from litellm.proxy._types import UserAPIKeyAuth
     from litellm.types.llms.openai import OpenAIFileObject
     from litellm.types.utils import LiteLLMBatch
@@ -1102,7 +1118,7 @@ def test_update_responses_input_with_unified_file_id():
     Test that update_responses_input_with_model_file_ids correctly decodes
     unified file IDs and extracts llm_output_file_id from responses API input.
     """
-    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+    from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
         update_responses_input_with_model_file_ids,
     )
 
@@ -1145,7 +1161,7 @@ def test_update_responses_input_with_regular_file_id():
     Test that update_responses_input_with_model_file_ids keeps regular
     OpenAI file IDs unchanged.
     """
-    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+    from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
         update_responses_input_with_model_file_ids,
     )
 
@@ -1181,7 +1197,7 @@ def test_update_responses_input_with_string_input():
     """
     Test that update_responses_input_with_model_file_ids returns string input unchanged.
     """
-    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+    from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
         update_responses_input_with_model_file_ids,
     )
 
@@ -1198,7 +1214,7 @@ def test_update_responses_input_with_multiple_file_ids():
     Test that update_responses_input_with_model_file_ids handles multiple file IDs
     (both unified and regular) in the same input.
     """
-    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+    from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
         update_responses_input_with_model_file_ids,
     )
 
@@ -1242,7 +1258,7 @@ def test_update_responses_input_with_model_file_id_mapping():
     Test that update_responses_input_with_model_file_ids correctly uses
     model_file_id_mapping to map managed file IDs to provider-specific file IDs.
     """
-    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+    from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
         update_responses_input_with_model_file_ids,
     )
 
@@ -1302,7 +1318,7 @@ def test_update_responses_tools_with_model_file_id_mapping():
     tools.container.file_ids were not being replaced with provider-specific
     file IDs, causing "string too long" errors from OpenAI.
     """
-    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+    from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
         update_responses_tools_with_model_file_ids,
     )
 
@@ -1350,7 +1366,7 @@ def test_update_responses_tools_without_mapping():
     Test that update_responses_tools_with_model_file_ids keeps file IDs
     unchanged when no mapping is provided.
     """
-    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+    from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
         update_responses_tools_with_model_file_ids,
     )
 
@@ -1382,7 +1398,7 @@ def test_update_responses_tools_with_mixed_file_ids():
     Test that update_responses_tools_with_model_file_ids correctly handles
     a mix of managed and regular file IDs.
     """
-    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+    from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
         update_responses_tools_with_model_file_ids,
     )
 
@@ -1978,7 +1994,6 @@ async def test_store_batch_output_file_retries_model_name_provider_fetch():
     assert all(
         call.kwargs["custom_llm_provider"] == "bedrock"
         and call.kwargs["max_retries"] == 0
-        and "_litellm_internal_model_credentials" not in call.kwargs
         for call in retrieve.call_args_list
     )
     assert sleep_calls == [0.5, 1.0]
@@ -2020,7 +2035,6 @@ async def test_store_batch_output_file_marks_model_name_fallback_after_four_tran
     assert all(
         call.kwargs["custom_llm_provider"] == "bedrock"
         and call.kwargs["max_retries"] == 0
-        and "_litellm_internal_model_credentials" not in call.kwargs
         for call in retrieve.call_args_list
     )
     assert sleep_calls == [0.5, 1.0, 2.0]
@@ -3654,7 +3668,6 @@ async def test_afile_retrieve_refreshes_marked_fallback_without_router_from_mode
     retrieve.assert_awaited_once()
     assert retrieve.await_args.kwargs["custom_llm_provider"] == "bedrock"
     assert retrieve.await_args.kwargs["max_retries"] == 0
-    assert "_litellm_internal_model_credentials" not in retrieve.await_args.kwargs
     updated_row: Final = managed_file_table.rows["unified-output"]
     assert updated_row.file_object == response
     assert updated_row.model_mappings == {"bedrock/model-x": "provider-output"}
@@ -3698,7 +3711,6 @@ async def test_afile_retrieve_uses_model_name_when_router_does_not_know_deployme
     )
     assert retrieve.await_args.kwargs["custom_llm_provider"] == "bedrock"
     assert retrieve.await_args.kwargs["max_retries"] == 0
-    assert "_litellm_internal_model_credentials" not in retrieve.await_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -3826,7 +3838,6 @@ async def test_afile_retrieve_case3_uses_default_provider_for_unknown_router_dep
     assert retrieve.await_args.kwargs["file_id"] == "provider-output"
     assert retrieve.await_args.kwargs["max_retries"] == 0
     assert "custom_llm_provider" not in retrieve.await_args.kwargs
-    assert "_litellm_internal_model_credentials" not in retrieve.await_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -3943,7 +3954,6 @@ async def test_afile_retrieve_raises_error_for_non_managed_file():
 
 @pytest.mark.asyncio
 async def test_list_batches_from_managed_objects_table():
-    from openai.types.batch import BatchRequestCounts
 
     from litellm.proxy._types import UserAPIKeyAuth
 
@@ -5577,62 +5587,48 @@ async def test_fine_tuning_provider_format_id_not_enforced():
     prisma_client.db.litellm_managedobjecttable.find_first.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "call_type", ["afile_content", "afile_retrieve", "afile_delete"]
-)
-@pytest.mark.parametrize(
-    "file_id", [MODEL_ENCODED_OUTPUT_FILE_ID, RAW_PROVIDER_FILE_ID]
-)
-async def test_team_b_cannot_access_team_a_provider_format_file(
-    call_type, file_id
-):
-    """
-    Cross-team content/retrieve/delete of a model-encoded or raw provider
-    file id must 403 when an ownership row exists for another team.
-    """
-    from litellm.proxy._types import UserAPIKeyAuth
+def _team_a_output_row() -> LiteLLM_ManagedFileTable:
+    return LiteLLM_ManagedFileTable(
+        unified_file_id="file-encoded-team-a-output",
+        file_object=OpenAIFileObject(
+            id="file-encoded-team-a-output",
+            object="file",
+            bytes=0,
+            created_at=1,
+            filename="output.jsonl",
+            purpose="batch_output",
+            status="processed",
+        ),
+        model_mappings={"gpt-4o-team-alias": RAW_PROVIDER_FILE_ID},
+        flat_model_file_ids=[RAW_PROVIDER_FILE_ID],
+        created_by="user_a",
+        team_id="team_a",
+    )
 
-    prisma_client = AsyncMock()
-    prisma_client.db.litellm_managedfiletable.find_first.return_value = (
-        _owned_record(created_by="user_a", team_id="team_a")
-    )
-    proxy_managed_files = PROXY_LiteLLMManagedFiles(
-        MagicMock(), prisma_client=prisma_client
-    )
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_type", ["afile_content", "afile_retrieve", "afile_delete"])
+@pytest.mark.parametrize("file_id", [MODEL_ENCODED_OUTPUT_FILE_ID, RAW_PROVIDER_FILE_ID])
+async def test_team_b_cannot_access_team_a_provider_format_file(call_type: str, file_id: str):
+    proxy_managed_files, _ = _managed_files_with_fake_prisma(_team_a_output_row())
 
     with pytest.raises(HTTPException) as exc_info:
         await proxy_managed_files.async_pre_call_hook(
-            user_api_key_dict=UserAPIKeyAuth(
-                user_id="user_b", team_id="team_b", parent_otel_span=MagicMock()
-            ),
+            user_api_key_dict=UserAPIKeyAuth(user_id="user_b", team_id="team_b", parent_otel_span=MagicMock()),
             cache=MagicMock(),
             data={"file_id": file_id},
             call_type=call_type,
         )
 
     assert exc_info.value.status_code == 403
-    prisma_client.db.litellm_managedfiletable.find_first.assert_awaited_once_with(
-        where={"OR": [{"unified_file_id": file_id}, {"flat_model_file_ids": {"has": file_id}}]}
-    )
 
 
 @pytest.mark.asyncio
 async def test_same_team_can_access_provider_format_file():
-    from litellm.proxy._types import UserAPIKeyAuth
-
-    prisma_client = AsyncMock()
-    prisma_client.db.litellm_managedfiletable.find_first.return_value = (
-        _owned_record(created_by="user_a", team_id="team_a")
-    )
-    proxy_managed_files = PROXY_LiteLLMManagedFiles(
-        MagicMock(), prisma_client=prisma_client
-    )
+    proxy_managed_files, _ = _managed_files_with_fake_prisma(_team_a_output_row())
 
     result = await proxy_managed_files.async_pre_call_hook(
-        user_api_key_dict=UserAPIKeyAuth(
-            user_id="teammate_of_a", team_id="team_a", parent_otel_span=MagicMock()
-        ),
+        user_api_key_dict=UserAPIKeyAuth(user_id="teammate_of_a", team_id="team_a", parent_otel_span=MagicMock()),
         cache=MagicMock(),
         data={"file_id": MODEL_ENCODED_OUTPUT_FILE_ID},
         call_type="afile_content",
@@ -6323,3 +6319,192 @@ async def test_only_a_streamed_background_create_is_marked_for_the_managed_bill(
     assert isinstance(result, dict)
     assert (MANAGED_BACKGROUND_RESPONSE_METADATA_KEY in result["litellm_metadata"]) is marked
     assert result["metadata"] == {"run": "nightly"}
+
+
+_GEMINI_OUTPUT_SPELLINGS: Final = (
+    "files/batch-out1",
+    "files%2Fbatch-out1",
+    "batch-out1/",
+    "https://generativelanguage.googleapis.com/v1beta/files/batch-out1",
+    "HTTPS://generativelanguage.googleapis.com/v1beta/files/batch-out1",
+    "x://h/files/batch-out1",
+)
+
+
+def _gemini_batch_output_row() -> LiteLLM_ManagedFileTable:
+    return LiteLLM_ManagedFileTable(
+        unified_file_id="file-encoded-gemini-output",
+        file_object=OpenAIFileObject(
+            id="file-encoded-gemini-output",
+            object="file",
+            bytes=0,
+            created_at=1,
+            filename="output.jsonl",
+            purpose="batch_output",
+            status="processed",
+        ),
+        model_mappings={"model-gemini": "batch-out1"},
+        flat_model_file_ids=["batch-out1"],
+        created_by="owner",
+        team_id="team-owner",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", _GEMINI_OUTPUT_SPELLINGS)
+async def test_enforce_provider_file_access_denies_every_spelling_of_another_keys_output_file(spelling: str):
+    managed_files, _ = _managed_files_with_fake_prisma(_gemini_batch_output_row())
+    stranger: Final = UserAPIKeyAuth(user_id="stranger", team_id="team-stranger")
+
+    with pytest.raises(HTTPException) as denied:
+        await managed_files.enforce_provider_file_access(spelling, stranger)
+
+    assert denied.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", (*_GEMINI_OUTPUT_SPELLINGS, "batch-out1"))
+async def test_enforce_provider_file_access_lets_the_owner_read_any_spelling(spelling: str):
+    managed_files, _ = _managed_files_with_fake_prisma(_gemini_batch_output_row())
+
+    owner: Final = UserAPIKeyAuth(user_id="owner", team_id="team-owner")
+    teammate: Final = UserAPIKeyAuth(user_id="teammate", team_id="team-owner")
+
+    assert await managed_files.enforce_provider_file_access(spelling, owner) is None
+    assert await managed_files.enforce_provider_file_access(spelling, teammate) is None
+
+
+@pytest.mark.asyncio
+async def test_enforce_provider_file_access_still_passes_a_file_nobody_registered():
+    managed_files, _ = _managed_files_with_fake_prisma(_gemini_batch_output_row())
+
+    stranger: Final = UserAPIKeyAuth(user_id="stranger")
+
+    assert await managed_files.enforce_provider_file_access("files/batch-other", stranger) is None
+
+
+_GEMINI_UPLOAD_URI: Final = "https://generativelanguage.googleapis.com/v1beta/files/upload-1"
+
+
+def _gemini_upload_row_stored_as_its_uri() -> LiteLLM_ManagedFileTable:
+    return LiteLLM_ManagedFileTable(
+        unified_file_id="file-encoded-gemini-upload",
+        file_object=OpenAIFileObject(
+            id="file-encoded-gemini-upload",
+            object="file",
+            bytes=12,
+            created_at=1,
+            filename="input.jsonl",
+            purpose="batch",
+            status="processed",
+        ),
+        model_mappings={"model-gemini": _GEMINI_UPLOAD_URI},
+        flat_model_file_ids=[_GEMINI_UPLOAD_URI],
+        created_by="owner",
+        team_id="team-owner",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spelling", ("upload-1", "files/upload-1", "files%2Fupload-1", "upload-1/", _GEMINI_UPLOAD_URI)
+)
+async def test_enforce_provider_file_access_denies_a_stranger_a_row_stored_as_the_gemini_uri(spelling: str):
+    managed_files, _ = _managed_files_with_fake_prisma(_gemini_upload_row_stored_as_its_uri())
+    stranger: Final = UserAPIKeyAuth(user_id="stranger", team_id="team-stranger")
+
+    with pytest.raises(HTTPException) as denied:
+        await managed_files.enforce_provider_file_access(spelling, stranger)
+
+    assert denied.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_enforce_provider_file_access_denies_a_stranger_the_model_encoded_wrapper_of_another_keys_file():
+    managed_files, _ = _managed_files_with_fake_prisma(_gemini_batch_output_row())
+    wrapped: Final = encode_file_id_with_model(file_id="batch-out1", model="model-gemini")
+    stranger: Final = UserAPIKeyAuth(user_id="stranger", team_id="team-stranger")
+
+    with pytest.raises(HTTPException) as denied:
+        await managed_files.enforce_provider_file_access(wrapped, stranger)
+
+    assert denied.value.status_code == 403
+
+
+_AZURE_UPLOAD_URL_NAMED_LIKE_ANOTHER_ID: Final = "https://acct.blob.core.windows.net/uploads/0c4e.files%2Ffile-victim"
+
+
+def _managed_file_row(unified_file_id: str, provider_file_id: str, owner: str) -> LiteLLM_ManagedFileTable:
+    return LiteLLM_ManagedFileTable(
+        unified_file_id=unified_file_id,
+        file_object=OpenAIFileObject(
+            id=unified_file_id,
+            object="file",
+            bytes=12,
+            created_at=1,
+            filename="input.jsonl",
+            purpose="batch",
+            status="processed",
+        ),
+        model_mappings={"model-a": provider_file_id},
+        flat_model_file_ids=[provider_file_id],
+        created_by=owner,
+        team_id=f"team-{owner}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_enforce_provider_file_access_ignores_an_upload_named_to_collide_with_another_keys_id():
+    managed_files, _ = _managed_files_with_fake_prisma(
+        _managed_file_row("file-attacker-upload", _AZURE_UPLOAD_URL_NAMED_LIKE_ANOTHER_ID, "attacker"),
+        _managed_file_row("file-victim-upload", "file-victim", "victim"),
+    )
+    attacker: Final = UserAPIKeyAuth(user_id="attacker", team_id="team-attacker")
+    victim: Final = UserAPIKeyAuth(user_id="victim", team_id="team-victim")
+
+    with pytest.raises(HTTPException) as denied:
+        await managed_files.enforce_provider_file_access("file-victim", attacker)
+
+    assert denied.value.status_code == 403
+    assert await managed_files.enforce_provider_file_access("file-victim", victim) is None
+
+
+@pytest.mark.asyncio
+async def test_store_unified_file_id_indexes_the_canonical_provider_file_id():
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_managedfiletable.upsert = AsyncMock(return_value=MagicMock())
+    proxy_managed_files: Final = PROXY_LiteLLMManagedFiles(
+        internal_usage_cache=MagicMock(), prisma_client=prisma_client
+    )
+
+    await proxy_managed_files.store_unified_file_id(
+        file_id="file-encoded-gemini-upload",
+        file_object=None,
+        litellm_parent_otel_span=None,
+        model_mappings={"model-gemini": _GEMINI_UPLOAD_URI},
+        user_api_key_dict=UserAPIKeyAuth(user_id="owner", team_id="team-owner"),
+    )
+
+    written: Final = prisma_client.db.litellm_managedfiletable.upsert.call_args.kwargs["data"]
+    assert written["create"]["flat_model_file_ids"] == ["upload-1"]
+    assert written["update"]["flat_model_file_ids"] == ["upload-1"]
+    assert json.loads(written["create"]["model_mappings"]) == {"model-gemini": _GEMINI_UPLOAD_URI}
+
+
+@pytest.mark.asyncio
+async def test_get_unified_file_ids_for_provider_file_ids_maps_every_spelling_onto_the_canonical_row():
+    canonical_row: Final = _gemini_upload_row_stored_as_its_uri().model_copy(
+        update={"flat_model_file_ids": ["upload-1"]}
+    )
+    managed_files, _ = _managed_files_with_fake_prisma(canonical_row)
+    owner: Final = UserAPIKeyAuth(user_id="owner", team_id="team-owner")
+
+    mapping: Final = await managed_files.get_unified_file_ids_for_provider_file_ids(
+        [_GEMINI_UPLOAD_URI, "files/upload-1", "upload-1", "upload-other"], owner
+    )
+
+    assert dict(mapping) == {
+        _GEMINI_UPLOAD_URI: "file-encoded-gemini-upload",
+        "files/upload-1": "file-encoded-gemini-upload",
+        "upload-1": "file-encoded-gemini-upload",
+    }

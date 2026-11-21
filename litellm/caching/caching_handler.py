@@ -21,7 +21,8 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Generator, Mapping
 from typing import TYPE_CHECKING, Any, Final, Optional, TypeVar
 
-from pydantic import BaseModel, ConfigDict, SkipValidation, TypeAdapter, ValidationError
+from pydantic import ConfigDict, SkipValidation, TypeAdapter, ValidationError
+from typing_extensions import TypedDict
 
 import litellm
 from litellm._internal_context import is_internal_call, post_response_phase
@@ -36,6 +37,7 @@ from litellm.litellm_core_utils.llm_response_utils.response_metadata import (
 from litellm.litellm_core_utils.logging_utils import (
     assemble_complete_response_from_streaming_chunks,
 )
+from litellm.llms.custom_httpx.sse_lines import split_sse_lines
 from litellm.types.caching import CACHED_STREAM_EVENTS_KEY, EMBEDDING_CACHE_FORMAT_VERSION, CachedEmbedding
 from litellm.types.integrations.custom_logger import converted_stream_requested
 from litellm.types.llms.base import LiteLLMBaseModel
@@ -47,7 +49,6 @@ from litellm.types.utils import (
     Choices,
     Embedding,
     EmbeddingResponse,
-    Message,
     ModelResponse,
     TextChoices,
     TextCompletionResponse,
@@ -68,6 +69,8 @@ _StreamResultT = TypeVar("_StreamResultT")
 
 
 from litellm.litellm_core_utils.core_helpers import (
+    as_object_list,
+    as_str_mapping,
     get_parent_otel_span_from_kwargs,
 )
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
@@ -89,6 +92,10 @@ class CachingHandlerResponse(LiteLLMBaseModel):
 
 
 in_memory_cache_obj: Final = InMemoryCache()
+
+
+class _CacheCallKwargs(TypedDict, total=False, extra_items=object):
+    pass
 
 
 def _drop_logging_obj_from_kwargs(request_kwargs: dict[str, object]) -> dict[str, object]:
@@ -129,41 +136,108 @@ def _is_chat_completion_cached_dict(cached_result: dict) -> bool:
     return "choices" in cached_result
 
 
-def _starts_content_block(event: object) -> bool:
-    text: Final = event.decode("utf-8", errors="replace") if isinstance(event, bytes) else event
-    return isinstance(text, str) and "event: content_block_start" in text.splitlines()
+_SSE_EVENT_DATA: Final = TypeAdapter(Mapping[str, object])
+
+
+def _sse_event_data(line: str) -> Mapping[str, object] | None:
+    if not line.startswith("data:"):
+        return None
+    try:
+        return _SSE_EVENT_DATA.validate_json(line.removeprefix("data:"))
+    except ValidationError:
+        return None
+
+
+def _content_block_payload(event: Mapping[str, object]) -> object:
+    match event.get("type"):
+        case "content_block_start":
+            return event.get("content_block")
+        case "content_block_delta":
+            return event.get("delta")
+        case _:
+            return None
+
+
+def _content_block_carries_output(block: object) -> bool:
+    fields: Final = as_str_mapping(block)
+    return fields is not None and any(key != "type" and value not in ("", [], None) for key, value in fields.items())
+
+
+def _sse_line_carries_output(line: str) -> bool:
+    event: Final = _sse_event_data(line)
+    return event is not None and _content_block_carries_output(_content_block_payload(event))
+
+
+def _sse_frame_carries_output(frame: object) -> bool:
+    text: Final = frame.decode("utf-8", errors="replace") if isinstance(frame, bytes) else frame
+    return isinstance(text, str) and any(_sse_line_carries_output(line) for line in split_sse_lines(text))
+
+
+_REPLAY_METADATA_FIELDS: Final = frozenset({"thought_signatures", "continuation_token"})
+
+
+def _message_field_carries_output(key: str, value: object) -> bool:
+    match key:
+        case "role":
+            return False
+        case "provider_specific_fields":
+            fields: Final = as_str_mapping(value) or {}
+            return any(
+                name not in _REPLAY_METADATA_FIELDS and field not in ("", [], {}, None)
+                for name, field in fields.items()
+            )
+        case _:
+            return value not in ("", [], {}, None)
+
+
+def _chat_message_fields(choice: object) -> Mapping[str, object] | None:
+    match choice:
+        case Choices():
+            return choice.message.model_dump(exclude_none=True)
+        case TextChoices():
+            return None
+        case _:
+            return as_str_mapping((as_str_mapping(choice) or {}).get("message"))
+
+
+def _choice_carries_output(choice: object) -> bool:
+    message: Final = _chat_message_fields(choice)
+    return message is None or any(_message_field_carries_output(key, value) for key, value in message.items())
+
+
+def _choices_carry_output(choices: object) -> bool:
+    return any(_choice_carries_output(choice) for choice in as_object_list(choices) or ())
 
 
 def is_response_without_output(result: object) -> bool:
     if isinstance(result, (ModelResponse, TextCompletionResponse)):
-        return not result.choices
+        return not _choices_carry_output(result.choices)
     if isinstance(result, ResponsesAPIResponse):
         return not getattr(result, "output", None)
-    if not isinstance(result, dict):
+    cached: Final = as_str_mapping(result)
+    if cached is None:
         return False
-    cached_stream_events: Final = result.get(CACHED_STREAM_EVENTS_KEY)
+    cached_stream_events: Final = cached.get(CACHED_STREAM_EVENTS_KEY)
     if isinstance(cached_stream_events, (list, tuple)):
-        return not any(_starts_content_block(event) for event in cached_stream_events)
-    if "choices" in result:
-        return not result["choices"]
-    if result.get("object") == "response":
-        return not result.get("output")
-    if result.get("type") == "message":
-        return not result.get("content")
+        return not any(_sse_frame_carries_output(event) for event in cached_stream_events)
+    if "choices" in cached:
+        return not _choices_carry_output(cached["choices"])
+    if cached.get("object") == "response":
+        return not cached.get("output")
+    if cached.get("type") == "message":
+        return not any(_content_block_carries_output(block) for block in as_object_list(cached.get("content")) or ())
     return False
 
 
-def _choice_carries_output(choice: Choices | TextChoices) -> bool:
-    payload: Final[Mapping[str, object]] = (
-        choice.message.model_dump(exclude_none=True) if isinstance(choice, Choices) else {"text": choice.text}
-    )
-    return any(key != "role" and value not in ("", [], {}) for key, value in payload.items())
+def _text_choice_carries_output(choice: TextChoices) -> bool:
+    text: Final[object] = choice.text
+    return text != ""
 
 
 def _assembled_stream_without_output(response: ModelResponse | TextCompletionResponse) -> bool:
-    """The stream wrapper closes a stream whose chunks carried no choice with an empty choice of its own, so the
-    assembled response has choices and the no-output check on it alone would store that empty answer."""
-    return not any(_choice_carries_output(choice) for choice in response.choices)
+    if isinstance(response, TextCompletionResponse):
+        return not any(_text_choice_carries_output(choice) for choice in response.choices)
+    return is_response_without_output(response)
 
 
 def _stream_replay_requested(kwargs: Mapping[str, object]) -> bool:
@@ -191,81 +265,6 @@ def _should_defer_streaming_cache_hit_callbacks(*, cached_result: object) -> boo
     return isinstance(
         cached_result, (CustomStreamWrapper, BaseResponsesAPIStreamingIterator, CachedAnthropicMessagesStreamIterator)
     )
-
-
-# Message.__init__ 会 del 掉未设置的可选字段（见 types/utils.py 的性能优化），
-# 属性真的不存在，故必须用 getattr 取默认值而非直接访问
-_OPTIONAL_CONTENT_FIELDS: Final = (
-    "tool_calls",
-    "function_call",
-    "reasoning_content",
-    "thinking_blocks",
-    "audio",
-    "images",
-)
-
-
-def _message_has_content(message: Message) -> bool:
-    content: Final = message.content
-    if content is not None and content != "":
-        return True
-    return any(getattr(message, field, None) for field in _OPTIONAL_CONTENT_FIELDS)
-
-
-class _AnthropicContentBlock(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    type: str | None = None
-    text: str | None = None
-
-
-class _AnthropicMessageResponse(BaseModel):
-    """``/v1/messages`` 非流式响应里判空需要的那几个字段，其余忽略。"""
-
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    type: str
-    content: tuple[_AnthropicContentBlock, ...] | None = None
-
-
-def _anthropic_block_has_content(block: _AnthropicContentBlock) -> bool:
-    """非 text 的块（tool_use / thinking）一律算内容，text 块要求真有文本。"""
-    return block.type != "text" or bool(block.text)
-
-
-def _narrow_result_for_content_check(result: object) -> "ModelResponse | _AnthropicMessageResponse | None":
-    """只把判空看得懂的两种形状交给 ``_is_contentless_result``，其余一律放行。"""
-    if isinstance(result, ModelResponse):
-        return result
-    try:
-        parsed: Final = _AnthropicMessageResponse.model_validate(result)
-    except ValidationError:
-        return None
-    return parsed if parsed.type == "message" else None
-
-
-def _is_contentless_result(result: "ModelResponse | _AnthropicMessageResponse | None") -> bool:
-    """一个内容块都没产出的回复不该进缓存。
-
-    上游概率性静默拒答会回 HTTP 200 + 空 content + finish_reason=stop，litellm 记为
-    success。缓存住它会让客户端在 TTL 内的每次重试都秒回同一个空回复，把一个重试就能
-    绕过的瞬时故障固化成用户看到的永久卡死。判空覆盖 content 之外的 tool_calls /
-    reasoning_content / thinking_blocks / audio / images，故纯工具调用与纯推理回复
-    不受影响。Anthropic Messages 形状（``/v1/messages`` 非流式，上游 1.99 起默认进缓存）
-    走 content 块数组这条分支；流式那条在
-    ``anthropic/pass_through/messages/response_cache.py`` 里按 SSE 形状判。
-    认不出的结果（embedding / rerank 等）由 ``_narrow_result_for_content_check``
-    收窄成 None，一律放行。
-    """
-    if result is None:
-        return False
-    if isinstance(result, ModelResponse):
-        if not result.choices:
-            return True
-        return not any(_message_has_content(choice.message) for choice in result.choices)
-    if result.content is None:
-        return False
-    return not any(_anthropic_block_has_content(block) for block in result.content)
 
 
 def _prompt_tokens_details_as_mapping(details: "PromptTokensDetailsWrapper") -> Mapping[str, object]:
@@ -531,7 +530,7 @@ class LLMCachingHandler:
         if litellm.cache is not None and self._is_call_type_supported_by_cache(original_function=original_function):
             args = args or ()
             # Now that we confirmed caching will happen, prepare kwargs
-            new_kwargs: Final = kwargs.copy()
+            new_kwargs: Final = dict[str, object](kwargs)
             new_kwargs.update(
                 convert_args_to_kwargs(
                     self.original_function,
@@ -546,7 +545,7 @@ class LLMCachingHandler:
             print_verbose("Checking Sync Cache")
             logging_obj.reset_caching_details()
             with response_cache_phase("get"):
-                cached_result = litellm.cache.get_cache(**new_kwargs)
+                cached_result = litellm.cache.get_cache(**_CacheCallKwargs(**new_kwargs))
             if is_response_without_output(cached_result):
                 verbose_logger.debug("LiteLLM Cache: cached response has no output, treating it as a miss")
                 return CachingHandlerResponse(cached_result=None)
@@ -556,7 +555,7 @@ class LLMCachingHandler:
                     pass
                 else:
                     call_type = original_function.__name__
-                    cached_result = self._convert_cached_result_to_model_response(
+                    converted_result: Final = self._convert_cached_result_to_model_response(
                         cached_result=cached_result,
                         call_type=call_type,
                         kwargs=kwargs,
@@ -584,16 +583,16 @@ class LLMCachingHandler:
                         logging_obj=logging_obj,
                         model=f"{custom_llm_provider}/{model}",
                         kwargs=kwargs,
-                        cached_result=cached_result,
+                        cached_result=converted_result,
                         is_async=False,
                         custom_llm_provider=custom_llm_provider,
                     )
 
                     if not is_internal_call.get() and not _should_defer_streaming_cache_hit_callbacks(
-                        cached_result=cached_result
+                        cached_result=converted_result
                     ):
                         logging_obj.handle_sync_cache_hit_success_callbacks(
-                            result=cached_result,
+                            result=converted_result,
                             start_time=start_time,
                             end_time=end_time,
                             cache_hit=cache_hit,
@@ -603,8 +602,8 @@ class LLMCachingHandler:
                         or self.request_kwargs.get("cache_key")
                         or litellm.cache.get_cache_key(**self.request_kwargs)
                     )
-                    _set_cached_hidden_param(cached_result, "cache_key", cache_key)
-                    return CachingHandlerResponse(cached_result=cached_result)
+                    _set_cached_hidden_param(converted_result, "cache_key", cache_key)
+                    return CachingHandlerResponse(cached_result=converted_result)
         return CachingHandlerResponse(cached_result=cached_result)
 
     _sync_get_cache = sync_get_cache
@@ -1026,22 +1025,14 @@ class LLMCachingHandler:
 
     def _convert_cached_result_to_model_response(
         self,
-        cached_result: Any,
+        cached_result: object,
         call_type: str,
         kwargs: dict[str, object],
         logging_obj: LiteLLMLoggingObj,
         model: str,
         args: tuple[object, ...],
         custom_llm_provider: str | None = None,
-    ) -> (
-        ModelResponse
-        | TextCompletionResponse
-        | EmbeddingResponse
-        | RerankResponse
-        | TranscriptionResponse
-        | CustomStreamWrapper
-        | None
-    ):
+    ) -> object:
         """
         Internal method to process the cached result
 
@@ -1217,7 +1208,7 @@ class LLMCachingHandler:
         self,
         result: object,
         original_function: Callable,
-        kwargs: dict[str, Any],
+        kwargs: Mapping[str, object],
         args: tuple[object, ...] | None = None,
     ):
         """
@@ -1245,7 +1236,7 @@ class LLMCachingHandler:
             return
         cache: Final = litellm.cache
 
-        new_kwargs: Final = kwargs.copy()
+        new_kwargs: Final = dict(kwargs)
         new_kwargs.update(
             convert_args_to_kwargs(
                 original_function,
@@ -1255,10 +1246,7 @@ class LLMCachingHandler:
         parent_otel_span: Final = get_parent_otel_span_from_kwargs(new_kwargs)
         new_kwargs["parent_otel_span"] = parent_otel_span
         # [OPTIONAL] ADD TO CACHE
-        cacheable_result: Final = _narrow_result_for_content_check(result)
-        if self.should_store_result_in_cache(
-            original_function=original_function, kwargs=new_kwargs, result=cacheable_result
-        ):
+        if self.should_store_result_in_cache(original_function=original_function, kwargs=new_kwargs):
             if (
                 isinstance(result, litellm.ModelResponse)
                 or isinstance(result, litellm.EmbeddingResponse)
@@ -1285,7 +1273,7 @@ class LLMCachingHandler:
                         )
                     )
             else:
-                create_cache_write_task(lambda: cache.async_add_cache(result, **new_kwargs))
+                create_cache_write_task(lambda: cache.async_add_cache(result, **_CacheCallKwargs(**new_kwargs)))
 
     def sync_set_cache(
         self,
@@ -1310,20 +1298,14 @@ class LLMCachingHandler:
             )
         )
 
-        sync_cacheable_result: Final = _narrow_result_for_content_check(result)
-        if self.should_store_result_in_cache(
-            original_function=self.original_function, kwargs=new_kwargs, result=sync_cacheable_result
-        ):
+        if self.should_store_result_in_cache(original_function=self.original_function, kwargs=new_kwargs):
             with response_cache_phase("set"):
                 litellm.cache.add_cache(result, **new_kwargs)
 
         return
 
     def should_store_result_in_cache(
-        self,
-        original_function: Callable[..., object],
-        kwargs: Mapping[str, object],
-        result: "ModelResponse | _AnthropicMessageResponse | None" = None,
+        self, original_function: Callable[..., object], kwargs: Mapping[str, object]
     ) -> bool:
         """
         Helper function to determine if the result should be stored in the cache.
@@ -1344,7 +1326,6 @@ class LLMCachingHandler:
             not _is_response_cache_excluded(model=model, kwargs=kwargs)
             and self._is_call_type_supported_by_cache(original_function=original_function)
             and no_store is not True
-            and not _is_contentless_result(result)
         )
 
     _should_store_result_in_cache = should_store_result_in_cache

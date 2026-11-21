@@ -60,7 +60,6 @@ from litellm.types.decisions import (
     systemone_choice_key,
 )
 from litellm.types.utils import is_decisions_model_mode
-from litellm.utils import get_model_info_helper
 
 _PAYLOAD_ADAPTER: Final[TypeAdapter[object]] = TypeAdapter(object)
 _SYSTEMONE_RESPONSE_ADAPTER: Final[TypeAdapter[DecisionsResponse]] = TypeAdapter(DecisionsResponse)
@@ -432,6 +431,10 @@ class DecisionsResponseValidationError(BaseLLMException):
     pass
 
 
+def _lacks_confidence(answer: DecisionsIRAnswer) -> bool:
+    return isinstance(answer, (DecisionsIRChoiceAnswer, DecisionsIRScoreAnswer)) and answer.confidence is None
+
+
 def parse_systemone_response(payload: object, request: DecisionsIRRequest) -> DecisionsIRResponse:
     return systemone_response_to_ir(
         _SYSTEMONE_RESPONSE_ADAPTER.validate_python(_normalize_systemone_response(payload)), request
@@ -501,9 +504,7 @@ def ir_to_systemone_response(response: DecisionsIRResponse, request: DecisionsIR
 
 def catalog_mode(model: str, custom_llm_provider: str) -> str | None:
     try:
-        key: Final = get_model_info_helper(model=model, custom_llm_provider=custom_llm_provider, catalog_only=True)[
-            "key"
-        ]
+        key: Final = litellm.get_model_info(model=model, custom_llm_provider=custom_llm_provider)["key"]
     except Exception:  # noqa: BLE001  # get_model_info raises bare Exception for an unmapped model, which the catalog does not list
         return None
     entry: Final = GetModelCostMap.loaded_model_cost_map().get(key)
@@ -513,9 +514,7 @@ def catalog_mode(model: str, custom_llm_provider: str) -> str | None:
 
 def _is_decisions_model(model: str, custom_llm_provider: str) -> bool:
     try:
-        model_mode: Final = get_model_info_helper(
-            model=model, custom_llm_provider=custom_llm_provider, catalog_only=True
-        ).get("mode")
+        model_mode: Final = litellm.get_model_info(model=model, custom_llm_provider=custom_llm_provider).get("mode")
     except Exception:  # noqa: BLE001  # get_model_info raises bare Exception for an unmapped model, which has no mode
         return False
     return is_decisions_model_mode(model_mode)
@@ -539,6 +538,8 @@ class BaseDecisionsConfig(ABC):
     max_total_image_bytes: int | None = None
     image_media_types: frozenset[str] | None = None
     inlines_remote_images: bool = False
+    openai_evidence_fields: frozenset[str] = frozenset()
+    confidence_optional: bool = False
     health_check_questions: Mapping[str, Mapping[str, object]] = MappingProxyType(
         {"reachable": MappingProxyType({"type": "noul", "instructions": "Is the service reachable?"})}
     )
@@ -687,13 +688,20 @@ class BaseDecisionsConfig(ABC):
     ) -> DecisionsIRResponse:
         try:
             payload: Final[object] = _PAYLOAD_ADAPTER.validate_json(raw_response.content)
-            return self.parse_response(payload, request)
+            response: Final = self.parse_response(payload, request)
         except ValidationError as error:
             raise DecisionsResponseValidationError(
                 status_code=500,
                 message=f"Decisions provider '{custom_llm_provider}' returned an unexpected response: "
                 f"{error.title} {_validation_summary(error)}",
             ) from error
+        if not self.confidence_optional and any(_lacks_confidence(answer) for answer in response.answers):
+            raise DecisionsResponseValidationError(
+                status_code=500,
+                message=f"Decisions provider '{custom_llm_provider}' returned an unexpected response: "
+                "a choice or score answer has no confidence",
+            )
+        return response
 
     def get_error_class(
         self,

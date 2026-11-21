@@ -3,7 +3,7 @@ import itertools
 import logging
 import mimetypes
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import MappingProxyType
@@ -17,12 +17,14 @@ from typing import (
     get_args,
     runtime_checkable,
 )
+from urllib.parse import unquote, urlparse
 
 from pydantic import TypeAdapter
 from typing_extensions import NotRequired, ReadOnly, TypedDict
 
-from litellm.batches.batch_utils import batch_cost_is_final
 from litellm.constants import MAX_FILE_LIST_LIMIT
+from litellm.litellm_core_utils.batch_utils import batch_cost_is_final
+from litellm.litellm_core_utils.core_helpers import as_str_mapping
 from litellm.proxy._types import ProxyException
 from litellm.repositories.managed_file_repository import ManagedFileRepository
 from litellm.repositories.table_repositories import (
@@ -347,6 +349,50 @@ def get_original_file_id(encoded_id: str) -> str:
         return encoded_id
 
 
+_GEMINI_FILES_HOST: Final = "generativelanguage.googleapis.com"
+
+
+def canonical_provider_file_id(file_id: str) -> str:
+    """The one spelling of a provider file id that ownership rows store and look up, so ``files/abc``,
+    ``files%2Fabc``, ``abc/`` and the Gemini file URL all resolve to the bare ``abc``. Every other URL or URI
+    (``s3://``, ``gs://``, a storage blob URL) is returned unchanged, so an upload whose name happens to contain
+    ``files/<id>`` never indexes someone else's ``<id>``."""
+    decoded: Final = unquote(file_id).strip()
+    is_url: Final = "://" in decoded
+    if is_url and urlparse(decoded).hostname != _GEMINI_FILES_HOST:
+        return file_id
+    path: Final = urlparse(decoded).path if is_url else decoded
+    files_index: Final = path.find("files/")
+    bare: Final = (path[files_index:] if files_index != -1 else path).strip("/").removeprefix("files/").strip("/")
+    return bare or decoded
+
+
+_GEMINI_FILES_URL: Final = "https://generativelanguage.googleapis.com/v1beta/files/"
+
+
+def _gemini_files_tail(file_id: str) -> str:
+    """The id Gemini resolves ``file_id`` to, whatever scheme or case wraps it: the text after its ``files/``."""
+    files_index: Final = file_id.find("files/")
+    return file_id[files_index:].strip("/").removeprefix("files/").strip("/") if files_index != -1 else ""
+
+
+def _iter_stored_forms(bare_ids: Sequence[str]) -> Iterator[str]:
+    for bare_id in bare_ids:
+        yield bare_id
+        yield f"files/{bare_id}"
+        yield f"{_GEMINI_FILES_URL}{bare_id}"
+
+
+def provider_file_id_spellings(file_id: str) -> tuple[str, ...]:
+    """Every spelling an ownership row may hold for ``file_id``: as sent, unwrapped from a model-encoded id and
+    canonicalized, reduced the way Gemini reduces it, plus the ``files/`` and Gemini URL forms that upload rows
+    stored before ids were canonicalized."""
+    original: Final = get_original_file_id(file_id)
+    reductions: Final = (canonical_provider_file_id(original), _gemini_files_tail(unquote(original)))
+    bare_ids: Final = tuple(dict.fromkeys(bare for bare in reductions if bare))
+    return tuple(dict.fromkeys((file_id, *_iter_stored_forms(bare_ids))))
+
+
 def is_model_embedded_id(file_id: str) -> bool:
     """
     Check if a file/batch ID has model routing information embedded.
@@ -597,7 +643,7 @@ def get_team_provider_credentials(
         return isinstance(public_model_name, str) and _key_allowlist_covers(public_model_name, key_model_allowlist)
 
     def _provider_credentials(model_id: str) -> dict[str, object] | None:
-        credentials: Final = registry.credentials(model_id, form="with_provider", team_id=team_id)
+        credentials: Final = as_str_mapping(registry.credentials(model_id, form="with_provider", team_id=team_id))
         if credentials is not None and credentials.get("custom_llm_provider") == custom_llm_provider:
             return {key: value for key, value in credentials.items() if key != "model"}
         return None
@@ -741,31 +787,6 @@ def apply_team_provider_credentials(
     prepare_data_with_credentials(data=data, credentials={**credentials, **explicit_request_credentials(data)})
 
 
-def add_internal_model_credentials(
-    data: dict,
-    llm_router: "Router",
-    model_id: str | None,
-) -> None:
-    """
-    Attach the deployment's immutable server-side credential snapshot to a router-routed
-    batch call (in-place).
-
-    Cost accounting for a completed batch reads the batch's output file, and the Bedrock
-    file config resolves its bucket only from this snapshot, never from a request param,
-    because the bucket is what managed file ids are validated against. Without it that
-    read fails and the batch's cost is never recorded.
-    """
-    if model_id is None:
-        return
-    try:
-        credentials: Final = llm_router.registry().credentials(model_id, form="with_provider")
-    except Exception:  # noqa: BLE001  # the snapshot only enables cost accounting; a batch whose deployment no longer resolves must still be retrievable
-        return
-    if credentials is None:
-        return
-    data["_litellm_internal_model_credentials"] = MappingProxyType(dict(credentials))
-
-
 def add_deployment_model_info(
     data: dict,
     llm_router: Optional["Router"],
@@ -791,7 +812,6 @@ def prepare_data_with_credentials(
     data: dict,
     credentials: dict,
     file_id: str | None = None,
-    include_internal_credentials: bool = False,
 ) -> None:
     """
     Update data dictionary with model credentials (in-place).
@@ -800,12 +820,8 @@ def prepare_data_with_credentials(
         data: Data dictionary to update
         credentials: Credentials from router
         file_id: Optional original file_id to set (for decoded file IDs)
-        include_internal_credentials: Preserve an immutable server-side snapshot
-            for code paths that must distinguish proxy config from request params.
     """
     data.update(credentials)
-    if include_internal_credentials:
-        data["_litellm_internal_model_credentials"] = MappingProxyType(dict(credentials))
     data.pop("custom_llm_provider", None)
 
     if file_id is not None:
@@ -1575,6 +1591,10 @@ async def get_batch_from_database(
         return None, None
 
 
+class _BatchCostJobScheduler(Protocol):
+    def get_job(self, job_id: str, /) -> object: ...
+
+
 def batch_cost_poller_is_active() -> bool:
     """
     Whether the CheckBatchCost poller will account for a managed batch's cost itself.
@@ -1595,10 +1615,10 @@ def batch_cost_poller_is_active() -> bool:
     try:
         import litellm.proxy.proxy_server as proxy_server_module
 
-        scheduler = getattr(proxy_server_module, "scheduler", None)
+        scheduler: Final[_BatchCostJobScheduler | None] = getattr(proxy_server_module, "scheduler", None)
         if scheduler is None:
             return False
-        job = scheduler.get_job("check_batch_cost_job")
+        job: Final = scheduler.get_job("check_batch_cost_job")
         if job is None:
             return False
         poller = getattr(getattr(job, "func", None), "__self__", None)

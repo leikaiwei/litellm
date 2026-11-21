@@ -21,6 +21,7 @@ from litellm.litellm_core_utils.llm_cost_calc.utils import (
     calculate_cache_writing_cost,
     generic_cost_per_token,
     get_billed_token_rates,
+    get_regional_uplift_multiplier,
     get_token_type_cost_breakdown,
 )
 from litellm.llms.gemini.image_generation.cost_calculator import (
@@ -29,9 +30,11 @@ from litellm.llms.gemini.image_generation.cost_calculator import (
 from litellm.llms.vertex_ai.image_generation.cost_calculator import (
     cost_calculator as vertex_image_generation_cost_calculator,
 )
+from litellm.types.llms.base import CachedTokensDetails
 from litellm.types.utils import (
     CacheCreationTokenDetails,
     CompletionTokensDetailsWrapper,
+    DataResidency,
     ImageObject,
     ImageResponse,
     ImageUsage,
@@ -40,6 +43,62 @@ from litellm.types.utils import (
     PromptTokensDetailsWrapper,
     Usage,
 )
+
+
+def test_realtime_cached_modality_breakdown_matches_prompt_cost(_local_model_cost_map):
+    model: Final = "gpt-realtime-2.1-mini"
+    rates: Final = litellm.model_cost[model]
+    usage: Final = Usage(
+        prompt_tokens=1000,
+        completion_tokens=0,
+        total_tokens=1000,
+        prompt_tokens_details=PromptTokensDetailsWrapper(
+            text_tokens=400,
+            audio_tokens=400,
+            image_tokens=200,
+            cached_tokens=300,
+            cached_tokens_details=CachedTokensDetails(text_tokens=100, audio_tokens=150, image_tokens=50),
+        ),
+    )
+
+    prompt_cost, _ = generic_cost_per_token(model=model, usage=usage, custom_llm_provider="openai")
+    breakdown: Final = get_token_type_cost_breakdown(model=model, custom_llm_provider="openai", usage=usage)
+    cached_cost: Final = (
+        100 * rates["cache_read_input_token_cost"]
+        + 150 * rates["cache_read_input_audio_token_cost"]
+        + 50 * rates["cache_read_input_image_token_cost"]
+    )
+    uncached_cost: Final = (
+        300 * rates["input_cost_per_token"]
+        + 250 * rates["input_cost_per_audio_token"]
+        + 150 * rates["input_cost_per_image_token"]
+    )
+
+    assert breakdown.cache_read_cost == pytest.approx(cached_cost)
+    assert prompt_cost == pytest.approx(uncached_cost + cached_cost)
+
+
+def test_image_model_bills_cached_image_tokens_at_its_cached_image_rate(_local_model_cost_map):
+    model: Final = "gpt-image-2"
+    rates: Final = litellm.model_cost[model]
+    usage: Final = Usage(
+        prompt_tokens=1000,
+        completion_tokens=0,
+        total_tokens=1000,
+        prompt_tokens_details=PromptTokensDetailsWrapper(
+            text_tokens=200,
+            image_tokens=800,
+            cached_tokens=600,
+            cached_tokens_details=CachedTokensDetails(text_tokens=100, image_tokens=500),
+        ),
+    )
+
+    prompt_cost, _ = generic_cost_per_token(model=model, usage=usage, custom_llm_provider="openai")
+    cached_cost: Final = 100 * rates["cache_read_input_token_cost"] + 500 * rates["cache_read_input_image_token_cost"]
+    uncached_cost: Final = 100 * rates["input_cost_per_token"] + 300 * rates["input_cost_per_image_token"]
+
+    assert rates["cache_read_input_image_token_cost"] != rates["cache_read_input_token_cost"]
+    assert prompt_cost == pytest.approx(uncached_cost + cached_cost)
 
 
 @pytest.fixture
@@ -324,15 +383,18 @@ def test_reasoning_tokens_gemini(_local_model_cost_map):
     )
 
 
-def test_image_tokens_with_custom_pricing() -> None:
+def test_image_tokens_with_custom_pricing():
     """Test that image_tokens in completion are properly costed with output_cost_per_image_token."""
-    model_info: Final = {
+    from unittest.mock import patch
+
+    # Mock model info with image token pricing
+    mock_model_info = {
         "input_cost_per_token": 1e-6,
         "output_cost_per_token": 2e-6,
         "output_cost_per_image_token": 5e-6,  # Custom pricing for image tokens in output
     }
 
-    usage: Final = Usage(
+    usage = Usage(
         completion_tokens=1720,  # text_tokens (600) + image_tokens (1120)
         prompt_tokens=14,
         total_tokens=1734,
@@ -349,32 +411,36 @@ def test_image_tokens_with_custom_pricing() -> None:
         ),
     )
 
-    prompt_cost, completion_cost = generic_cost_per_token(
-        model="test-model",
-        usage=usage,
-        custom_llm_provider="gemini",
-        model_info=cast(ModelInfo, model_info),
-    )
+    with patch(
+        "litellm.litellm_core_utils.llm_cost_calc.utils.get_model_info",
+        return_value=mock_model_info,
+    ):
+        prompt_cost, completion_cost = generic_cost_per_token(
+            model="test-model", usage=usage, custom_llm_provider="gemini"
+        )
 
     # Expected costs:
     # Prompt: 14 * 1e-6
     # Completion: (600 * 2e-6) + (1120 * 5e-6)
-    expected_prompt_cost: Final = 14 * 1e-6
-    expected_completion_cost: Final = (600 * 2e-6) + (1120 * 5e-6)
+    expected_prompt_cost = 14 * 1e-6
+    expected_completion_cost = (600 * 2e-6) + (1120 * 5e-6)
 
     assert round(prompt_cost, 12) == round(expected_prompt_cost, 12)
     assert round(completion_cost, 12) == round(expected_completion_cost, 12)
 
 
-def test_image_tokens_fallback_to_base_cost() -> None:
+def test_image_tokens_fallback_to_base_cost():
     """Test that image_tokens fall back to base cost when output_cost_per_image_token is not set."""
-    model_info: Final = {
+    from unittest.mock import patch
+
+    # Mock model info without image token pricing
+    mock_model_info = {
         "input_cost_per_token": 1e-6,
         "output_cost_per_token": 2e-6,
         # No output_cost_per_image_token defined
     }
 
-    usage: Final = Usage(
+    usage = Usage(
         completion_tokens=1720,
         prompt_tokens=14,
         total_tokens=1734,
@@ -391,18 +457,19 @@ def test_image_tokens_fallback_to_base_cost() -> None:
         ),
     )
 
-    prompt_cost, completion_cost = generic_cost_per_token(
-        model="test-model",
-        usage=usage,
-        custom_llm_provider="gemini",
-        model_info=cast(ModelInfo, model_info),
-    )
+    with patch(
+        "litellm.litellm_core_utils.llm_cost_calc.utils.get_model_info",
+        return_value=mock_model_info,
+    ):
+        prompt_cost, completion_cost = generic_cost_per_token(
+            model="test-model", usage=usage, custom_llm_provider="gemini"
+        )
 
     # Expected costs:
     # Prompt: 14 * 1e-6
     # Completion: (600 * 2e-6) + (1120 * 2e-6)  # image_tokens use base cost
-    expected_prompt_cost: Final = 14 * 1e-6
-    expected_completion_cost: Final = (600 * 2e-6) + (1120 * 2e-6)
+    expected_prompt_cost = 14 * 1e-6
+    expected_completion_cost = (600 * 2e-6) + (1120 * 2e-6)
 
     assert round(prompt_cost, 12) == round(expected_prompt_cost, 12)
     assert round(completion_cost, 12) == round(expected_completion_cost, 12)
@@ -433,14 +500,16 @@ def test_video_input_tokens_gemini_omni_flash_preview(_local_model_cost_map):
     )
 
 
-def test_video_tokens_fallback_to_base_cost() -> None:
+def test_video_tokens_fallback_to_base_cost():
     """Video output tokens fall back to the base output rate when output_cost_per_video_token is not set."""
-    model_info: Final = {
+    from unittest.mock import patch
+
+    mock_model_info = {
         "input_cost_per_token": 1e-6,
         "output_cost_per_token": 2e-6,
     }
 
-    usage: Final = Usage(
+    usage = Usage(
         completion_tokens=1720,
         prompt_tokens=14,
         total_tokens=1734,
@@ -451,27 +520,30 @@ def test_video_tokens_fallback_to_base_cost() -> None:
         prompt_tokens_details=PromptTokensDetailsWrapper(text_tokens=14),
     )
 
-    prompt_cost, completion_cost = generic_cost_per_token(
-        model="test-model",
-        usage=usage,
-        custom_llm_provider="gemini",
-        model_info=cast(ModelInfo, model_info),
-    )
+    with patch(
+        "litellm.litellm_core_utils.llm_cost_calc.utils.get_model_info",
+        return_value=mock_model_info,
+    ):
+        prompt_cost, completion_cost = generic_cost_per_token(
+            model="test-model", usage=usage, custom_llm_provider="gemini"
+        )
 
     assert round(prompt_cost, 12) == round(14 * 1e-6, 12)
     assert round(completion_cost, 12) == round((600 + 1120) * 2e-6, 12)
 
 
-def test_prompt_audio_and_video_tokens_without_modality_rates_bill_at_tiered_input_rate() -> None:
+def test_prompt_audio_and_video_tokens_without_modality_rates_bill_at_tiered_input_rate():
     """Prompt audio/video tokens with no modality rate are prompt tokens, so a >200k prompt bills them above-200k."""
-    model_info: Final = {
+    from unittest.mock import patch
+
+    mock_model_info = {
         "input_cost_per_token": 2e-6,
         "input_cost_per_token_above_200k_tokens": 4e-6,
         "output_cost_per_token": 1.2e-5,
         "output_cost_per_token_above_200k_tokens": 1.8e-5,
     }
 
-    usage: Final = Usage(
+    usage = Usage(
         prompt_tokens=816032,
         completion_tokens=4559,
         total_tokens=820591,
@@ -479,20 +551,23 @@ def test_prompt_audio_and_video_tokens_without_modality_rates_bill_at_tiered_inp
         completion_tokens_details=CompletionTokensDetailsWrapper(text_tokens=4559),
     )
 
-    prompt_cost, completion_cost = generic_cost_per_token(
-        model="test-model",
-        usage=usage,
-        custom_llm_provider="vertex_ai",
-        model_info=cast(ModelInfo, model_info),
-    )
+    with patch(
+        "litellm.litellm_core_utils.llm_cost_calc.utils.get_model_info",
+        return_value=mock_model_info,
+    ):
+        prompt_cost, completion_cost = generic_cost_per_token(
+            model="test-model", usage=usage, custom_llm_provider="vertex_ai"
+        )
 
     assert round(prompt_cost, 9) == round(816032 * 4e-6, 9)
     assert round(completion_cost, 9) == round(4559 * 1.8e-5, 9)
 
 
-def test_prompt_modality_rates_still_win_over_tiered_input_rate() -> None:
+def test_prompt_modality_rates_still_win_over_tiered_input_rate():
     """An explicit input_cost_per_audio_token / input_cost_per_video_token beats the fallback, even above 200k."""
-    model_info: Final = {
+    from unittest.mock import patch
+
+    mock_model_info = {
         "input_cost_per_token": 2e-6,
         "input_cost_per_token_above_200k_tokens": 4e-6,
         "input_cost_per_audio_token": 3e-6,
@@ -500,7 +575,7 @@ def test_prompt_modality_rates_still_win_over_tiered_input_rate() -> None:
         "output_cost_per_token": 1.2e-5,
     }
 
-    usage: Final = Usage(
+    usage = Usage(
         prompt_tokens=300000,
         completion_tokens=10,
         total_tokens=300010,
@@ -508,12 +583,11 @@ def test_prompt_modality_rates_still_win_over_tiered_input_rate() -> None:
         completion_tokens_details=CompletionTokensDetailsWrapper(text_tokens=10),
     )
 
-    prompt_cost, _ = generic_cost_per_token(
-        model="test-model",
-        usage=usage,
-        custom_llm_provider="vertex_ai",
-        model_info=cast(ModelInfo, model_info),
-    )
+    with patch(
+        "litellm.litellm_core_utils.llm_cost_calc.utils.get_model_info",
+        return_value=mock_model_info,
+    ):
+        prompt_cost, _ = generic_cost_per_token(model="test-model", usage=usage, custom_llm_provider="vertex_ai")
 
     assert round(prompt_cost, 9) == round(100000 * 4e-6 + 100000 * 3e-6 + 100000 * 1e-6, 9)
 
@@ -1733,9 +1807,12 @@ def test_gpt55_dated_variants_match_base_reasoning_effort_capabilities(_local_mo
         )
 
 
-def test_string_cost_values() -> None:
+def test_string_cost_values():
     """Test that cost values defined as strings are properly converted to floats."""
-    model_info: Final = {
+    from unittest.mock import patch
+
+    # Mock model info with string cost values (as might be read from config.yaml)
+    mock_model_info = {
         "input_cost_per_token": "3e-7",  # String representation of scientific notation
         "output_cost_per_token": "6e-7",  # String representation of scientific notation
         "input_cost_per_audio_token": "0.000001",  # String representation of decimal
@@ -1747,7 +1824,7 @@ def test_string_cost_values() -> None:
     # Test usage with various token types
     # Note: prompt_tokens must equal sum of details to avoid double-counting adjustment
     # text_tokens(700) + audio_tokens(100) + cached_tokens(200) + cache_creation_tokens(150) = 1150
-    usage: Final = Usage(
+    usage = Usage(
         prompt_tokens=1150,
         completion_tokens=500,
         total_tokens=1650,
@@ -1767,16 +1844,18 @@ def test_string_cost_values() -> None:
         ),
     )
 
-    prompt_cost, completion_cost = generic_cost_per_token(
-        model="test-model",
-        usage=usage,
-        custom_llm_provider="test-provider",
-        model_info=cast(ModelInfo, model_info),
-    )
+    # Mock get_model_info to return our mock model info
+    with patch(
+        "litellm.litellm_core_utils.llm_cost_calc.utils.get_model_info",
+        return_value=mock_model_info,
+    ):
+        prompt_cost, completion_cost = generic_cost_per_token(
+            model="test-model", usage=usage, custom_llm_provider="test-provider"
+        )
 
     # Calculate expected costs manually
     # Prompt cost = text_tokens * input_cost + audio_tokens * audio_cost + cached_tokens * cache_read_cost + cache_creation_tokens * cache_creation_cost
-    expected_prompt_cost: Final = (
+    expected_prompt_cost = (
         700 * 3e-7  # text tokens
         + 100 * 1e-6  # audio tokens
         + 200 * 1.5e-8  # cached tokens
@@ -1784,7 +1863,7 @@ def test_string_cost_values() -> None:
     )
 
     # Completion cost = text_tokens * output_cost + audio_tokens * audio_output_cost
-    expected_completion_cost: Final = 450 * 6e-7 + 50 * 2e-6  # text tokens  # audio tokens
+    expected_completion_cost = 450 * 6e-7 + 50 * 2e-6  # text tokens  # audio tokens
 
     # Assert costs are calculated correctly
     assert round(prompt_cost, 12) == round(expected_prompt_cost, 12)
@@ -1898,17 +1977,19 @@ def test_calculate_cost_component_with_string_values():
     assert cost == 0.0
 
 
-def test_string_cost_values_edge_cases() -> None:
+def test_string_cost_values_edge_cases():
     """Test edge cases for string cost value handling."""
+    from unittest.mock import patch
+
     # Test with mixed string and float cost values
-    model_info: Final = {
+    mock_model_info = {
         "input_cost_per_token": "1e-6",  # String
         "output_cost_per_token": 2e-6,  # Float
         "input_cost_per_audio_token": "invalid",  # Invalid string
         "output_cost_per_audio_token": None,  # None value
     }
 
-    usage: Final = Usage(
+    usage = Usage(
         prompt_tokens=1000,
         completion_tokens=500,
         total_tokens=1500,
@@ -1924,26 +2005,30 @@ def test_string_cost_values_edge_cases() -> None:
         ),
     )
 
-    prompt_cost, completion_cost = generic_cost_per_token(
-        model="test-model",
-        usage=usage,
-        custom_llm_provider="test-provider",
-        model_info=cast(ModelInfo, model_info),
-    )
+    with patch(
+        "litellm.litellm_core_utils.llm_cost_calc.utils.get_model_info",
+        return_value=mock_model_info,
+    ):
+        prompt_cost, completion_cost = generic_cost_per_token(
+            model="test-model", usage=usage, custom_llm_provider="test-provider"
+        )
 
     # Expected costs:
     # Prompt: 1000 * 1e-6 + 100 * 0 (invalid string becomes 0)
     # Completion: 500 * 2e-6 + 50 * 2e-6 (audio tokens fall back to base cost when output_cost_per_audio_token is None)
-    expected_prompt_cost: Final = 1000 * 1e-6
-    expected_completion_cost: Final = 500 * 2e-6 + 50 * 2e-6
+    expected_prompt_cost = 1000 * 1e-6
+    expected_completion_cost = 500 * 2e-6 + 50 * 2e-6
 
     assert round(prompt_cost, 12) == round(expected_prompt_cost, 12)
     assert round(completion_cost, 12) == round(expected_completion_cost, 12)
 
 
-def test_string_cost_values_with_threshold() -> None:
+def test_string_cost_values_with_threshold():
     """Test that string cost values work correctly with threshold pricing."""
-    model_info: Final = {
+    from unittest.mock import patch
+
+    # Mock model info with string cost values including threshold pricing
+    mock_model_info = {
         "input_cost_per_token": "1e-6",  # String base cost
         "output_cost_per_token": "2e-6",  # String base cost
         "input_cost_per_token_above_200k_tokens": "5e-7",  # String threshold cost (lower)
@@ -1951,22 +2036,23 @@ def test_string_cost_values_with_threshold() -> None:
     }
 
     # Test usage above threshold
-    usage: Final = Usage(
+    usage = Usage(
         prompt_tokens=250000,  # Above 200k threshold
         completion_tokens=1000,
         total_tokens=251000,
     )
 
-    prompt_cost, completion_cost = generic_cost_per_token(
-        model="test-model",
-        usage=usage,
-        custom_llm_provider="test-provider",
-        model_info=cast(ModelInfo, model_info),
-    )
+    with patch(
+        "litellm.litellm_core_utils.llm_cost_calc.utils.get_model_info",
+        return_value=mock_model_info,
+    ):
+        prompt_cost, completion_cost = generic_cost_per_token(
+            model="test-model", usage=usage, custom_llm_provider="test-provider"
+        )
 
     # Expected costs using threshold pricing (string values converted to float)
-    expected_prompt_cost: Final = 250000 * 5e-7  # threshold cost
-    expected_completion_cost: Final = 1000 * 1e-6  # threshold cost
+    expected_prompt_cost = 250000 * 5e-7  # threshold cost
+    expected_completion_cost = 1000 * 1e-6  # threshold cost
 
     assert round(prompt_cost, 12) == round(expected_prompt_cost, 12)
     assert round(completion_cost, 12) == round(expected_completion_cost, 12)
@@ -2207,6 +2293,10 @@ def test_cache_writing_cost_with_zero_creation_tokens_and_ephemeral_details():
     prompt_tokens_details: PromptTokensDetailsResult = {
         "cache_hit_tokens": 0,
         "cache_hit_audio_tokens": 0,
+        "cached_text_tokens": 0,
+        "cached_audio_tokens": 0,
+        "cached_image_tokens": 0,
+        "has_cached_tokens_details": False,
         "cache_creation_tokens": 0,
         "cache_creation_token_details": CacheCreationTokenDetails(
             ephemeral_5m_input_tokens=100,
@@ -2491,6 +2581,51 @@ def test_data_residency_applies_uplift(data_residency, model, _local_model_cost_
     assert regional[1] == pytest.approx(base[1] * 1.10, rel=1e-9)
 
 
+def test_fedramp_data_residency_applies_configured_uplift() -> None:
+    usage: Final = Usage(prompt_tokens=1000, completion_tokens=500, total_tokens=1500)
+    model_info: Final[ModelInfo] = {
+        "key": "fedramp-fixture",
+        "max_tokens": None,
+        "max_input_tokens": None,
+        "max_output_tokens": None,
+        "input_cost_per_token": 1e-6,
+        "output_cost_per_token": 2e-6,
+        "litellm_provider": "openai",
+        "mode": "chat",
+        "supported_openai_params": None,
+        "regional_processing_uplift_multiplier_us": 1.5,
+        "fedramp_uplift_multiplier": 1.1,
+    }
+
+    base: Final = generic_cost_per_token(
+        model="fedramp-fixture",
+        usage=usage,
+        custom_llm_provider="openai",
+        model_info=model_info,
+    )
+    fedramp: Final = generic_cost_per_token(
+        model="fedramp-fixture",
+        usage=usage,
+        custom_llm_provider="openai",
+        data_residency=DataResidency.FEDRAMP.value,
+        model_info=model_info,
+    )
+
+    us: Final = generic_cost_per_token(
+        model="fedramp-fixture",
+        usage=usage,
+        custom_llm_provider="openai",
+        data_residency=DataResidency.US.value,
+        model_info=model_info,
+    )
+
+    assert sum(base) > 0
+    assert fedramp[0] == pytest.approx(base[0] * 1.1)
+    assert fedramp[1] == pytest.approx(base[1] * 1.1)
+    assert us[0] == pytest.approx(base[0] * 1.5)
+    assert us[1] == pytest.approx(base[1] * 1.5)
+
+
 @pytest.mark.parametrize("model", ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-pro", "gpt-4o", "gpt-4.1"])
 def test_data_residency_no_uplift_for_pre_march_2026_models(model, _local_model_cost_map):
     """Models released before 2026-03-05 must not have the regional uplift."""
@@ -2629,6 +2764,61 @@ def test_vertex_uplift_invalid_multiplier_defaults_to_one():
     assert (
         get_vertex_regional_endpoint_uplift({"regional_endpoint_uplift_multiplier": "not-a-number"}, "us-east5") == 1.0
     )
+
+
+@pytest.mark.parametrize(
+    "model_info, data_residency",
+    [
+        ({"fedramp_uplift_multiplier": "not-a-number"}, "fedramp"),
+        ({}, "fedramp"),
+        ({"fedramp_uplift_multiplier": 1.1}, "us"),
+        ({"fedramp_uplift_multiplier": 1.1}, None),
+    ],
+)
+def test_fedramp_uplift_defaults_to_one(model_info: ModelInfo, data_residency: str | None):
+    """A malformed or missing FedRAMP multiplier, or a non-FedRAMP host, bills base pricing and never raises."""
+    from litellm.litellm_core_utils.llm_cost_calc.utils import get_fedramp_uplift_multiplier
+
+    assert get_fedramp_uplift_multiplier(model_info, data_residency) == 1.0
+
+
+@pytest.mark.parametrize(
+    "model_info, data_residency",
+    [({f"regional_processing_uplift_multiplier_{r.value}": "1.25"}, r.value.upper()) for r in DataResidency],
+)
+def test_regional_uplift_reads_the_multiplier_named_by_each_residency(model_info: ModelInfo, data_residency: str):
+    assert get_regional_uplift_multiplier(model_info, data_residency) == 1.25
+
+
+@pytest.mark.parametrize(
+    "model_info",
+    [{"regional_processing_uplift_multiplier_us": value} for value in (1.25, "1.25", b"1.25", bytearray(b"1.25"))],
+)
+def test_regional_uplift_accepts_every_value_float_converts(model_info: ModelInfo):
+    assert get_regional_uplift_multiplier(model_info, "us") == 1.25
+
+
+class _IndexOnly:
+    def __index__(self) -> int:
+        return 2
+
+
+@pytest.mark.parametrize("model_info", [{"regional_processing_uplift_multiplier_us": _IndexOnly()}])
+def test_regional_uplift_accepts_an_index_only_value(model_info: ModelInfo):
+    assert get_regional_uplift_multiplier(model_info, "us") == 2.0
+
+
+@pytest.mark.parametrize(
+    "model_info, data_residency",
+    [
+        ({"regional_processing_uplift_multiplier_eu": "not-a-number"}, "eu"),
+        ({"regional_processing_uplift_multiplier_eu": [1.25]}, "eu"),
+        ({"regional_processing_uplift_multiplier_apac": 1.25}, "apac"),
+        ({"regional_processing_uplift_multiplier_eu": 1.25}, None),
+    ],
+)
+def test_regional_uplift_defaults_to_one(model_info: ModelInfo, data_residency: str | None):
+    assert get_regional_uplift_multiplier(model_info, data_residency) == 1.0
 
 
 def test_service_tier_suffixes_constant_in_sync_with_enum():
@@ -4158,6 +4348,37 @@ def test_azure_gpt_6_foundry_price_sheet(_local_model_cost_map, model_base):
         assert azure_ai_info[field] == base
         assert azure_us_info[field] == pytest.approx(1.1 * base)
         assert azure_eu_info[field] == pytest.approx(1.2 * base)
+
+
+@pytest.mark.parametrize("model", ["azure/gpt-6-luna", "azure/gpt-6-luna-2026-09-22"])
+@pytest.mark.parametrize(
+    ("prompt_tokens", "input_rate", "cache_read_rate", "output_rate"),
+    [
+        (100_000, 5e-08, 5e-09, 2.5e-07),
+        (300_000, 1e-07, 1e-08, 3.75e-07),
+    ],
+)
+def test_generic_cost_per_token_azure_gpt_6_luna_flex_tiers(
+    _local_model_cost_map, model, prompt_tokens, input_rate, cache_read_rate, output_rate
+):
+    """azure/gpt-6-luna bills Azure's Flex Global rates, half of Standard, with the long context step past 272K."""
+    cached_tokens = 20_000
+    completion_tokens = 1_000
+    usage = Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=cached_tokens),
+    )
+    prompt_cost, completion_cost = generic_cost_per_token(
+        model=model,
+        usage=usage,
+        custom_llm_provider="azure",
+        service_tier="flex",
+    )
+    expected_prompt = (prompt_tokens - cached_tokens) * input_rate + cached_tokens * cache_read_rate
+    assert prompt_cost == pytest.approx(expected_prompt)
+    assert completion_cost == pytest.approx(completion_tokens * output_rate)
 
 
 @pytest.mark.parametrize("region_prefix", ["azure/", "azure/us/", "azure/eu/"])

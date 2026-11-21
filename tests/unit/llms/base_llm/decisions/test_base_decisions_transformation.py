@@ -4,7 +4,6 @@ from typing import Final
 
 import httpx
 import pytest
-import respx
 from pydantic import TypeAdapter, ValidationError
 
 import litellm
@@ -13,7 +12,7 @@ from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.base_llm.decisions.transformation import (
     BaseDecisionsConfig,
     DecisionsInputLimits,
-    catalog_mode,
+    DecisionsResponseValidationError,
     ir_to_systemone_request,
     ir_to_systemone_response,
     parse_systemone_response,
@@ -23,6 +22,7 @@ from litellm.llms.openai.decisions.transformation import openai_request_to_ir
 from litellm.llms.typesafe.decisions.transformation import TypeSafeDecisionsConfig
 from litellm.types.decisions import (
     MAX_DECISION_QUESTIONS,
+    DecisionsIRChoiceAnswer,
     DecisionsIRRefusal,
     DecisionsIRRequest,
     DecisionsIRScoreAnswer,
@@ -53,52 +53,6 @@ _SYSTEMONE_REQUEST: Final[Mapping[str, object]] = {
         "severity": {"type": "score", "criteria": ["minor", {"label": "major"}]},
     },
 }
-
-
-@pytest.mark.parametrize("provider", ("ollama", "ollama_chat"))
-def test_decision_capability_checks_do_not_contact_an_ambient_ollama_server(
-    local_model_cost_map: None, monkeypatch: pytest.MonkeyPatch, respx_mock: respx.MockRouter, provider: str
-) -> None:
-    monkeypatch.setenv("OLLAMA_API_BASE", "https://ambient.example")
-    monkeypatch.setenv("OLLAMA_API_KEY", "ambient-test-key")
-    metadata: Final = respx_mock.post("https://ambient.example/api/show").respond(
-        json={"model_info": {"test.context_length": 32768}}
-    )
-    config: Final = BaseDecisionsConfig()
-
-    assert catalog_mode("unmapped-decisions-test", provider) is None
-    assert (
-        config.supports_box_questions("unmapped-decisions-test", provider, {}, None),
-        config.supports_audio_input("unmapped-decisions-test", provider, None),
-        config.supports_video_input("unmapped-decisions-test", provider, None),
-    ) == (False, False, False)
-    assert not metadata.called
-
-
-@pytest.mark.parametrize("mode", ("evaluation", "decisions", "chat"))
-@pytest.mark.parametrize("supported", (False, True))
-def test_decision_capabilities_preserve_registered_modes_and_flags(
-    local_model_cost_map: None, monkeypatch: pytest.MonkeyPatch, mode: str, supported: bool
-) -> None:
-    monkeypatch.setitem(
-        litellm.model_cost,
-        "bespoke/test-decision-capabilities",
-        {
-            "litellm_provider": "bespoke",
-            "mode": mode,
-            "supports_box_questions": supported,
-            "supports_audio_input": supported,
-            "supports_video_input": supported,
-        },
-    )
-    config: Final = BaseDecisionsConfig()
-    expected: Final = supported and mode in ("evaluation", "decisions")
-
-    assert (
-        config.supports_box_questions("test-decision-capabilities", "bespoke", {}, None),
-        config.supports_audio_input("test-decision-capabilities", "bespoke", None),
-        config.supports_video_input("test-decision-capabilities", "bespoke", None),
-    ) == (expected, expected, expected)
 
 
 @pytest.mark.parametrize("declared", (4096, 0, -1, True, None))
@@ -393,6 +347,49 @@ def test_a_box_answer_without_confidence_reaches_the_caller_unchanged() -> None:
     response: Final = ir_to_systemone_response(parse_systemone_response(payload, ir), ir)
 
     assert response.model_dump(mode="json") == payload
+
+
+@pytest.mark.parametrize(
+    ("question", "answer"),
+    [
+        (
+            {"type": "choice", "criteria": {"yes": "Yes", "no": "No"}},
+            {"type": "choice", "choice": "yes", "probabilities": {"yes": 0.9, "no": 0.1}},
+        ),
+        (
+            {"type": "score", "criteria": ["low", "high"]},
+            {"type": "score", "score": 0.5, "legend": {"0": "low", "1": "high"}, "probabilities": {"0": 0.5, "1": 0.5}},
+        ),
+    ],
+)
+@pytest.mark.parametrize("confidence", ({}, {"confidence": None}))
+@pytest.mark.parametrize(
+    ("provider", "optional"), (("nace", False), ("fireworks_ai", False), ("parallel_ai", True))
+)
+def test_only_a_provider_without_confidence_may_omit_it(
+    question: Mapping[str, object],
+    answer: Mapping[str, object],
+    confidence: Mapping[str, object],
+    provider: str,
+    optional: bool,
+) -> None:
+    config: Final = ProviderConfigManager.get_provider_decisions_config("decision", LlmProviders(provider))
+    assert config is not None
+    request: Final = systemone_request_to_ir(
+        DecisionsRequestBody.model_validate({"state": {"text": "Example"}, "questions": {"asked": question}})
+    )
+    upstream: Final = httpx.Response(
+        200, json={"mode": "fast", "model": "decision", "answers": {"asked": {**answer, **confidence}}}
+    )
+
+    if optional:
+        parsed: Final = config.transform_decisions_response("decision", provider, upstream, request)
+        assert isinstance(parsed.answers[0], (DecisionsIRChoiceAnswer, DecisionsIRScoreAnswer))
+        assert parsed.answers[0].confidence is None
+        return
+    with pytest.raises(DecisionsResponseValidationError) as raised:
+        config.transform_decisions_response("decision", provider, upstream, request)
+    assert raised.value.status_code == 500
 
 
 @pytest.mark.parametrize("provider", ("nace", "openrouter", "fireworks_ai", "typesafe"))

@@ -458,6 +458,31 @@ async def test_only_internal_fixed_response_provider_needs_no_context_budget() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wrapper", "content"),
+    (
+        ("web_search_tool_result", [{"type": "web_search_result", "title": "Result", "encrypted_content": "private"}]),
+        ("code_execution_tool_result", {"type": "encrypted_code_execution_result", "encrypted_stdout": "private"}),
+    ),
+)
+async def test_encrypted_server_tool_history_is_rejected(wrapper: str, content: object) -> None:
+    request: Final[dict[str, object]] = {
+        "model": "anthropic/claude-opus-5-5",
+        "model_info": {"max_input_tokens": 950_000},
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": wrapper, "tool_use_id": "srv_1", "content": content}],
+            },
+            {"role": "user", "content": "Continue"},
+        ],
+    }
+    with pytest.raises(litellm.BadRequestError) as error:
+        await _HOOK.async_pre_call_deployment_hook(request, CallTypes.anthropic_messages)
+    assert "private" not in str(error.value)
+
+
+@pytest.mark.asyncio
 async def test_supported_server_tool_and_compaction_history_remain_usable() -> None:
     messages: Final[list[dict[str, object]]] = [
         {"role": "user", "content": "Search"},

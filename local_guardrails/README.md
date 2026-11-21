@@ -798,7 +798,10 @@ Claude 候选保留到选定部署后检查；全部候选超限时返回 `Conte
 所有部署复用 LiteLLM 的 tokenizer、Anthropic system 提取和 Responses 输入转换，包含 system、
 instructions、工具定义和工具历史，不重命名工具，不修改用户消息。计数失败或全局计数关闭时，
 返回明确的本地无法核验提示，建议 `/compact` 或开启新会话，不再把未知长度的请求继续发给
-上游。Responses 的正常加密推理和加密压缩历史除外，这类内容按下述规则保留并交由上游校验
+上游。1.110.2 的通用计数器只统计服务端工具结果的可读字段。严格准入遇到含
+`encrypted_content` 的 `web_search_result` 或含 `encrypted_stdout` 的
+`encrypted_code_execution_result`，仍在生成前返回 400。空搜索结果与工具错误结果可正常计数。
+Responses 的正常加密推理和加密压缩历史按下述规则保留并交由上游校验
 
 内嵌图片在受限后台线程里复用 Pillow 校验结构和压缩像素。解码前按现有
 `MAX_IMAGE_URL_DOWNLOAD_SIZE_MB` 限制分配，解码后遵守 Pillow 像素上限。返回错误时包含

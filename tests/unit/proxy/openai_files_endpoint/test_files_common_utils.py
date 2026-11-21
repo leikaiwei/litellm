@@ -396,79 +396,12 @@ async def test_a_caller_that_handed_off_accounting_still_leaves_the_marker_alone
     assert data["status"] == "complete"
 
 
-# =========================================================================== #
-# add_internal_model_credentials - the snapshot that lets a completed
-# batch's output file be read, and therefore its cost be recorded
-# =========================================================================== #
-
-
-def test_add_internal_model_credentials_attaches_an_immutable_snapshot():
-    """Cost accounting for a completed batch reads its output file, and Bedrock resolves
-    that bucket only from this snapshot. It must be immutable so nothing downstream can
-    redirect the bucket that managed file ids are validated against."""
-    from litellm.proxy.openai_files_endpoints.common_utils import (
-        add_internal_model_credentials,
-    )
-
-    router = route_entry_points_to_stubs(MagicMock())
-    router.get_deployment_credentials_with_provider = MagicMock(
-        return_value={"s3_bucket_name": "configured-bucket", "aws_region_name": "us-east-1"}
-    )
-    data = {"batch_id": "unified-batch-id"}
-
-    add_internal_model_credentials(data=data, llm_router=router, model_id="deployment-1")
-
-    snapshot = data["_litellm_internal_model_credentials"]
-    assert snapshot["s3_bucket_name"] == "configured-bucket"
-    assert isinstance(snapshot, MappingProxyType)
-    with pytest.raises(TypeError):
-        snapshot["s3_bucket_name"] = "attacker-bucket"
-    router.get_deployment_credentials_with_provider.assert_called_once_with(model_id="deployment-1")
-
-
-@pytest.mark.parametrize(
-    "model_id, credentials",
-    [(None, {"s3_bucket_name": "b"}), ("deployment-1", None)],
-    ids=["no-model-id", "deployment-has-no-credentials"],
-)
-def test_add_internal_model_credentials_is_a_noop_without_a_resolvable_deployment(model_id, credentials):
-    """An unroutable batch must be left alone rather than given an empty snapshot, which
-    would look like a configured bucket of nothing."""
-    from litellm.proxy.openai_files_endpoints.common_utils import (
-        add_internal_model_credentials,
-    )
-
-    router = route_entry_points_to_stubs(MagicMock())
-    router.get_deployment_credentials_with_provider = MagicMock(return_value=credentials)
-    data = {"batch_id": "unified-batch-id"}
-
-    add_internal_model_credentials(data=data, llm_router=router, model_id=model_id)
-
-    assert "_litellm_internal_model_credentials" not in data
-
-
-def test_add_internal_model_credentials_survives_a_failing_deployment_lookup():
-    """The snapshot only enables cost accounting, so a batch whose deployment no longer
-    resolves, which happens when a model group is removed while batches are in flight,
-    must still be retrievable rather than failing the request on the lookup."""
-    from litellm.proxy.openai_files_endpoints.common_utils import (
-        add_internal_model_credentials,
-    )
-
-    router = route_entry_points_to_stubs(MagicMock())
-    router.get_deployment_credentials_with_provider = MagicMock(side_effect=KeyError("deployment-gone"))
-    data = {"batch_id": "unified-batch-id"}
-
-    add_internal_model_credentials(data=data, llm_router=router, model_id="deployment-gone")
-
-    assert data == {"batch_id": "unified-batch-id"}
-
-
 from openai.types.batch import BatchRequestCounts
 
 from litellm.proxy.openai_files_endpoints.common_utils import (
     _completed_batch_safe_to_retire,
 )
+from litellm.proxy.openai_files_endpoints.common_utils import canonical_provider_file_id, encode_file_id_with_model, provider_file_id_spellings
 
 
 def _completed_batch_for_retire(output_file_id: str | None, counts: BatchRequestCounts | None = None) -> LiteLLMBatch:
@@ -964,3 +897,52 @@ def test_a_provider_wildcard_grant_finds_only_deployments_named_under_it(deploye
     )
 
     assert (None if credentials is None else credentials["api_key"]) == api_key
+
+
+@pytest.mark.parametrize(
+    ("file_id", "canonical"),
+    (
+        ("batch-out1", "batch-out1"),
+        ("files/batch-out1", "batch-out1"),
+        ("files%2Fbatch-out1", "batch-out1"),
+        ("batch-out1/", "batch-out1"),
+        ("/files/batch-out1/", "batch-out1"),
+        ("https://generativelanguage.googleapis.com/v1beta/files/batch-out1", "batch-out1"),
+        ("file-abc123", "file-abc123"),
+        ("s3://bucket/path/files/output.jsonl", "s3://bucket/path/files/output.jsonl"),
+        ("gs://bucket/prefix/predictions.jsonl", "gs://bucket/prefix/predictions.jsonl"),
+        (
+            "https://acct.blob.core.windows.net/uploads/0c4e.files%2Ffile-victim",
+            "https://acct.blob.core.windows.net/uploads/0c4e.files%2Ffile-victim",
+        ),
+        ("x://h/files/batch-out1", "x://h/files/batch-out1"),
+    ),
+)
+def test_canonical_provider_file_id_collapses_every_spelling_to_the_stored_id(file_id: str, canonical: str):
+    assert canonical_provider_file_id(file_id) == canonical
+
+
+def test_provider_file_id_spellings_unwraps_a_model_encoded_id_and_covers_the_stored_forms():
+    wrapped: Final = encode_file_id_with_model(file_id="batch-out1", model="gemini-deployment")
+
+    assert provider_file_id_spellings(wrapped) == (
+        wrapped,
+        "batch-out1",
+        "files/batch-out1",
+        "https://generativelanguage.googleapis.com/v1beta/files/batch-out1",
+    )
+    for spelling in ("batch-out1", "files%2Fbatch-out1", "batch-out1/"):
+        assert set(provider_file_id_spellings(spelling)) >= set(provider_file_id_spellings(wrapped)[1:]), spelling
+
+
+@pytest.mark.parametrize(
+    "respelling",
+    (
+        "HTTPS://generativelanguage.googleapis.com/v1beta/files/batch-out1",
+        "x://h/files/batch-out1",
+        "S3://b/files/batch-out1",
+        "x%3A%2F%2Fh%2Ffiles%2Fbatch-out1",
+    ),
+)
+def test_provider_file_id_spellings_reduce_any_scheme_the_way_gemini_does(respelling: str):
+    assert "batch-out1" in provider_file_id_spellings(respelling)

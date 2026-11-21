@@ -109,6 +109,7 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     can_org_access_model,
     delete_cache_key_objects,
     delete_cache_team_object,
+    evict_budget_windows_absent_marker,
     get_jwt_key_mapping_cache_keys_for_tokens,
     get_org_object,
     get_team_membership,
@@ -133,6 +134,7 @@ from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import (
 from litellm.proxy.common_utils.callback_utils import encrypt_callback_vars
 from litellm.proxy.common_utils.json_merge_patch import apply_json_merge_patch
 from litellm.proxy.common_utils.openai_error_payload import proxy_exception_for
+from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     team_membership_auth_cache_key,
@@ -154,6 +156,7 @@ from litellm.proxy.management.teams.dependencies import get_team_access
 from litellm.proxy.management_endpoints.common_daily_activity import (
     InvalidDateRange,
     parse_canonical_date_range,
+    unless_database_fails,
 )
 from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # legacy module exports
     _check_disable_global_guardrails_caller_permission,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
@@ -223,9 +226,14 @@ from litellm.proxy.management_helpers.utils import (
     add_new_member,
     management_endpoint_wrapper,
 )
-from litellm.proxy.utils import PrismaClient, ProxyLogging, handle_exception_on_proxy
+from litellm.proxy.utils import (
+    PrismaClient,
+    ProxyLogging,
+    handle_exception_on_proxy,
+    query_raw_within_statement_timeout,
+)
 from litellm.repositories.budget_repository import BudgetRepository
-from litellm.repositories.chunked_in import delete_many_in, find_many_in
+from litellm.repositories.chunked_in import delete_many_in, find_many_in, update_many_in
 from litellm.repositories.daily_activity_buckets import api_key_from_bucket
 from litellm.repositories.organization_repository import OrganizationRepository
 from litellm.repositories.prisma_protocols import TableActions
@@ -612,6 +620,9 @@ async def refresh_cached_team(
     await publish_auth_cache_invalidation(cache_key=f"team_id:{team_row.team_id}")
     if team_table.team_alias is not None:
         await publish_auth_cache_invalidation(cache_key=f"team_alias:{team_table.team_alias}")
+    await evict_budget_windows_absent_marker(
+        entity_type=Litellm_EntityType.TEAM, entity_id=team_row.team_id, user_api_key_cache=user_api_key_cache
+    )
 
 
 _refresh_cached_team: Final = refresh_cached_team
@@ -902,6 +913,50 @@ class TeamMemberBudgetHandler:
 
         TeamMemberBudgetHandler.clean_team_member_fields(updated_kv)
         return updated_kv
+
+    @staticmethod
+    async def member_budgets_on_team_reset_window(
+        team_id: str, team_member_budget_id: str | None, prisma_client: PrismaClient
+    ) -> tuple[str | None, tuple[str, ...]]:
+        """The team default's reset window, and the budgets of members who take their cap from it and reset on a copy."""
+        team_default: Final = (
+            await _budget_db(prisma_client).find_unique(where={"budget_id": team_member_budget_id})
+            if team_member_budget_id is not None
+            else None
+        )
+        team_window: Final = team_default.budget_duration if team_default is not None else None
+        memberships: Final = await _team_membership_db(prisma_client).find_many(
+            where={"team_id": team_id, "budget_id": {"not": team_member_budget_id}},
+            include={"litellm_budget_table": True},
+        )
+        return team_window, tuple(
+            m.litellm_budget_table.budget_id
+            for m in memberships
+            if m.litellm_budget_table is not None
+            and m.litellm_budget_table.max_budget is None
+            and m.litellm_budget_table.budget_duration == team_window
+        )
+
+    @staticmethod
+    async def move_members_to_team_reset_window(
+        team_id: str, team_member_budget_id: str | None, budget_duration: str | None, prisma_client: PrismaClient
+    ) -> None:
+        """Runs before the team default is written, so a retry after a failure still finds the members left behind."""
+        team_window, budget_ids = await TeamMemberBudgetHandler.member_budgets_on_team_reset_window(
+            team_id=team_id, team_member_budget_id=team_member_budget_id, prisma_client=prisma_client
+        )
+        if team_window == budget_duration or not budget_ids:
+            return
+        _ = await update_many_in(
+            _budget_db(prisma_client),
+            "budget_id",
+            budget_ids,
+            data={
+                "budget_duration": budget_duration,
+                "budget_reset_at": get_budget_reset_time(budget_duration) if budget_duration else None,
+            },
+            atomicity="per_chunk_ok",
+        )
 
     @staticmethod
     async def backfill_team_member_budget_entries(
@@ -1818,6 +1873,7 @@ async def new_team(
             "tpm_limit",
             "rpm_limit",
             "team_member_permissions",
+            "access_group_ids",
         ):
             if getattr(data, field, None) is None and (
                 field != "budget_duration" or field not in data.model_fields_set
@@ -2779,6 +2835,15 @@ async def update_team(
                         if key in existing_team_row.metadata
                     },
                 }
+
+        _current_member_budget_id: Final = (existing_team_row.metadata or {}).get("team_member_budget_id")
+        if "team_member_budget_duration" in _team_member_fields_in_request:
+            await TeamMemberBudgetHandler.move_members_to_team_reset_window(
+                team_id=data.team_id,
+                team_member_budget_id=_current_member_budget_id if isinstance(_current_member_budget_id, str) else None,
+                budget_duration=data.team_member_budget_duration,
+                prisma_client=prisma_client,
+            )
 
         if _team_member_fields_in_request and TeamMemberBudgetHandler.should_create_budget(
             team_member_budget=data.team_member_budget,
@@ -7293,7 +7358,12 @@ async def resolve_team_daily_activity_scope(
     where_condition: Final[_TeamIdInFilter] = {}
     if team_ids_list:
         where_condition["team_id"] = {"in": list(team_ids_list)}
-    team_aliases: Final = await _team_db(prisma_client).find_many(where=where_condition)
+    team_alias_lookup: Final = _team_db(prisma_client).find_many(where=where_condition)
+    team_aliases: Final = (
+        await unless_database_fails(team_alias_lookup, [], "its team aliases")
+        if user_api_key_has_admin_view(user_api_key_dict)
+        else await team_alias_lookup
+    )
     team_alias_metadata: Final = {t.team_id: {"team_alias": _as_object(t.team_alias)} for t in team_aliases}
 
     # Check if user is team admin or has /team/daily/activity permission
@@ -7469,6 +7539,9 @@ class _TeamUserSpendDbRow(TypedDict):
     failed_requests: ReadOnly[int]
 
 
+_TEAM_USER_SPEND_ROWS: Final = TypeAdapter(tuple[_TeamUserSpendDbRow, ...])
+
+
 @router.get(
     "/team/spend/by_user",
     response_model=TeamUserSpendResponse,
@@ -7519,12 +7592,16 @@ async def get_team_spend_by_user(
     own_user_only: Final = scope.api_key_filter is not None
     user_param: Final = (user_api_key_dict.user_id or "",) if own_user_only else ()
     async with db_span("team_user_spend", "LiteLLM_SpendLogs"):
-        rows: Final[Sequence[_TeamUserSpendDbRow]] = await prisma_client.db.query_raw(
-            _team_user_spend_sql(team_count=len(scoped_team_ids), restrict_to_user=own_user_only),
-            start_date,
-            end_date,
-            *scoped_team_ids,
-            *user_param,
+        rows: Final = _TEAM_USER_SPEND_ROWS.validate_python(
+            await query_raw_within_statement_timeout(
+                prisma_client,
+                _team_user_spend_sql(team_count=len(scoped_team_ids), restrict_to_user=own_user_only),
+                start_date,
+                end_date,
+                *scoped_team_ids,
+                *user_param,
+                what="Spend per user",
+            )
         )
     results: Final = tuple(
         TeamUserSpendRow(

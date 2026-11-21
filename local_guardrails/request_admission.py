@@ -198,22 +198,6 @@ def _image_data(block: Mapping[str, object]) -> str | AdmissionProblem | None:
     return encoded
 
 
-def _image_blocks(items: object, path: str) -> Iterator[tuple[str, str | AdmissionProblem]]:
-    if isinstance(items, (list, tuple)):
-        for index, item in enumerate(_ITEMS.validate_python(items)):
-            yield from _image_blocks(item, f"{path}[{index}]")
-        return
-    if not isinstance(items, Mapping):
-        return
-    block: Final = _OBJECT.validate_python(items)
-    encoded: Final = _image_data(block)
-    if encoded is not None:
-        yield path, encoded
-    yield from _image_blocks(block.get("content"), f"{path}.content")
-    if block.get("type") == "function_call_output":
-        yield from _image_blocks(block.get("output"), f"{path}.output")
-
-
 def _valid_image(encoded: str) -> bool:
     maximum: Final = int(MAX_IMAGE_URL_DOWNLOAD_SIZE_MB * 1024 * 1024)
     if maximum <= 0 or len(encoded) > 4 * ((maximum + 2) // 3):
@@ -231,14 +215,27 @@ def _valid_image(encoded: str) -> bool:
     return True
 
 
-def _image_problem(data: Mapping[str, object]) -> AdmissionProblem | None:
-    for field in ("messages", "input", "system"):
-        for path, encoded in _image_blocks(data.get(field), field):
-            if isinstance(encoded, AdmissionProblem):
-                return AdmissionProblem(f"{path}.{encoded.field}", encoded.message)
-            if not _valid_image(encoded):
-                return AdmissionProblem(path, "内嵌图片损坏或超过图片大小限制，请重新上传图片后重试")
-    return None
+def _content_problems(items: object, path: str, check_encrypted: bool) -> Iterator[AdmissionProblem]:
+    if isinstance(items, (list, tuple)):
+        for index, item in enumerate(_ITEMS.validate_python(items)):
+            yield from _content_problems(item, f"{path}[{index}]", check_encrypted)
+        return
+    if not isinstance(items, Mapping):
+        return
+    block: Final = _OBJECT.validate_python(items)
+    if check_encrypted and (
+        (block.get("type") == "web_search_result" and block.get("encrypted_content"))
+        or (block.get("type") == "encrypted_code_execution_result" and block.get("encrypted_stdout"))
+    ):
+        yield AdmissionProblem(path, "无法本地核验加密工具结果，请压缩上下文或开启新会话", False)
+    encoded: Final = _image_data(block)
+    if isinstance(encoded, AdmissionProblem):
+        yield AdmissionProblem(f"{path}.{encoded.field}", encoded.message)
+    elif encoded is not None and not _valid_image(encoded):
+        yield AdmissionProblem(path, "内嵌图片损坏或超过图片大小限制，请重新上传图片后重试")
+    yield from _content_problems(block.get("content"), f"{path}.content", check_encrypted)
+    if block.get("type") == "function_call_output":
+        yield from _content_problems(block.get("output"), f"{path}.output", check_encrypted)
 
 
 def _messages(data: Mapping[str, object]) -> Sequence[object]:
@@ -528,9 +525,10 @@ def _admit(
     local_counter: Callable[[Mapping[str, object], str], int | AdmissionProblem] = _count,
     known_counts: Mapping[str, int | AdmissionProblem] | None = None,
 ) -> list[dict[str, object]]:
-    image_error: Final = _image_problem(data)
-    if image_error is not None:
-        _raise_invalid(image_error, model)
+    check_encrypted: Final = not pending_compaction and any(candidate.limit is not None for candidate in candidates)
+    for field in ("messages", "input", "system"):
+        for problem in _content_problems(data.get(field), field, check_encrypted):
+            _raise_invalid(problem, model)
     bounded: Final = tuple(
         candidate for candidate in candidates if candidate.limit is not None or candidate.local_response
     )

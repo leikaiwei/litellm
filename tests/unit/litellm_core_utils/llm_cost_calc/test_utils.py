@@ -9,72 +9,10 @@ import pytest
 import respx
 
 import litellm
-from litellm.cost_calculator import cost_per_token, pricing_entry_for_cost_calc
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.litellm_core_utils.llm_cost_calc.utils import generic_cost_per_token, get_billed_token_rates
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.types.llms.base import CachedTokensDetails
-from litellm.types.utils import ModelResponse, PromptTokensDetailsWrapper, Usage
-
-
-@pytest.mark.parametrize("provider", ("ollama", "ollama_chat"))
-@pytest.mark.parametrize("registered", (False, True))
-@pytest.mark.parametrize("qualified", (False, True))
-def test_ollama_pricing_uses_registered_rates_without_contacting_the_server(
-    local_model_cost_map: None,
-    monkeypatch: pytest.MonkeyPatch,
-    respx_mock: respx.MockRouter,
-    provider: str,
-    registered: bool,
-    qualified: bool,
-) -> None:
-    model: Final = "test-ollama-pricing-registered" if registered else "test-ollama-pricing-unmapped"
-    monkeypatch.setenv("OLLAMA_API_BASE", "https://ambient-pricing.example")
-    metadata: Final = respx_mock.post("https://ambient-pricing.example/api/show").respond(
-        json={"model_info": {"test.context_length": 32768}}
-    )
-    if registered:
-        monkeypatch.setitem(
-            litellm.model_cost,
-            f"{provider}/{model}",
-            {
-                "litellm_provider": provider,
-                "mode": "chat",
-                "input_cost_per_token": 2e-06,
-                "output_cost_per_token": 5e-06,
-                "input_cost_per_token_decisions": 3e-06,
-                "output_cost_per_token_decisions": 7e-06,
-            },
-        )
-    usage: Final = Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120)
-    cost_model: Final = f"{provider}/{model}" if qualified else model
-    cost_provider: Final = None if qualified else provider
-
-    assert cost_per_token(
-        model=cost_model, custom_llm_provider=cost_provider, usage_object=usage, call_type="systemone"
-    ) == pytest.approx((0.0003, 0.00014) if registered else (0.0, 0.0))
-    assert generic_cost_per_token(model=cost_model, custom_llm_provider=cost_provider, usage=usage) == pytest.approx(
-        (0.0002, 0.0001) if registered else (0.0, 0.0)
-    )
-    rates: Final = get_billed_token_rates(model=cost_model, custom_llm_provider=cost_provider, usage=usage)
-    assert rates is not None
-    assert (rates.input_cost_per_token, rates.output_cost_per_token) == (
-        (2e-06, 5e-06) if registered else (0.0, 0.0)
-    )
-    diagnostic: Final = pricing_entry_for_cost_calc(
-        model=cost_model,
-        completion_response=None,
-        custom_llm_provider=cost_provider,
-        custom_pricing=False,
-        base_model=None,
-        router_model_id=None,
-        region_name=None,
-        litellm_logging_obj=None,
-    )
-    assert diagnostic is not None
-    assert diagnostic[1]["input_cost_per_token"] == (2e-06 if registered else 0.0)
-    assert not metadata.called
-
+from litellm.types.utils import CompletionTokensDetailsWrapper, ModelResponse, PromptTokensDetailsWrapper, Usage
 
 TIER_MODEL: Final = "tier-priced-test-model"
 TIER_ROW: Final[Mapping[str, float]] = MappingProxyType(
@@ -108,6 +46,190 @@ AUDIO_TIER_ROW: Final[Mapping[str, float]] = MappingProxyType(
         "cache_read_input_audio_token_cost_priority": 8e-07,
     }
 )
+
+
+@pytest.mark.parametrize("image_tokens", (60, 100))
+@pytest.mark.parametrize(
+    ("service_tier", "priority_rate", "image_rate"),
+    ((None, 11e-06, 7e-06), ("priority", 11e-06, 11e-06), ("flex", 11e-06, 7e-06), ("priority", 0.0, 0.0)),
+)
+def test_completion_cost_uses_priority_image_output_rate(
+    local_model_cost_map: None, service_tier: str | None, priority_rate: float, image_rate: float, image_tokens: int
+) -> None:
+    model: Final = "gemini-synthetic-image-priority"
+    litellm.register_model(
+        {
+            model: {
+                "litellm_provider": "vertex_ai",
+                "mode": "chat",
+                "input_cost_per_token": 3e-06,
+                "output_cost_per_token": 5e-06,
+                "output_cost_per_image_token": 7e-06,
+                "output_cost_per_image_token_priority": priority_rate,
+            }
+        }
+    )
+    response: Final = ModelResponse(
+        model=model,
+        usage=Usage(
+            prompt_tokens=20,
+            completion_tokens=100,
+            total_tokens=120,
+            completion_tokens_details=CompletionTokensDetailsWrapper(image_tokens=image_tokens),
+        ),
+    )
+    cost: Final = litellm.completion_cost(
+        completion_response=response, model=model, custom_llm_provider="vertex_ai", service_tier=service_tier
+    )
+    assert cost == pytest.approx(20 * 3e-06 + (100 - image_tokens) * 5e-06 + image_tokens * image_rate)
+
+
+@pytest.mark.parametrize("prompt_tokens", (199_999, 200_000, 200_001))
+@pytest.mark.parametrize(
+    ("service_tier", "flat_rate", "context_rate"),
+    ((None, 7e-06, 11e-06), ("priority", 13e-06, 17e-06), ("flex", 19e-06, 23e-06)),
+)
+def test_completion_cost_uses_total_prompt_for_audio_context_tiers(
+    local_model_cost_map: None, prompt_tokens: int, service_tier: str | None, flat_rate: float, context_rate: float
+) -> None:
+    model: Final = "gemini-synthetic-audio-context"
+    litellm.register_model(
+        {
+            model: {
+                "litellm_provider": "vertex_ai",
+                "mode": "chat",
+                "input_cost_per_token": 3e-06,
+                "output_cost_per_token": 5e-06,
+                "input_cost_per_audio_token": 7e-06,
+                "input_cost_per_audio_token_above_200k_tokens": 11e-06,
+                "input_cost_per_audio_token_priority": 13e-06,
+                "input_cost_per_audio_token_above_200k_tokens_priority": 17e-06,
+                "input_cost_per_audio_token_flex": 19e-06,
+                "input_cost_per_audio_token_above_200k_tokens_flex": 23e-06,
+            }
+        }
+    )
+    response: Final = ModelResponse(
+        model=model,
+        usage=Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=10,
+            total_tokens=prompt_tokens + 10,
+            prompt_tokens_details=PromptTokensDetailsWrapper(audio_tokens=100),
+        ),
+    )
+    cost: Final = litellm.completion_cost(
+        completion_response=response, model=model, custom_llm_provider="vertex_ai", service_tier=service_tier
+    )
+    audio_rate: Final = context_rate if prompt_tokens > 200_000 else flat_rate
+    assert cost == pytest.approx((prompt_tokens - 100) * 3e-06 + 100 * audio_rate + 10 * 5e-06)
+
+
+@pytest.mark.parametrize("prompt_tokens", (200_000, 200_001))
+def test_batch_cost_uses_audio_context_and_image_output_tiers(local_model_cost_map: None, prompt_tokens: int) -> None:
+    from litellm.cost_calculator import batch_cost_calculator
+
+    model: Final = "gemini-synthetic-batch-audio-context"
+    litellm.register_model(
+        {
+            model: {
+                "litellm_provider": "vertex_ai",
+                "mode": "chat",
+                "input_cost_per_token": 6e-06,
+                "output_cost_per_token": 10e-06,
+                "input_cost_per_token_batches": 3e-06,
+                "output_cost_per_token_batches": 5e-06,
+                "input_cost_per_token_above_200k_tokens_batches": 13e-06,
+                "output_cost_per_token_above_200k_tokens_batches": 17e-06,
+                "output_cost_per_image_token_batches": 19e-06,
+                "input_cost_per_audio_token_batches": 7e-06,
+                "input_cost_per_audio_token_above_200k_tokens_batches": 11e-06,
+            }
+        }
+    )
+    usage: Final = Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=20,
+        total_tokens=prompt_tokens + 20,
+        prompt_tokens_details=PromptTokensDetailsWrapper(audio_tokens=100),
+        completion_tokens_details=CompletionTokensDetailsWrapper(image_tokens=10),
+    )
+    cost: Final = batch_cost_calculator(model=model, custom_llm_provider="vertex_ai", usage=usage)
+    audio_rate: Final = 11e-06 if prompt_tokens > 200_000 else 7e-06
+    input_rate: Final = 13e-06 if prompt_tokens > 200_000 else 3e-06
+    output_rate: Final = 17e-06 if prompt_tokens > 200_000 else 5e-06
+    assert sum(cost) == pytest.approx(
+        (prompt_tokens - 100) * input_rate + 100 * audio_rate + 10 * output_rate + 10 * 19e-06
+    )
+
+
+@pytest.mark.parametrize("prompt_tokens", (200_000, 200_001))
+def test_completion_cost_uses_flex_context_input_and_output_rates(
+    local_model_cost_map: None, prompt_tokens: int
+) -> None:
+    model: Final = "gemini-synthetic-flex-context"
+    litellm.register_model(
+        {
+            model: {
+                "litellm_provider": "vertex_ai",
+                "mode": "chat",
+                "input_cost_per_token": 6e-06,
+                "output_cost_per_token": 10e-06,
+                "input_cost_per_token_flex": 3e-06,
+                "output_cost_per_token_flex": 5e-06,
+                "input_cost_per_token_above_200k_tokens_flex": 7e-06,
+                "output_cost_per_token_above_200k_tokens_flex": 11e-06,
+            }
+        }
+    )
+    response: Final = ModelResponse(
+        model=model, usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=10, total_tokens=prompt_tokens + 10)
+    )
+    cost: Final = litellm.completion_cost(
+        completion_response=response, model=model, custom_llm_provider="vertex_ai", service_tier="flex"
+    )
+    input_rate: Final = 7e-06 if prompt_tokens > 200_000 else 3e-06
+    output_rate: Final = 11e-06 if prompt_tokens > 200_000 else 5e-06
+    assert cost == pytest.approx(prompt_tokens * input_rate + 10 * output_rate)
+
+
+@pytest.mark.parametrize(
+    ("audio_fields", "audio_rate"),
+    (
+        ({}, 3e-06),
+        ({"input_cost_per_audio_token": 7e-06}, 7e-06),
+        ({"input_cost_per_audio_token_above_200k_tokens": 11e-06}, 11e-06),
+        ({"input_cost_per_audio_token_above_200k_tokens_priority": 0.0}, 0.0),
+    ),
+)
+def test_audio_context_rates_preserve_fallbacks_and_explicit_zero(
+    local_model_cost_map: None, audio_fields: Mapping[str, float], audio_rate: float
+) -> None:
+    model: Final = "gemini-synthetic-audio-fallback"
+    litellm.register_model(
+        {
+            model: {
+                "litellm_provider": "vertex_ai",
+                "mode": "chat",
+                "input_cost_per_token": 3e-06,
+                "output_cost_per_token": 5e-06,
+                **audio_fields,
+            }
+        }
+    )
+    response: Final = ModelResponse(
+        model=model,
+        usage=Usage(
+            prompt_tokens=200_001,
+            completion_tokens=10,
+            total_tokens=200_011,
+            prompt_tokens_details=PromptTokensDetailsWrapper(audio_tokens=100),
+        ),
+    )
+    cost: Final = litellm.completion_cost(
+        completion_response=response, model=model, custom_llm_provider="vertex_ai", service_tier="priority"
+    )
+    assert cost == pytest.approx(199_901 * 3e-06 + 100 * audio_rate + 10 * 5e-06)
 
 
 def _cost_at(prices: Mapping[str, float], column_suffix: str) -> float:

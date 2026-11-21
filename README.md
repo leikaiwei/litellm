@@ -2,6 +2,14 @@
 
 Fork 自 [BerriAI/litellm](https://github.com/BerriAI/litellm)，在上游基础上打了以下补丁：
 
+2026-11-21 同步上游稳定版 [v1.110.2](https://github.com/BerriAI/litellm/releases/tag/v1.110.2)，生产主代理和 usage-api 的切换另行执行
+
+空回复缓存读写及 Anthropic 服务端工具计数已采用上游实现。[缓存修复](https://github.com/BerriAI/litellm/pull/50057) 同时覆盖缓存中已有的空回复。[工具计数](https://github.com/BerriAI/litellm/pull/51334) 支持搜索及代码执行结果，只计算可读字段。升级时要同步替换外置 `request_admission.py`，否则严格准入会放行含加密搜索正文或加密标准输出的工具历史。现网插件的 50 万复核线、可信用量复用和部署输入上限继续生效
+
+Anthropic Messages 转发 `mcp_servers` 时保留新版对支持路由的透传，以及 fork 对 `custom_openai` 的参数过滤。强制本地计费也覆盖新版零费用判定，避免上游报零把缺少本地价格的请求记成免费
+
+从 1.109.0 升级会执行 8 项数据库迁移。新版默认使用 SpendLogs 账本，删除旧的两张账本表及两个枚举。切换前须重新核对旧表行数、备份旧结构和数据。回滚前须核对新账本交付状态，并恢复旧结构、旧镜像和配套准入插件
+
 2026-11-15 已上线 `7115053d9da` 的 Claude 严格准入修复。普通请求的远程复核触发线降为 `500000`，已有 `950000` 输入上限不变。达到触发线、含加密 thinking 且没有可信用量基准时直接要求压缩，不依赖远程低值放行。低于触发线的原生 Messages 也记录完整响应用量，同一历史的真实输入和校准增量优先于较低的远程计数，上游明确报告超限后阻止同一历史继续增长
 
 此次完整失败样本本地仅 `524451`，生成接口报告 `1003389`。同账号真实计数查询补齐逐轮配置功能头后仍只返回 `776998`，所以降低触发线不能单独保证拦截。该版本保留 CPA 改写、生成正文和现有 fallback，只修改外部插件及计数请求的官方功能头，详细条件见[插件说明](local_guardrails/README.md#request_admission-请求上下文准入)
@@ -150,7 +158,7 @@ Responses 正常的加密 reasoning、compaction 历史改为保留并交给上�
 - 1.103.1 同步时复核：结论同上，两处补丁原样保留
 - 1.104.0 同步时复核：上游对 `caching_handler.py` 的改动全在 embedding 缓存（格式版本、部分命中合并），没有新增绕过 `_should_store_result_in_cache` 的写入路径；`_persist` 只是把 payload 收成一行。两处补丁原样保留。上游把测试从 `tests/test_litellm/caching/` 搬到 `tests/unit/caching/` 并大幅扩写，git 认不出是改名，我们的判空用例与那条换样本的修改已手工移植到新位置
 - 部署状态：生产曾用派生镜像 `v1.98.0-fork.patch.1-cachefix`（在 patch.1 上叠一层 COPY 替换该文件），未发 release、未打 tag。1.99.1 起随正式 release 构建，该临时镜像可弃用
-- 上游未修，无对应 issue / PR
+- 1.110.2 起使用上游 #50057，移除本地缓存判空实现
 
 **只按本地单价计费** — `__init__.py`、`cost_calculator.py`、`litellm_core_utils/litellm_logging.py`
 - 场景：上游是自建网关时，它会回传 `x-litellm-response-cost`，litellm 优先采信这个值，于是本地 `model_info` 里配的单价被覆盖。同一个模型流式走上游价、非流式走本地价，两套口径对不上，用量报表没法看
@@ -563,6 +571,7 @@ Set `LITELLM_PROXY_API_BASE` and `LITELLM_PROXY_API_KEY` and every model call th
 | [Deepseek (`deepseek`)](https://docs.litellm.ai/docs/providers/deepseek) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Eden AI (`edenai`)](https://docs.litellm.ai/docs/providers/edenai) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |  |  |
 | [ElevenLabs (`elevenlabs`)](https://docs.litellm.ai/docs/providers/elevenlabs) | ✅ | ✅ | ✅ |  |  | ✅ | ✅ |  |  |  |
+| [EmpirioLabs AI (`empiriolabs`)](https://docs.litellm.ai/docs/providers/empiriolabs) | ✅ |  | ✅ |  |  |  |  |  |  |  |
 | [Empower (`empower`)](https://docs.litellm.ai/docs/providers/empower) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [eu/jev Decisions API (`eu_jev`)](https://docs.litellm.ai/docs/pass_through/eu_jev) |  |  |  |  |  |  |  |  |  |  |
 | [Fal AI (`fal_ai`)](https://docs.litellm.ai/docs/providers/fal_ai) | ✅ | ✅ | ✅ |  | ✅ |  |  |  |  |  |
@@ -609,6 +618,7 @@ Set `LITELLM_PROXY_API_BASE` and `LITELLM_PROXY_API_KEY` and every model call th
 | [OpenAI-like (`openai_like`)](https://docs.litellm.ai/docs/providers/openai_compatible) |  |  |  | ✅ |  |  |  |  |  |  |
 | [OpenRouter (`openrouter`)](https://docs.litellm.ai/docs/providers/openrouter) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [OVHCloud AI Endpoints (`ovhcloud`)](https://docs.litellm.ai/docs/providers/ovhcloud) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
+| [Parallel AI (`parallel_ai`)](https://docs.litellm.ai/docs/search/parallel_ai) |  |  |  |  |  |  |  |  |  |  |
 | [Perplexity AI (`perplexity`)](https://docs.litellm.ai/docs/providers/perplexity) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Petals (`petals`)](https://docs.litellm.ai/docs/providers/petals) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |
 | [Pinstripes (`pinstripes`)](https://docs.litellm.ai/docs/providers/pinstripes) | ✅ | ✅ | ✅ |  |  |  |  |  |  |  |

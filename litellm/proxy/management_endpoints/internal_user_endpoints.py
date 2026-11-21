@@ -47,7 +47,7 @@ from litellm.proxy.auth.password_policy import (
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
-from litellm.proxy.common_utils.openai_error_payload import proxy_exception_for
+from litellm.proxy.common_utils.openai_error_payload import openai_shaped_proxy_exception, proxy_exception_for
 from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     object_permission_cache_key,
@@ -83,8 +83,13 @@ from litellm.proxy.management_helpers.object_permission_utils import (  # noqa: 
     handle_update_object_permission_common,
     set_object_permission,
 )
+from litellm.proxy.management_helpers.team_roster_sync import user_tx_db
 from litellm.proxy.management_helpers.utils import management_endpoint_wrapper
-from litellm.proxy.utils import handle_exception_on_proxy, hash_password
+from litellm.proxy.utils import handle_exception_on_proxy, hash_password, query_raw_rows, run_off_loop_if_fips
+from litellm.redis.stores.spend_counters import (
+    user_counter,
+)
+from litellm.repositories.chunked_in import find_many_in
 from litellm.repositories.organization_repository import OrganizationRepository
 from litellm.repositories.prisma_protocols import TableActions
 from litellm.repositories.table_repositories import (
@@ -125,6 +130,11 @@ _USER_MODEL_BUDGET_ADAPTER: Final = TypeAdapter(dict[str, float | BudgetConfig])
 _USER_CACHE_INVALIDATION_BATCH_SIZE: Final = 50
 
 
+_LOCK_ALL_USERS_SQL: Final = (
+    'SELECT 1 AS locked FROM "LiteLLM_UserTable" WHERE TRUE ORDER BY user_id COLLATE "C" FOR UPDATE'
+)
+
+
 @with_config(ConfigDict(extra="allow", strict=True))
 class _AdminTeamAndKeyRows(TypedDict):
     keys: ReadOnly[Sequence[object] | None]
@@ -134,6 +144,7 @@ class _AdminTeamAndKeyRows(TypedDict):
 _ADMIN_TEAM_AND_KEY_ROWS_ADAPTER: Final = TypeAdapter(
     list[_AdminTeamAndKeyRows], config=ConfigDict(hide_input_in_errors=True)
 )
+_TEAM_METADATA_ADAPTER: Final = TypeAdapter(dict[str, object], config=ConfigDict(hide_input_in_errors=True))
 _ADMIN_KEY_ROW_ADAPTER: Final = TypeAdapter(
     dict[str, object], config=ConfigDict(strict=True, hide_input_in_errors=True)
 )
@@ -201,7 +212,7 @@ async def _hash_password_in_dict(
         if not password_prevalidated:
             validate_password_policy(data["password"], general_settings)
             await validate_password_not_breached(data["password"], general_settings, hibp_client)
-        data["password"] = hash_password(data["password"])
+        data["password"] = await run_off_loop_if_fips(hash_password, data["password"])
         data["password_reset_required"] = True
         data["last_breach_check_at"] = None
 
@@ -443,8 +454,12 @@ async def add_new_user_to_default_team(
     user_api_key_dict: UserAPIKeyAuth,
     teams: Sequence[str | NewUserRequestTeam],
     prisma_client: "PrismaClient",
+    teams_are_defaults: bool = True,
 ):
-    memberships: Final = tuple(_default_team_membership(team) for team in teams)
+    requested: Final = tuple(_default_team_membership(team) for team in teams)
+    memberships: Final = (
+        await _memberships_on_team_member_budget(requested, prisma_client) if teams_are_defaults else requested
+    )
     for membership in memberships:
         with contextlib.suppress(Exception):
             await _add_user_to_team(
@@ -455,6 +470,25 @@ async def add_new_user_to_default_team(
                 max_budget_in_team=membership.max_budget_in_team,
                 user_role=membership.user_role,
             )
+
+
+async def _memberships_on_team_member_budget(
+    memberships: tuple[NewUserRequestTeam, ...], prisma_client: "PrismaClient"
+) -> tuple[NewUserRequestTeam, ...]:
+    """A default team's max_budget_in_team is already the team's member budget, which also carries the reset."""
+    capped_team_ids: Final = [m.team_id for m in memberships if m.max_budget_in_team is not None]
+    if not capped_team_ids:
+        return memberships
+    team_rows: Final = await find_many_in(_team_table(prisma_client), "team_id", capped_team_ids)
+    budgeted_team_ids: Final = frozenset(
+        row.team_id
+        for row in team_rows
+        if isinstance(row.metadata, dict)
+        and _TEAM_METADATA_ADAPTER.validate_python(row.metadata).get("team_member_budget_id") is not None
+    )
+    return tuple(
+        m.model_copy(update={"max_budget_in_team": None}) if m.team_id in budgeted_team_ids else m for m in memberships
+    )
 
 
 def _default_team_membership(team: str | NewUserRequestTeam) -> NewUserRequestTeam:
@@ -629,6 +663,7 @@ async def new_user(
                 user_api_key_dict=user_api_key_dict,
                 teams=teams,
                 prisma_client=prisma_client,
+                teams_are_defaults=data.teams is None,
             )
 
         user_id: Final = cast(str | None, response.get("user_id", None))
@@ -1048,6 +1083,7 @@ async def _check_user_info_v2_access(
     1. Proxy admins / proxy admin viewers can access any user
     2. User can access their own info
     3. Team admins can access info of users in their teams
+    4. Org admins can access info of users in their organizations
 
     Raises on unexpected DB errors so they surface as 500s, not silent 404s.
     """
@@ -1090,7 +1126,31 @@ async def _check_user_info_v2_access(
                     if team.team_id in (target_user.teams or []):
                         return target_user
 
+    if user_api_key_dict.user_id is not None and await _target_in_caller_admin_org(
+        prisma_client=prisma_client,
+        caller_user_id=user_api_key_dict.user_id,
+        target_user_id=target_user_id,
+    ):
+        return await _fetch_target_user()
+
     return None
+
+
+async def _target_in_caller_admin_org(
+    prisma_client: "PrismaClient",
+    caller_user_id: str,
+    target_user_id: str,
+) -> bool:
+    admin_memberships: Final = await prisma_client.db.litellm_organizationmembership.find_many(
+        where={"user_id": caller_user_id, "user_role": LitellmUserRoles.ORG_ADMIN.value}
+    )
+    if not admin_memberships:
+        return False
+    admin_org_ids: Final = {membership.organization_id for membership in admin_memberships}
+    target_memberships: Final = await prisma_client.db.litellm_organizationmembership.find_many(
+        where={"user_id": target_user_id}
+    )
+    return any(membership.organization_id in admin_org_ids for membership in target_memberships)
 
 
 @router.get(
@@ -1197,6 +1257,8 @@ async def user_info_v2(
             ),
         )
     except Exception as e:
+        if isinstance(e, HTTPException) and e.status_code < 500:
+            raise openai_shaped_proxy_exception(e, str(e.detail), e.status_code)
         verbose_proxy_logger.exception("litellm.proxy.proxy_server.user_info_v2(): Exception occured - %s", e)
         raise handle_exception_on_proxy(e)
 
@@ -1204,7 +1266,7 @@ async def user_info_v2(
 async def _fetch_admin_teams_and_keys_rows(
     prisma_client: "PrismaClient", sql_query: str
 ) -> Sequence[_AdminTeamAndKeyRows]:
-    return _ADMIN_TEAM_AND_KEY_ROWS_ADAPTER.validate_python(await prisma_client.db.query_raw(sql_query))
+    return _ADMIN_TEAM_AND_KEY_ROWS_ADAPTER.validate_python(await query_raw_rows(prisma_client.db, sql_query))
 
 
 async def _get_user_info_for_proxy_admin(user_api_key_dict: UserAPIKeyAuth):
@@ -1444,7 +1506,7 @@ async def _invalidate_user_spend_counter_if_changed(
     if non_default_values.get("spend") is not None:
         from litellm.proxy.proxy_server import invalidate_spend_counter
 
-        await invalidate_spend_counter(counter_key=f"spend:user:{non_default_values['user_id']}")
+        await invalidate_spend_counter(counter_key=user_counter(str(non_default_values["user_id"])))
 
 
 def _clears_object_permission(user_request: UpdateUserRequest) -> bool:
@@ -1984,14 +2046,16 @@ async def bulk_user_update(
 
         try:
             # Perform bulk database update
-            await UserRepository(prisma_client).table.update_many(
-                where={},
-                data=(
-                    {**non_default_values, "model_max_budget": json.dumps(non_default_values["model_max_budget"])}
-                    if "model_max_budget" in non_default_values
-                    else non_default_values
-                ),
-            )
+            async with prisma_client.tx() as transaction:
+                _ = await transaction.query_raw(_LOCK_ALL_USERS_SQL)
+                _ = await user_tx_db(transaction).update_many(
+                    where={},
+                    data=(
+                        {**non_default_values, "model_max_budget": json.dumps(non_default_values["model_max_budget"])}
+                        if "model_max_budget" in non_default_values
+                        else non_default_values
+                    ),
+                )
 
             for start in range(0, len(all_users_in_db), _USER_CACHE_INVALIDATION_BATCH_SIZE):
                 await asyncio.gather(

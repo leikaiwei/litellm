@@ -13,20 +13,22 @@ import re
 import secrets
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
+from enum import Enum
 from types import MappingProxyType
 from typing import Final, NamedTuple, Protocol, Union, cast
 
+import anyio
 import fastapi
 from fastapi import HTTPException, Request, WebSocket, status
 from fastapi.security.api_key import APIKeyHeader
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 from starlette.exceptions import WebSocketException
+from starlette.requests import ClientDisconnect
 
 import litellm
-from litellm._internal_context import service_target
+from litellm._internal_context import service_target, set_request_parent_otel_span
 from litellm._logging import verbose_logger, verbose_proxy_logger
 from litellm._service_logger import ServiceLogging
-from litellm.caching.redis_cache import RedisCache
 from litellm.constants import (
     CLIENT_REQUESTED_MODEL_SCOPE_KEY,
     GLOBAL_PROXY_SPEND_CACHE_KEY,
@@ -78,6 +80,7 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     get_team_member_default_budget,
     get_team_membership,
     get_team_object,
+    get_team_object_from_cache,
     get_user_object,
     get_user_role,
     is_model_cost_zero,
@@ -148,6 +151,7 @@ from litellm.proxy.common_utils.http_parsing_utils import (  # noqa: F401  # leg
     populate_request_with_path_params,
     read_raw_json_body,
     read_request_body,
+    resolve_realtime_route_model,
     rewrite_request_model,
     safe_get_request_headers,
     safe_get_request_query_params,
@@ -180,10 +184,19 @@ from litellm.proxy.utils import (
     ProxyLogging,
     normalize_route_for_root_path,
 )
+from litellm.redis.stores.spend_counters import (
+    SpendCounterStore,
+    team_member_counter,
+)
 from litellm.repositories.table_repositories import JWTKeyMappingRepository, TeamMembershipRepository
 from litellm.repositories.user_repository import UserRepository
 from litellm.repositories.verification_token_repository import VerificationTokenRepository
-from litellm.router_api import fallbacks_disabled, references_provider_scoped_resource, request_fallback_chain
+from litellm.router_api import (
+    RoutingContext,
+    fallbacks_disabled,
+    references_provider_scoped_resource,
+    request_fallback_chain,
+)
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.services import ServiceTypes
 
@@ -299,6 +312,17 @@ async def _normalize_claude_model(
     rewrite_request_model(request_data, request, source)
 
 
+_CODEX_NATIVE_RESPONSES_ROUTE: Final = "/backend-api/codex/responses"
+
+
+def _is_codex_native_litellm_turn(route: str, model: object, llm_router: litellm.Router, team_id: str | None) -> bool:
+    if route != _CODEX_NATIVE_RESPONSES_ROUTE:
+        return False
+    from litellm.proxy.pass_through_endpoints.codex_passthrough_endpoints import routes_to_litellm
+
+    return routes_to_litellm(model, llm_router, team_id)
+
+
 async def _resolve_router_settings_model_group_alias(
     request_data: dict[str, object],  # mutable-ok: the request body is rewritten in place for every downstream reader
     valid_token: UserAPIKeyAuth,
@@ -315,9 +339,12 @@ async def _resolve_router_settings_model_group_alias(
     if request.scope.get(MODEL_GROUP_ALIAS_RESOLVED_SCOPE_KEY) is True:
         return
     request.scope[MODEL_GROUP_ALIAS_RESOLVED_SCOPE_KEY] = True
-    if request_dispatched_to_pass_through_endpoint(request) or request_dispatched_to_provider_pass_through(request):
-        return
     requested: Final = request_data.get("model")
+    if request_dispatched_to_pass_through_endpoint(request) or (
+        request_dispatched_to_provider_pass_through(request)
+        and not _is_codex_native_litellm_turn(route, requested, llm_router, valid_token.team_id)
+    ):
+        return
     if not isinstance(requested, str) or await read_raw_json_body(request=request) is None:
         return
     settings: Final = await proxy_config.get_hierarchical_router_settings(
@@ -328,11 +355,37 @@ async def _resolve_router_settings_model_group_alias(
     target: Final = resolve_model_group_alias(settings.get("model_group_alias"), requested)
     if target is None or target == requested:
         return
+    if request_dispatched_to_provider_pass_through(request):
+        from litellm.proxy.pass_through_endpoints.codex_passthrough_endpoints import native_turn_serves_through_litellm
+
+        if not await native_turn_serves_through_litellm(requested, llm_router, request, valid_token):
+            return
     verbose_proxy_logger.debug(
         "router_settings.model_group_alias resolved %s -> %s before auth",
         requested.replace("\r", "").replace("\n", ""),
         target.replace("\r", "").replace("\n", ""),
     )
+    request.scope.setdefault(CLIENT_REQUESTED_MODEL_SCOPE_KEY, requested)
+    rewrite_request_model(request_data, request, target)
+
+
+def _resolve_codex_native_chatgpt_model(
+    request_data: dict[str, object],  # mutable-ok: the request body is rewritten in place for every downstream reader
+    valid_token: UserAPIKeyAuth,
+    request: Request | None,
+    route: str,
+) -> None:
+    requested: Final = request_data.get("model")
+    if route != _CODEX_NATIVE_RESPONSES_ROUTE or request is None or not isinstance(requested, str):
+        return
+    from litellm.proxy.pass_through_endpoints.codex_passthrough_endpoints import native_chatgpt_model
+    from litellm.proxy.proxy_server import llm_router
+
+    if llm_router is None:
+        return
+    target: Final = native_chatgpt_model(requested, llm_router, valid_token)
+    if target is None:
+        return
     request.scope.setdefault(CLIENT_REQUESTED_MODEL_SCOPE_KEY, requested)
     rewrite_request_model(request_data, request, target)
 
@@ -1246,11 +1299,21 @@ def _apply_budget_limits_to_end_user_params(
 
 
 async def user_api_key_auth_websocket(websocket: WebSocket) -> UserAPIKeyAuth:
-    return await user_api_key_auth_websocket_for_model(websocket, model=websocket.query_params.get("model"))
+    return await user_api_key_auth_websocket_for_model(websocket, model=websocket.query_params.get("model", ""))
+
+
+async def user_api_key_auth_realtime_websocket(websocket: WebSocket) -> UserAPIKeyAuth:
+    route_path: Final[object] = websocket.scope.get("path")
+    model: Final = resolve_realtime_route_model(
+        model=websocket.query_params.get("model"),
+        intent=websocket.query_params.get("intent"),
+        is_translation=isinstance(route_path, str) and route_path.endswith("/realtime/translations"),
+    )
+    return await user_api_key_auth_websocket_for_model(websocket, model=model or "")
 
 
 async def user_api_key_auth_live_websocket(websocket: WebSocket) -> UserAPIKeyAuth:
-    return await user_api_key_auth_websocket_for_model(websocket, model=None)
+    return await user_api_key_auth_websocket_for_model(websocket, model="")
 
 
 def _has_required_baggage_tag_mapping() -> bool:
@@ -1266,7 +1329,7 @@ def _has_required_baggage_tag_mapping() -> bool:
 
 
 async def user_api_key_auth_websocket_for_model(
-    websocket: WebSocket, model: str | None, *, close_on_auth_error: bool = True
+    websocket: WebSocket, model: str, *, close_on_auth_error: bool = True
 ) -> UserAPIKeyAuth:
     ws_scope: Final = websocket.scope or {}
     scope_headers: Final = list(ws_scope.get("headers") or [])
@@ -1565,10 +1628,14 @@ _JWT_AUTH_DISABLED_HINT = (
 )
 
 
+class _JWTKeyMappingFailure(Enum):
+    NO_ELIGIBLE_KEY = "JWT Key Mapping: No eligible existing virtual key for this identity. Access denied."
+
+
 class _PendingAutoRegister(NamedTuple):
     """
     Signal returned by ``_resolve_jwt_to_virtual_key`` when the JWT's claim is
-    unmapped and ``unregistered_jwt_client_behavior`` is AUTO_REGISTER.
+    unmapped and ``unregistered_jwt_client_behavior`` is AUTO_REGISTER or LINK_ONLY.
 
     The caller MUST run standard ``JWTAuthManager.auth_builder`` to apply RBAC,
     scope mappings, ``custom_validate``, and ``user_allowed_email_domain``
@@ -1582,23 +1649,22 @@ class _PendingAutoRegister(NamedTuple):
     claim_value: str
     cache_key: str
     jwt_issuer: str | None = None
+    behavior: UnregisteredJWTClientBehavior = UnregisteredJWTClientBehavior.AUTO_REGISTER
 
 
 def _claim_identifies_user(jwt_handler: JWTHandler, claim_field: str, jwt_issuer: str | None) -> bool:
-    if not jwt_handler.litellm_jwtauth.auto_register_map_existing_key:
-        return False
     if jwt_handler.litellm_jwtauth.is_user_identity_claim(claim_field, jwt_issuer):
         return True
     verbose_proxy_logger.warning(
-        "JWT Key Mapping (auto_register_map_existing_key): claim '%s' is not the user_id or user_email JWT field "
-        "and may be shared by several users, so a new key is minted instead of reusing one the user owns.",
+        "JWT Key Mapping: claim '%s' is not the user_id or user_email JWT field "
+        "and may be shared by several users, so existing user keys cannot be linked automatically.",
         claim_field,
     )
     return False
 
 
 async def _reusable_key_hash_for_user(prisma_client: PrismaClient, user_id: str, team_id: str | None) -> str | None:
-    key: Final = await VerificationTokenRepository(prisma_client).find_newest_reusable_llm_api_key(user_id, team_id)
+    key: Final = await VerificationTokenRepository(prisma_client).find_newest_reusable_key(user_id, team_id)
     return None if key is None else key.token
 
 
@@ -1617,11 +1683,13 @@ async def _auto_register_jwt_mapping(
     org_id: str | None = None,
     end_user_id: str | None = None,
     agent_id: str | None = None,
-) -> UserAPIKeyAuth | None:
+    behavior: UnregisteredJWTClientBehavior = UnregisteredJWTClientBehavior.AUTO_REGISTER,
+) -> UserAPIKeyAuth | _JWTKeyMappingFailure | None:
     """
     Auto-register: create a new virtual key + mapping for an unrecognised JWT
     claim value, or point the mapping at a key the resolved user already owns
-    when ``auto_register_map_existing_key`` is set. ``team_id`` and ``user_id``
+    when ``auto_register_map_existing_key`` is set. LINK_ONLY always searches
+    for an existing key and rejects when none is eligible. ``team_id`` and ``user_id``
     must come from a successful ``JWTAuthManager.auth_builder`` run — they
     encode the JWT identity AFTER
     RBAC/scope/custom_validate/email-domain policy has been enforced. The key
@@ -1639,11 +1707,21 @@ async def _auto_register_jwt_mapping(
         generate_key_helper_fn,
     )
 
+    link_only: Final = behavior == UnregisteredJWTClientBehavior.LINK_ONLY
+    reuse_existing: Final = link_only or jwt_handler.litellm_jwtauth.auto_register_map_existing_key
     existing_token_hash: Final = (
-        await _reusable_key_hash_for_user(prisma_client, user_id, team_id)
-        if user_id is not None and _claim_identifies_user(jwt_handler, virtual_key_claim_field, jwt_issuer)
+        await _reusable_key_hash_for_user(
+            prisma_client,
+            user_id,
+            team_id,
+        )
+        if reuse_existing
+        and user_id is not None
+        and _claim_identifies_user(jwt_handler, virtual_key_claim_field, jwt_issuer)
         else None
     )
+    if link_only and existing_token_hash is None:
+        return _JWTKeyMappingFailure.NO_ELIGIBLE_KEY
     minted: Final = existing_token_hash is None
     if existing_token_hash is not None:
         token_hash = existing_token_hash
@@ -1680,8 +1758,8 @@ async def _auto_register_jwt_mapping(
                     "jwt_claim_name": virtual_key_claim_field,
                     "jwt_claim_value": claim_value,
                     "token": token_hash,
-                    "created_by": "auto_register",
-                    "updated_by": "auto_register",
+                    "created_by": behavior.value,
+                    "updated_by": behavior.value,
                 }
             )
     except Exception as e:
@@ -1693,8 +1771,8 @@ async def _auto_register_jwt_mapping(
             # the DB and the cleartext is in memory on this request. Delete it
             # so orphans don't accumulate under sustained concurrency.
             verbose_proxy_logger.debug(
-                "JWT Key Mapping (auto_register): unique conflict on create — "
-                "deleting orphaned virtual key and fetching winner's mapping for %s='%s'.",
+                "JWT Key Mapping (%s): unique conflict on create, fetching winner's mapping for %s='%s'.",
+                behavior.value,
                 virtual_key_claim_field,
                 claim_value,
             )
@@ -1724,7 +1802,7 @@ async def _auto_register_jwt_mapping(
                 raise HTTPException(
                     status_code=503,
                     detail=(
-                        "JWT Key Mapping: AUTO_REGISTER race resolution failed — "
+                        f"JWT Key Mapping: {behavior.value.upper()} race resolution failed — "
                         "winner's mapping was concurrently removed. Retry the request."
                     ),
                 )
@@ -1738,7 +1816,8 @@ async def _auto_register_jwt_mapping(
     )
 
     verbose_proxy_logger.info(
-        "JWT Key Mapping (auto_register): %s virtual key for %s='%s'.",
+        "JWT Key Mapping (%s): %s virtual key for %s='%s'.",
+        behavior.value,
         "created new" if minted else "mapped existing",
         virtual_key_claim_field,
         claim_value,
@@ -1810,7 +1889,7 @@ async def _resolve_jwt_to_virtual_key(
       - ``UserAPIKeyAuth``: a resolved virtual key (cache hit or DB hit). The
         caller may use this directly; JWT policy has been enforced previously
         (at key-creation time or, for cached results, before caching).
-      - ``_PendingAutoRegister``: claim is unmapped and behavior is AUTO_REGISTER.
+      - ``_PendingAutoRegister``: claim is unmapped and behavior is AUTO_REGISTER or LINK_ONLY.
         The caller MUST run ``JWTAuthManager.auth_builder`` to enforce JWT
         policy (RBAC, scope, custom_validate, email-domain), then invoke
         ``_auto_register_jwt_mapping`` with the validated team_id/user_id.
@@ -1818,7 +1897,7 @@ async def _resolve_jwt_to_virtual_key(
         The caller falls through to standard team-based JWT auth (which itself
         enforces full JWT policy via auth_builder).
       - Raises HTTPException: REJECT policy hit, missing claim under
-        REJECT/AUTO_REGISTER, or other policy violations.
+        REJECT/AUTO_REGISTER/LINK_ONLY, or other policy violations.
     """
     raw_issuer: Final = jwt_claims.get(JWTHandler.LITELLM_JWT_ISSUER_CLAIM)
     normalized_issuer: Final = raw_issuer if isinstance(raw_issuer, str) else None
@@ -1845,6 +1924,7 @@ async def _resolve_jwt_to_virtual_key(
         if behavior in (
             UnregisteredJWTClientBehavior.REJECT,
             UnregisteredJWTClientBehavior.AUTO_REGISTER,
+            UnregisteredJWTClientBehavior.LINK_ONLY,
         ):
             raise HTTPException(
                 status_code=403,
@@ -1876,7 +1956,7 @@ async def _resolve_jwt_to_virtual_key(
                 status_code=403,
                 detail=f"JWT Key Mapping: No registered mapping for {virtual_key_claim_field}='{claim_value}'. Access denied.",
             )
-        if behavior == UnregisteredJWTClientBehavior.AUTO_REGISTER:
+        if behavior in (UnregisteredJWTClientBehavior.AUTO_REGISTER, UnregisteredJWTClientBehavior.LINK_ONLY):
             # Stale sentinel written under a prior fallback_team_mapping config —
             # evict it and defer auto-register to after auth_builder runs. Raise
             # the same 500 as the fresh-path AUTO_REGISTER branch when there is
@@ -1886,7 +1966,7 @@ async def _resolve_jwt_to_virtual_key(
                 raise HTTPException(
                     status_code=500,
                     detail=(
-                        "JWT Key Mapping: AUTO_REGISTER requires a database connection. "
+                        f"JWT Key Mapping: {behavior.value.upper()} requires a database connection. "
                         "Configure a database or change unregistered_jwt_client_behavior."
                     ),
                 )
@@ -1896,6 +1976,7 @@ async def _resolve_jwt_to_virtual_key(
                 claim_value=str(claim_value),
                 cache_key=cache_key,
                 jwt_issuer=normalized_issuer,
+                behavior=behavior,
             )
         return None
     elif cached_mapping is not None:
@@ -1956,12 +2037,12 @@ async def _resolve_jwt_to_virtual_key(
             detail=f"JWT Key Mapping: No registered mapping for {virtual_key_claim_field}='{claim_value}'. Access denied.",
         )
 
-    if behavior == UnregisteredJWTClientBehavior.AUTO_REGISTER:
+    if behavior in (UnregisteredJWTClientBehavior.AUTO_REGISTER, UnregisteredJWTClientBehavior.LINK_ONLY):
         if prisma_client is None:
             raise HTTPException(
                 status_code=500,
                 detail=(
-                    "JWT Key Mapping: AUTO_REGISTER requires a database connection. "
+                    f"JWT Key Mapping: {behavior.value.upper()} requires a database connection. "
                     "Configure a database or change unregistered_jwt_client_behavior."
                 ),
             )
@@ -1974,6 +2055,7 @@ async def _resolve_jwt_to_virtual_key(
             claim_value=str(claim_value),
             cache_key=cache_key,
             jwt_issuer=normalized_issuer,
+            behavior=behavior,
         )
 
     # FALLBACK_TEAM_MAPPING (default): cache the miss and return None so the
@@ -2020,7 +2102,8 @@ def _ensure_parent_otel_span_on_request_state(request: Request) -> None:
 
     if open_telemetry_logger is None:
         return
-    if getattr(request.state, "parent_otel_span", None) is not None:
+    if (existing_span := getattr(request.state, "parent_otel_span", None)) is not None:
+        set_request_parent_otel_span(existing_span)
         return
     parent_otel_span: Final = open_telemetry_logger.create_litellm_proxy_request_started_span(
         start_time=start_time,
@@ -2036,6 +2119,7 @@ def _ensure_parent_otel_span_on_request_state(request: Request) -> None:
             http_route=get_request_route_template(request),
         )
     request.state.parent_otel_span = parent_otel_span
+    set_request_parent_otel_span(parent_otel_span)
 
 
 async def _read_request_body_deferring_parse_failure(
@@ -2058,6 +2142,209 @@ async def _read_request_body_deferring_parse_failure(
     except ProxyException as parse_exception:
         return {}, parse_exception
     return populate_request_with_path_params(request_data=parsed_body, request=request), None
+
+
+PREFLIGHT_FAILURE_JSON_BODY_MAX_BYTES: Final = 64 * 1024
+PREFLIGHT_FAILURE_JSON_BODY_TIMEOUT_SECONDS: Final = 1.0
+
+
+def _preflight_failure_model(
+    body: Mapping[str, object], route: str, request: Request, team_id: str | None
+) -> str | Sequence[str] | None:
+    from litellm.proxy.proxy_server import llm_router
+
+    try:
+        return _get_model_from_request_context(dict(body), route, request, llm_router, team_id)
+    except Exception:  # noqa: BLE001  # logging enrichment must never replace the existing preflight rejection
+        return None
+
+
+async def _preflight_failure_request_data(
+    request: Request, route: str, cached_key: UserAPIKeyAuth
+) -> Mapping[str, object]:
+    from litellm.proxy.common_request_processing import resolve_litellm_call_id
+    from litellm.proxy.litellm_pre_call_utils import key_and_team_logging_fields
+    from litellm.proxy.proxy_server import proxy_config
+    from litellm.proxy.utils import (
+        _call_type_for_route,  # pyright: ignore[reportPrivateUsage]  # share proxy failure route classification
+    )
+
+    body: Final = await _small_preflight_failure_json(request)
+    model: Final = _preflight_failure_model(body, route, request, cached_key.team_id)
+    call_type: Final = _call_type_for_route(route, method=request.method)
+    _seed_request_destinations(cached_key, request)
+    seed_request_identity(cached_key, model=model, request_data=body)
+    return {
+        **{key: value for key, value in body.items() if key != "model"},
+        **({"model": model} if model is not None else {}),
+        "litellm_call_id": resolve_litellm_call_id(request.headers.get("x-litellm-call-id")),
+        "call_type": call_type,
+        **key_and_team_logging_fields(user_api_key_dict=cached_key, proxy_config=proxy_config),
+    }
+
+
+async def _small_preflight_failure_json(request: Request) -> Mapping[str, object]:
+    declared: Final = request.headers.get("content-length", "")
+    content_type: Final = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if (
+        not declared.isdecimal()
+        or len(declared) > 10
+        or not 0 < int(declared) <= PREFLIGHT_FAILURE_JSON_BODY_MAX_BYTES
+        or request.headers.get("transfer-encoding") is not None
+        or content_type != "application/json"
+    ):
+        return {}
+    buffered: Final = bytearray()
+    try:
+        with anyio.fail_after(PREFLIGHT_FAILURE_JSON_BODY_TIMEOUT_SECONDS):
+            async for chunk in request.stream():
+                if len(buffered) + len(chunk) > PREFLIGHT_FAILURE_JSON_BODY_MAX_BYTES:
+                    return {}
+                buffered.extend(chunk)
+        parsed: Final = _GENERAL_SETTINGS_ADAPTER.validate_json(buffered)
+    except (ValidationError, RuntimeError, ClientDisconnect, TimeoutError):
+        return {}
+    return {
+        **({"model": parsed["model"]} if isinstance(parsed.get("model"), str) else {}),
+        **{
+            slot: {
+                name: value
+                for name, value in _GENERAL_SETTINGS_ADAPTER.validate_python(metadata).items()
+                if name in ("tags", "session_id", "trace_user_id", "trace_id", "trace_name")
+            }
+            for slot in ("metadata", "litellm_metadata")
+            if isinstance(metadata := parsed.get(slot), dict)
+        },
+    }
+
+
+def _is_bodyless_get(request: Request) -> bool:
+    return (
+        request.scope.get("method") == "GET"
+        and request.headers.get("content-length", "0") == "0"
+        and request.headers.get("transfer-encoding") is None
+    )
+
+
+def _team_fields_newer_than_key(key: UserAPIKeyAuth, team: LiteLLM_TeamTableCachedObj) -> Mapping[str, object]:
+    if team.last_refreshed_at is None or key.last_refreshed_at is None:
+        return MappingProxyType({})
+    if team.last_refreshed_at <= key.last_refreshed_at:
+        return MappingProxyType({})
+    key_fields: Final = type(key).model_fields
+    return MappingProxyType(
+        {f"team_{name}": value for name, value in team.__dict__.items() if f"team_{name}" in key_fields}
+    )
+
+
+async def _cached_team_fields_for_key(
+    key: UserAPIKeyAuth, user_api_key_cache: UserApiKeyCache, parent_otel_span: Span | None
+) -> Mapping[str, object] | None:
+    if key.team_id is None or key.team_id == UI_TEAM_ID:
+        return MappingProxyType({})
+    try:
+        team: Final = await get_team_object_from_cache(
+            key=f"team_id:{key.team_id}", user_api_key_cache=user_api_key_cache, parent_otel_span=parent_otel_span
+        )
+        return None if team is None else _team_fields_newer_than_key(key, team)
+    except Exception:  # noqa: BLE001  # an unreadable team entry is treated like a team cache miss
+        return None
+
+
+def _refused_by_team_limit(rejection: HTTPException) -> bool:
+    from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
+
+    return isinstance(rejection, ProxyRateLimitError) and rejection.descriptor_key == "team"
+
+
+async def _reject_from_headers_before_reading_body(
+    request: Request, api_key: str | None, custom_litellm_key_header: str | None, route: str
+) -> None:
+    """Refuse a request its headers already condemn, a blocked key or an exhausted key limit, before reading its body.
+
+    Only a key already in the cache is considered, so a miss changes nothing and the full auth path still runs.
+    The limit is only checked where a body is declared and the route is metered, because model listing, token
+    counting and other GET discovery routes never reach the limiter and must keep answering an exhausted key.
+    A retry flood of large payloads against a limited key used to buffer every payload just to answer 429.
+    """
+    if not RouteChecks.is_llm_api_route(route=route):
+        return
+    from litellm.proxy import proxy_server
+    from litellm.proxy.common_request_processing import proxy_exception_from_http_exception
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import PROXY_MaxParallelRequestsHandler_v3
+    from litellm.proxy.proxy_server import prisma_client, proxy_logging_obj, user_api_key_cache
+
+    configured_header: Final = proxy_server.general_settings_view().get("litellm_key_header_name")
+    bearer_token: Final = (
+        get_api_key_from_custom_header(request=request, custom_litellm_key_header_name=configured_header)
+        if isinstance(configured_header, str) and configured_header in request.headers
+        else _get_bearer_token_or_received_api_key(custom_litellm_key_header)
+        if isinstance(custom_litellm_key_header, str)
+        else get_bearer_token(api_key=api_key)
+        if isinstance(api_key, str)
+        else ""
+    )
+    if not bearer_token:
+        return
+    hashed_token: Final = hash_token(bearer_token)
+    try:
+        cached_key: Final = IdentityStore.key_from_principal(
+            await IdentityStore(prisma_client, user_api_key_cache, check_cache_only=True).resolve(
+                hashed_token=hashed_token
+            )
+        )
+    except Exception:  # noqa: BLE001  # any cache miss defers to the full auth path below
+        return
+    parent_otel_span: Final[Span | None] = getattr(request.state, "parent_otel_span", None)
+    if cached_key.blocked is True:
+        request_data: Final = dict(await _preflight_failure_request_data(request, route, cached_key))
+        await UserAPIKeyAuthExceptionHandler.handle_authentication_error(
+            e=ProxyException(
+                message="Authentication Error, Key is blocked. Update via `/key/unblock` if you're an admin.",
+                type=ProxyErrorTypes.auth_error,
+                param=None,
+                code=status.HTTP_401_UNAUTHORIZED,
+            ),
+            request=request,
+            request_data=request_data,
+            route=route,
+            parent_otel_span=parent_otel_span,
+            api_key=bearer_token,
+            resolved_identity=cached_key,
+            dispatched_call_type=str(request_data["call_type"]) if request_data["call_type"] is not None else None,
+        )
+        return
+    if RouteChecks.is_unbilled_route(route) or _is_bodyless_get(request):
+        return
+    limiter: Final = proxy_logging_obj.get_proxy_hook("parallel_request_limiter")
+    if not isinstance(limiter, PROXY_MaxParallelRequestsHandler_v3):
+        return
+    team_fields: Final = await _cached_team_fields_for_key(cached_key, user_api_key_cache, parent_otel_span)
+    rate_limited: Final = cached_key.model_copy(
+        update={
+            **(team_fields or {}),
+            "api_key": cached_key.api_key or hashed_token,
+            "parent_otel_span": parent_otel_span,
+            "request_route": normalize_request_route(route),
+        }
+    )
+    try:
+        await limiter.raise_if_over_limit_before_body(rate_limited)
+    except HTTPException as rejection:
+        if team_fields is None and _refused_by_team_limit(rejection):
+            return
+        failure_data: Final = dict(await _preflight_failure_request_data(request, route, rate_limited))
+        transformed: Final = await proxy_logging_obj.post_call_failure_hook(  # pyright: ignore[reportUnknownMemberType]  # bare dict in sig
+            request_data=failure_data,
+            original_exception=rejection,
+            user_api_key_dict=rate_limited,
+            route=route,
+            dispatched_call_type=str(failure_data["call_type"]) if failure_data["call_type"] is not None else None,
+        )
+        failure: Final = transformed if transformed is not None else rejection
+        if isinstance(failure, ProxyException):
+            raise failure
+        raise proxy_exception_from_http_exception(failure, dict(failure.headers or {}))
 
 
 async def _record_unparsable_body_failure(
@@ -2466,10 +2753,13 @@ async def user_api_key_auth_builder(
                             org_id=org_id,
                             end_user_id=end_user_id,
                             agent_id=agent_id,
+                            behavior=pending_auto_register.behavior,
                         )
                         if pending_auto_register is not None and prisma_client is not None
                         else None
                     )
+                    if isinstance(auto_registered, _JWTKeyMappingFailure):
+                        raise HTTPException(status_code=403, detail=auto_registered.value)
                     if auto_registered is not None:
                         auto_registered.jwt_claims = jwt_claims
                         auto_registered.user_email = user_email
@@ -2485,7 +2775,13 @@ async def user_api_key_auth_builder(
 
                     falls_through_to_key_checks: Final = (
                         auto_registered is not None
-                        and jwt_handler.litellm_jwtauth.auto_register_map_existing_key
+                        and (
+                            jwt_handler.litellm_jwtauth.auto_register_map_existing_key
+                            or (
+                                pending_auto_register is not None
+                                and pending_auto_register.behavior == UnregisteredJWTClientBehavior.LINK_ONLY
+                            )
+                        )
                         and master_key is not None
                     )
                     if not falls_through_to_key_checks:
@@ -2608,6 +2904,7 @@ async def user_api_key_auth_builder(
             await prefetch_identity_keys(
                 _identity_cache_keys(api_key, end_user_id=end_user_id, key_is_resolved=valid_token is not None),
                 user_api_key_cache=user_api_key_cache,
+                before_read=arm_routing_cooldowns,
             )
         if end_user_id:
             try:
@@ -2752,17 +3049,8 @@ async def user_api_key_auth_builder(
                     check_cache_only=True,
                 )
 
-                if (
-                    team_obj.last_refreshed_at is not None
-                    and valid_token.last_refreshed_at is not None
-                    and team_obj.last_refreshed_at > valid_token.last_refreshed_at
-                ):
-                    team_obj_dict: Final[Mapping[str, object]] = MappingProxyType(team_obj.__dict__)
-
-                    for k, v in team_obj_dict.items():
-                        field_name = f"team_{k}"
-                        if field_name in valid_token.__fields__:
-                            setattr(valid_token, field_name, v)
+                for field_name, value in _team_fields_newer_than_key(valid_token, team_obj).items():
+                    setattr(valid_token, field_name, value)
             except Exception as e:
                 verbose_logger.debug(e)  # moving from .warning to .debug as it spams logs when team missing from cache.
 
@@ -3057,7 +3345,7 @@ async def validate_resolved_virtual_key(  # noqa: C901  # Preserve ordering of e
                         team_member_spend = valid_token.team_member_spend
                         if valid_token.user_id is not None and valid_token.team_id is not None:
                             team_member_spend = await get_current_spend(
-                                counter_key=f"spend:team_member:{valid_token.user_id}:{valid_token.team_id}",
+                                counter_key=team_member_counter(valid_token.user_id, valid_token.team_id),
                                 fallback_spend=team_member_spend,
                                 max_budget=team_member_budget,
                             )
@@ -4121,6 +4409,7 @@ async def _authorize_authenticated_request(
     RouteChecks.should_call_route(route=route, valid_token=user_api_key_auth_obj, request=request)
     await _normalize_claude_model(request_data, user_api_key_auth_obj, request, route)
     await _resolve_router_settings_model_group_alias(request_data, user_api_key_auth_obj, request, route)
+    _resolve_codex_native_chatgpt_model(request_data, user_api_key_auth_obj, request, route)
 
     # Single authorization point. Builder paths MUST NOT call common_checks.
     # Route through the same exception handler the builder uses so
@@ -4226,10 +4515,10 @@ async def _authorize_authenticated_request(
     return None
 
 
-def _spend_counter_redis_cache() -> RedisCache | None:
-    from litellm.proxy.proxy_server import spend_counter_cache
+def _spend_counter_store() -> SpendCounterStore:
+    from litellm.proxy.proxy_server import spend_counter_store
 
-    return spend_counter_cache.redis_cache
+    return spend_counter_store
 
 
 def _identity_cache_keys(api_key: str, *, end_user_id: str | None, key_is_resolved: bool) -> tuple[str, ...]:
@@ -4260,7 +4549,18 @@ async def _prefetch_referenced_auth_objects(
         refs=AuthObjectRefs.from_token(valid_token),
         user_api_key_cache=user_api_key_cache,
         prisma_client=prisma_client,
+        before_read=arm_routing_cooldowns,
     )
+
+
+def arm_routing_cooldowns() -> None:
+    """Declares the cooldown read routing takes later into the auth prefetch's native round trip, so a request whose
+    auth objects come from Redis pays one round trip for both. Armed only when a prefetch reads Redis, so a request
+    served from memory, or denied, reads no cooldowns early."""
+    from litellm.proxy.proxy_server import llm_router  # noqa: PLC0415  # runtime global
+
+    if llm_router is not None:
+        RoutingContext(llm_router).arm_cooldown_prefetch()
 
 
 def _seed_request_destinations(user_api_key_dict: UserAPIKeyAuth, request: Request | None = None) -> None:
@@ -4320,9 +4620,12 @@ async def user_api_key_auth(
     # close, and the trace never reaches the backend.
     _ensure_parent_otel_span_on_request_state(request)
 
+    route: Final[str] = get_request_route(request=request)
+    await _reject_from_headers_before_reading_body(
+        request=request, api_key=api_key, custom_litellm_key_header=custom_litellm_key_header, route=route
+    )
     request_data, body_parse_exception = await _read_request_body_deferring_parse_failure(request=request)
     phase_event("litellm.request.body_parsed")
-    route: Final[str] = get_request_route(request=request)
     ## CHECK IF ROUTE IS ALLOWED
 
     # Run the whole auth phase inside a live ``auth`` span so the DB lookups it
@@ -4332,7 +4635,7 @@ async def user_api_key_auth(
     with (
         phase_span(f"auth {route}"),
         service_target(AUTH_OBJECTS_TARGET),
-        spend_counter_batch_scope(_spend_counter_redis_cache()),
+        spend_counter_batch_scope(_spend_counter_store()),
     ):
         try:
             user_api_key_auth_obj: Final = await user_api_key_auth_builder(
@@ -4588,6 +4891,7 @@ async def enforce_key_and_fallback_model_access(
     """
     await _normalize_claude_model(request_data, valid_token, request, route)
     await _resolve_router_settings_model_group_alias(request_data, valid_token, request, route)
+    _resolve_codex_native_chatgpt_model(request_data, valid_token, request, route)
     config: Final = valid_token.config
 
     if config != {}:

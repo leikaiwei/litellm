@@ -4,8 +4,6 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, cast
 
-from pydantic import BaseModel, ConfigDict, ValidationError
-
 import litellm
 from litellm._logging import verbose_logger
 from litellm.caching.caching_handler import create_cache_write_task, is_response_without_output
@@ -35,67 +33,6 @@ def _decode(chunk: bytes | str) -> str:
 
 def _split_sse_events(stream_text: str) -> tuple[str, ...]:
     return tuple(event for event in _SSE_EVENT_BOUNDARY.split(stream_text) if event)
-
-
-class _SSEContentBlock(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    type: str | None = None
-    text: str | None = None
-
-
-class _SSEDelta(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    text: str | None = None
-    thinking: str | None = None
-    partial_json: str | None = None
-
-
-class _SSEEvent(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    type: str | None = None
-    content_block: _SSEContentBlock | None = None
-    delta: _SSEDelta | None = None
-
-
-def _parse_sse_event(event: str) -> _SSEEvent | None:
-    """Parse one SSE event's ``data:`` JSON; None when absent or unparseable."""
-    for line in event.splitlines():
-        if not line.startswith("data:"):
-            continue
-        try:
-            return _SSEEvent.model_validate_json(line[len("data:") :])
-        except ValidationError:
-            return None
-    return None
-
-
-def _event_carries_content(event: str) -> bool:
-    """非 text 的内容块（tool_use / thinking）一律算内容，text 块要求真有 delta 文本。"""
-    parsed: Final = _parse_sse_event(event)
-    if parsed is None:
-        return False
-    if parsed.type == "content_block_start":
-        block: Final = parsed.content_block
-        return block is not None and (block.type != "text" or bool(block.text))
-    if parsed.type == "content_block_delta":
-        delta: Final = parsed.delta
-        return delta is not None and bool(delta.text or delta.thinking or delta.partial_json)
-    return False
-
-
-def _stream_produced_content(events: Sequence[str]) -> bool:
-    """一个内容块都没产出的流不该进缓存。
-
-    上游偶发静默拒答会回一条格式完好却没有任何内容的流（message_start ->
-    message_delta(stop_reason=end_turn) -> message_stop）。它带 message_stop、
-    也不是 error 帧，故上面两道判定都放行。缓存住它会让 TTL 窗口内的每次重试都
-    秒回同一个空回复，把一次重试就能绕过的瞬时故障固化成用户看到的永久卡死。
-    与 caching_handler._is_contentless_result 同一判据，换成 SSE 形状表达。
-    """
-    return any(_event_carries_content(event) for event in events)
 
 
 class AnthropicMessagesStreamCacheWriter:
@@ -176,11 +113,9 @@ class AnthropicMessagesStreamCacheWriter:
         except UnicodeDecodeError as e:
             verbose_logger.exception("Anthropic Messages stream cache write failed: %s", e)
             return
-        if not _stream_produced_content(events):
-            return
         cached_payload: Final = {CACHED_STREAM_EVENTS_KEY: events}
         if is_response_without_output(cached_payload):
-            verbose_logger.debug("LiteLLM Cache: not caching a stream with no content blocks")
+            verbose_logger.debug("LiteLLM Cache: not caching a stream with no output")
             return
         dual_cache: Final = self.caching_handler.dual_cache
 
